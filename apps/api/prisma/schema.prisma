@@ -1,0 +1,449 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AppMode {
+  PAPER
+  LIVE
+}
+
+enum Side {
+  BUY
+  SELL
+}
+
+enum DecisionAction {
+  EXECUTE
+  SKIP
+}
+
+enum ExecutionStatus {
+  SUBMITTED
+  FILLED
+  FAILED
+  SKIPPED
+}
+
+model WatchedWallet {
+  id             String     @id @default(uuid())
+  address        String     @unique
+  label          String
+  enabled        Boolean    @default(true)
+  copyEnabled    Boolean    @default(true)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  priorityTier   String     @default("INACTIVE")
+  lastPolledAt   DateTime?
+  nextPollAt     DateTime?
+  syncStatus     String     @default("ACTIVE")
+  lastSyncAt     DateTime?
+  lastActivitySyncedAt DateTime?
+  lastPositionsSyncedAt DateTime?
+  lastSyncError  String?
+  strategies     Strategy[]
+  activityEvents WalletActivityEvent[]
+  tradeEvents    TradeEvent[]
+  analyticsSnapshots WalletAnalyticsSnapshot[]
+  whaleAlerts    WhaleAlert[]
+  paperSessions  PaperCopySession[]
+}
+
+model WalletActivityEvent {
+  id                String   @id @default(uuid())
+  trackedWalletId   String
+  walletAddress     String
+  externalEventId   String?
+  dedupeKey         String
+  eventType         String
+  marketId          String
+  marketQuestion    String?
+  outcome           String?
+  side              Side?
+  price             Decimal?
+  shares            Decimal?
+  notional          Decimal?
+  fee               Decimal?
+  txHash            String?
+  orderId           String?
+  eventTimestamp    DateTime
+  detectedAt        DateTime
+  rawPayloadJson    Json
+  createdAt         DateTime @default(now())
+  trackedWallet     WatchedWallet @relation(fields: [trackedWalletId], references: [id], onDelete: Cascade)
+  paperTrades       PaperCopyTrade[]
+
+  @@unique([trackedWalletId, dedupeKey])
+  @@index([trackedWalletId, eventTimestamp])
+  @@index([marketId, eventTimestamp])
+}
+
+model Strategy {
+  id                    String              @id @default(uuid())
+  walletId              String
+  name                  String
+  enabled               Boolean             @default(true)
+  mode                  AppMode             @default(PAPER)
+  bankroll              Decimal             @default(10000)
+  copiedTradesToday     Int                 @default(0)
+  skippedTradesToday    Int                 @default(0)
+  dailyPnl              Decimal             @default(0)
+  lastCopiedTradeAt     DateTime?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  wallet                WatchedWallet       @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  riskConfig            RiskConfig?
+  decisions             CopyDecision[]
+  executions            Execution[]
+  positions             Position[]
+  snapshots             PortfolioSnapshot[]
+  backtests             BacktestRun[]
+  smartConfig           SmartCopyStrategyConfig?
+}
+
+model RiskConfig {
+  id                     String    @id @default(uuid())
+  strategyId             String    @unique
+  fixedDollar            Decimal?
+  pctSourceSize          Decimal?
+  pctBankroll            Decimal?
+  maxExposure            Decimal
+  perMarketMaxAllocation Decimal
+  dailyLossCap           Decimal
+  maxSlippageBps         Int
+  minLiquidity           Decimal
+  maxSpreadBps           Int
+  inverseMode            Boolean   @default(false)
+  copyBuys               Boolean   @default(true)
+  copySells              Boolean   @default(true)
+  cooldownSeconds        Int       @default(0)
+  fillStrategy           String
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+  strategy               Strategy  @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+}
+
+model TradeEvent {
+  id                  String    @id @default(uuid())
+  walletId            String
+  sourceEventId       String
+  sourceWalletAddress String
+  marketId            String
+  marketQuestion      String?
+  outcome             String
+  side                Side
+  size                Decimal
+  price               Decimal
+  txHash              String?
+  orderId             String?
+  tradedAt            DateTime
+  observedAt          DateTime
+  createdAt           DateTime  @default(now())
+  wallet              WatchedWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  decisions           CopyDecision[]
+  whaleAlerts         WhaleAlert[]
+  clusterSignals      ClusterSignal[]
+
+  @@unique([walletId, sourceEventId])
+  @@index([marketId])
+}
+
+model WalletAnalyticsSnapshot {
+  id                    String   @id @default(uuid())
+  walletId              String
+  totalTrades           Int
+  wins                  Int
+  losses                Int
+  winRate               Decimal
+  averageEntryPrice     Decimal
+  averageExitPrice      Decimal
+  averageHoldTime       Decimal
+  profitFactor          Decimal
+  realizedPnl           Decimal
+  unrealizedPnl         Decimal
+  maxDrawdown           Decimal
+  bestTrade             Decimal
+  worstTrade            Decimal
+  marketDiversification Int
+  tradeFrequency        Decimal
+  sharpeLike            Decimal
+  tradeAccuracy         Decimal
+  avgTradeSize          Decimal
+  marketsTraded         Int
+  createdAt             DateTime @default(now())
+  wallet                WatchedWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([walletId, createdAt])
+}
+
+model WhaleAlert {
+  id              String   @id @default(uuid())
+  walletId        String
+  tradeEventId    String
+  marketId        String
+  side            Side
+  price           Decimal
+  size            Decimal
+  notionalUsd     Decimal
+  liquidity       Decimal
+  reasonsJson     Json
+  message         String
+  createdAt       DateTime @default(now())
+  wallet          WatchedWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  tradeEvent      TradeEvent @relation(fields: [tradeEventId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, createdAt])
+}
+
+model ClusterSignal {
+  id              String   @id @default(uuid())
+  marketId        String
+  side            Side
+  walletIdsJson   Json
+  thresholdWallets Int
+  windowSeconds   Int
+  firstTradeAt    DateTime
+  lastTradeAt     DateTime
+  eventKey        String   @unique
+  triggerTradeEventId String
+  createdAt       DateTime @default(now())
+  triggerTradeEvent TradeEvent @relation(fields: [triggerTradeEventId], references: [id], onDelete: Cascade)
+
+  @@index([marketId, createdAt])
+}
+
+model MarketIntelligenceSnapshot {
+  id                 String   @id @default(uuid())
+  marketId           String
+  totalBuyVolume     Decimal
+  totalSellVolume    Decimal
+  uniqueWallets      Int
+  netSentimentScore  Decimal
+  buyPressure        Decimal
+  sellPressure       Decimal
+  createdAt          DateTime @default(now())
+
+  @@index([marketId, createdAt])
+}
+
+model StreamEvent {
+  id          String   @id @default(uuid())
+  type        String
+  entityId    String?
+  payload     Json
+  createdAt   DateTime @default(now())
+
+  @@index([type, createdAt])
+}
+
+model SmartCopyStrategyConfig {
+  id                         String   @id @default(uuid())
+  strategyId                 String   @unique
+  profitableWalletsOnly      Boolean  @default(false)
+  minSourceTradeUsd          Decimal?
+  firstEntryOnly             Boolean  @default(false)
+  ignoreExitTrades           Boolean  @default(false)
+  copyClustersOnly           Boolean  @default(false)
+  topRankedWalletsOnly       Boolean  @default(false)
+  topRankMinWinRate          Decimal?
+  topRankMinSharpeLike       Decimal?
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+  strategy                   Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+}
+
+model CopyDecision {
+  id             String         @id @default(uuid())
+  strategyId     String
+  tradeEventId   String
+  action         DecisionAction
+  side           Side
+  orderSize      Decimal
+  limitPrice     Decimal
+  reasonsJson    Json
+  idempotencyKey String         @unique
+  createdAt      DateTime       @default(now())
+  strategy       Strategy       @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  tradeEvent     TradeEvent     @relation(fields: [tradeEventId], references: [id], onDelete: Cascade)
+  execution      Execution?
+}
+
+model Execution {
+  id              String          @id @default(uuid())
+  strategyId      String
+  decisionId      String          @unique
+  mode            AppMode
+  status          ExecutionStatus
+  externalOrderId String?
+  filledSize      Decimal
+  avgFillPrice    Decimal
+  feePaid         Decimal
+  errorMessage    String?
+  createdAt       DateTime        @default(now())
+  strategy        Strategy        @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  decision        CopyDecision    @relation(fields: [decisionId], references: [id], onDelete: Cascade)
+}
+
+model Position {
+  id            String    @id @default(uuid())
+  strategyId    String
+  marketId      String
+  outcome       String
+  size          Decimal
+  avgPrice      Decimal
+  realizedPnl   Decimal   @default(0)
+  unrealizedPnl Decimal   @default(0)
+  updatedAt     DateTime  @updatedAt
+  strategy      Strategy  @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+
+  @@unique([strategyId, marketId, outcome])
+}
+
+model PortfolioSnapshot {
+  id                String    @id @default(uuid())
+  strategyId        String
+  mode              AppMode
+  bankroll          Decimal
+  exposure          Decimal
+  realizedPnl       Decimal
+  unrealizedPnl     Decimal
+  openPositions     Int
+  copiedTradesToday Int
+  skippedTradesToday Int
+  createdAt         DateTime  @default(now())
+  strategy          Strategy  @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+}
+
+model BacktestRun {
+  id          String   @id @default(uuid())
+  strategyId  String
+  name        String
+  configJson  Json
+  resultJson  Json
+  createdAt   DateTime @default(now())
+  strategy    Strategy @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  category   String
+  entityId   String
+  action     String
+  payload    Json
+  createdAt  DateTime @default(now())
+
+  @@index([category, entityId])
+}
+
+model PaperCopySession {
+  id                    String   @id @default(uuid())
+  trackedWalletId       String
+  trackedWalletAddress  String
+  status                String
+  startingCash          Decimal
+  currentCash           Decimal
+  estimatedSourceExposure Decimal?
+  copyRatio             Decimal?
+  maxAllocationPerMarket Decimal @default(2500)
+  maxTotalExposure      Decimal @default(10000)
+  minNotionalThreshold  Decimal @default(2)
+  feeBps                Int     @default(0)
+  slippageBps           Int     @default(0)
+  startedAt             DateTime?
+  endedAt               DateTime?
+  lastProcessedEventAt  DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  trackedWallet         WatchedWallet @relation(fields: [trackedWalletId], references: [id], onDelete: Cascade)
+  trades                PaperCopyTrade[]
+  positions             PaperCopyPosition[]
+  snapshots             PaperPortfolioSnapshot[]
+  metricPoints          PaperSessionMetricPoint[]
+
+  @@index([trackedWalletId, createdAt])
+  @@index([status, updatedAt])
+}
+
+model PaperCopyTrade {
+  id                    String   @id @default(uuid())
+  sessionId             String
+  sourceActivityEventId String?
+  marketId              String
+  marketQuestion        String?
+  outcome               String
+  side                  Side
+  action                String
+  sourcePrice           Decimal?
+  simulatedPrice        Decimal
+  sourceShares          Decimal?
+  simulatedShares       Decimal
+  notional              Decimal
+  feeApplied            Decimal
+  slippageApplied       Decimal
+  eventTimestamp        DateTime
+  processedAt           DateTime
+  reasoning             Json
+  createdAt             DateTime @default(now())
+  session               PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sourceActivityEvent   WalletActivityEvent? @relation(fields: [sourceActivityEventId], references: [id], onDelete: SetNull)
+
+  @@unique([sessionId, sourceActivityEventId])
+  @@index([sessionId, eventTimestamp])
+}
+
+model PaperCopyPosition {
+  id                String   @id @default(uuid())
+  sessionId         String
+  marketId          String
+  marketQuestion    String?
+  outcome           String
+  netShares         Decimal
+  avgEntryPrice     Decimal
+  currentMarkPrice  Decimal
+  realizedPnl       Decimal @default(0)
+  unrealizedPnl     Decimal @default(0)
+  status            String
+  openedAt          DateTime
+  closedAt          DateTime?
+  updatedAt         DateTime @updatedAt
+  session           PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, marketId, outcome])
+  @@index([sessionId, status])
+}
+
+model PaperPortfolioSnapshot {
+  id                String   @id @default(uuid())
+  sessionId         String
+  timestamp         DateTime
+  cash              Decimal
+  grossExposure     Decimal
+  netLiquidationValue Decimal
+  realizedPnl       Decimal
+  unrealizedPnl     Decimal
+  totalPnl          Decimal
+  returnPct         Decimal
+  createdAt         DateTime @default(now())
+  session           PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, timestamp])
+}
+
+model PaperSessionMetricPoint {
+  id                 String   @id @default(uuid())
+  sessionId          String
+  timestamp          DateTime
+  totalPnl           Decimal
+  realizedPnl        Decimal
+  unrealizedPnl      Decimal
+  netLiquidationValue Decimal
+  openPositionsCount Int
+  createdAt          DateTime @default(now())
+  session            PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, timestamp])
+}

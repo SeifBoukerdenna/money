@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    background:
+        radial-gradient(1200px 700px at 20% -10%, rgba(30, 58, 138, 0.16), transparent 60%),
+        radial-gradient(900px 500px at 90% -10%, rgba(15, 118, 110, 0.12), transparent 55%),
+        #050910;
+    @apply text-slate-100 antialiased;
+}
+
+.card {
+    @apply rounded-2xl border border-slate-800/70 bg-[#08101d]/80 p-5 backdrop-blur;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+
+.panel {
+    @apply rounded-2xl border border-slate-800/70 bg-[#091425]/70 backdrop-blur;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+}
+
+.input {
+    @apply w-full rounded-xl border border-slate-700/80 bg-[#0a1528] px-3 py-2 text-sm text-slate-100 outline-none ring-0 transition placeholder:text-slate-500 focus:border-blue-500/70;
+}
+
+.btn-primary {
+    @apply inline-flex items-center justify-center rounded-xl bg-blue-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-400 disabled:cursor-not-allowed disabled:opacity-60;
+}
+
+.btn-muted {
+    @apply inline-flex items-center justify-center rounded-xl border border-slate-700/80 bg-[#0b1628]/60 px-3 py-2 text-sm text-slate-200 transition hover:bg-slate-800/80;
+}
+
+.mode-paper {
+    @apply border-emerald-500/40 bg-emerald-500/10 text-emerald-200;
+}
+
+.mode-live {
+    @apply border-rose-500/50 bg-rose-500/10 text-rose-200;
+}
+
+a {
+    @apply transition-colors;
+}

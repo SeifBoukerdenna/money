@@ -1,0 +1,41 @@
+{
+  "name": "api",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "lint": "eslint src --ext .ts",
+    "test": "vitest run",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev --name init",
+    "db:seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@copytrader/alerts": "workspace:*",
+    "@copytrader/backtest-engine": "workspace:*",
+    "@copytrader/cluster-detector": "workspace:*",
+    "@copytrader/event-stream": "workspace:*",
+    "@copytrader/market-intelligence": "workspace:*",
+    "@copytrader/polymarket-adapter": "workspace:*",
+    "@copytrader/risk-engine": "workspace:*",
+    "@copytrader/shared": "workspace:*",
+    "@copytrader/wallet-analytics": "workspace:*",
+    "@fastify/cors": "^10.0.1",
+    "@fastify/sensible": "^6.0.3",
+    "@fastify/websocket": "^11.0.2",
+    "@prisma/client": "^6.4.1",
+    "bullmq": "^5.43.0",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "ioredis": "^5.4.2",
+    "pino": "^9.6.0",
+    "prom-client": "^15.1.3",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "prisma": "^6.4.1",
+    "tsx": "^4.19.3"
+  }
+}
