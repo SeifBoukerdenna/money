@@ -85,13 +85,9 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
     url: string,
   ): Promise<Record<string, unknown> | Array<Record<string, unknown>> | null> {
     const response = await fetch(url, {
-      headers: {
-        accept: 'application/json',
-      },
+      headers: { accept: 'application/json' },
     });
-    if (response.status === 404) {
-      return null;
-    }
+    if (response.status === 404) return null;
     if (!response.ok) {
       throw new Error(`Polymarket request failed: ${response.status} ${url}`);
     }
@@ -169,15 +165,59 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
       const sourceWalletAddress = String(
         row.proxyWallet ?? row.user ?? row.wallet ?? row.sourceWalletAddress ?? walletAddress,
       ).trim();
-      const eventType = String(row.type ?? row.eventType ?? 'TRADE').toUpperCase();
-      const normalizedType =
-        eventType === 'TRADE'
-          ? String(row.side ?? row.takerSide ?? 'TRADE').toUpperCase() === 'SELL'
-            ? 'SELL'
-            : 'BUY'
-          : eventType === 'REDEEM'
-            ? 'CLOSE'
-            : eventType;
+
+      const rawEventType = String(row.type ?? row.eventType ?? 'TRADE').toUpperCase();
+
+      // ---------------------------------------------------------------------------
+      // Side + eventType normalization
+      //
+      // Polymarket's data-api is inconsistent across endpoints. Rules:
+      //
+      // 1. Explicit eventType takes precedence: SELL, CLOSE, REDUCE, REDEEM → SELL
+      // 2. For TRADE events: look at row.side, row.takerSide, row.outcome_side
+      //    Any of those being 'SELL' → normalise to SELL
+      // 3. REDEEM is a market resolution payout → treat as CLOSE (full SELL)
+      // 4. INCREASE is an add-to-position → BUY
+      // 5. Default to BUY only when no signal indicates SELL
+      // ---------------------------------------------------------------------------
+      let normalizedType: string;
+      let effectiveSide: Side | null;
+
+      if (rawEventType === 'REDEEM') {
+        normalizedType = 'REDEEM';
+        effectiveSide = 'SELL';
+      } else if (rawEventType === 'CLOSE') {
+        normalizedType = 'CLOSE';
+        effectiveSide = 'SELL';
+      } else if (rawEventType === 'REDUCE') {
+        normalizedType = 'REDUCE';
+        effectiveSide = 'SELL';
+      } else if (rawEventType === 'SELL') {
+        normalizedType = 'SELL';
+        effectiveSide = 'SELL';
+      } else if (rawEventType === 'INCREASE') {
+        normalizedType = 'INCREASE';
+        effectiveSide = 'BUY';
+      } else if (rawEventType === 'BUY') {
+        normalizedType = 'BUY';
+        effectiveSide = 'BUY';
+      } else {
+        // TRADE or unknown — resolve from side fields
+        const sideHint = String(
+          row.side ?? row.takerSide ?? row.outcome_side ?? row.orderSide ?? '',
+        ).toUpperCase();
+        if (sideHint === 'SELL') {
+          normalizedType = 'SELL';
+          effectiveSide = 'SELL';
+        } else if (sideHint === 'BUY') {
+          normalizedType = 'BUY';
+          effectiveSide = 'BUY';
+        } else {
+          // No explicit signal — default to BUY (most common case for TRADE)
+          normalizedType = 'BUY';
+          effectiveSide = 'BUY';
+        }
+      }
 
       if (sinceMs && Number.isFinite(sinceMs) && tradedAtMs <= sinceMs) {
         continue;
@@ -188,17 +228,42 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
 
       const externalEventId = row.id ? String(row.id) : undefined;
 
+      // Normalize outcome to UPPERCASE — critical for position matching.
+      // Polymarket's positions API returns "Up"/"Down" but activity returns "UP"/"DOWN".
+      // Inconsistency causes findUnique(sessionId, marketId, outcome) to miss positions.
+      const normalizedOutcome = row.outcome ? String(row.outcome).toUpperCase() : null;
+
+      // For REDEEM events: price and shares may be null/zero for worthless positions.
+      // We still need to emit these events so the paper engine closes the position.
+      // Winning REDEEMs: price=1.0, shares=usdcSize. Losing: price=0, shares=0.
+      let eventPrice = Number.isFinite(price) && price > 0 ? price : null;
+      let eventShares = Number.isFinite(size) && size > 0 ? size : null;
+
+      if (normalizedType === 'REDEEM' || normalizedType === 'CLOSE') {
+        // For winning REDEEM: shares = usdcSize (payout), price = 1.0
+        const usdcPayout = Math.abs(Number(row.usdcSize ?? 0));
+        if (usdcPayout > 0) {
+          eventShares = usdcPayout;
+          eventPrice = 1.0;
+        } else {
+          // Losing position — still emit the event but with null price/shares.
+          // _applyEvent handles this case by closing the position at price=0.
+          eventShares = null;
+          eventPrice = null;
+        }
+      }
+
       events.push({
         id: crypto.randomUUID(),
         ...(externalEventId ? { externalEventId } : {}),
         eventType: normalizedType,
         marketId,
         marketQuestion: row.title ? String(row.title) : null,
-        outcome: row.outcome ? String(row.outcome) : null,
-        side: normalizedType === 'BUY' ? 'BUY' : normalizedType === 'SELL' ? 'SELL' : null,
-        price: Number.isFinite(price) && price > 0 ? price : null,
-        shares: Number.isFinite(size) && size > 0 ? size : null,
-        notional: notional && Number.isFinite(notional) ? notional : null,
+        outcome: normalizedOutcome,
+        side: effectiveSide,
+        price: eventPrice,
+        shares: eventShares,
+        notional: eventShares !== null && eventPrice !== null ? eventShares * eventPrice : null,
         fee: null,
         txHash: row.transactionHash
           ? String(row.transactionHash)
@@ -237,50 +302,49 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
       for (const row of rows) {
         const conditionId = String(row.conditionId ?? '').trim();
         const title = String(row.title ?? '').trim();
-        const outcome = String(row.outcome ?? 'UNKNOWN').trim();
+        // Normalize to UPPERCASE to match activity events
+        const outcome = String(row.outcome ?? 'UNKNOWN')
+          .trim()
+          .toUpperCase();
         const size = Number(row.size ?? 0);
         if (!conditionId || !title || !Number.isFinite(size) || size <= 0) {
           continue;
         }
 
-        const avgPrice = Number(row.avgPrice ?? 0);
-        const currentPrice = Number(row.curPrice ?? row.currentPrice ?? 0);
-        const totalTraded = Number(row.initialValue ?? row.totalBought ?? 0);
-        const amountWon = Number(row.currentValue ?? 0);
-        const pnl = Number(row.cashPnl ?? 0);
-        const pnlPercent = Number(row.percentPnl ?? 0);
-        const sideGuess =
-          Number.isFinite(currentPrice) && Number.isFinite(avgPrice)
-            ? currentPrice >= avgPrice
-              ? 'BUY'
-              : 'SELL'
-            : 'UNKNOWN';
+        const avgPrice = Number(row.avgPrice ?? row.price ?? 0);
+        const currentPrice = Number(row.curPrice ?? row.currentPrice ?? row.price ?? avgPrice);
+        const totalTraded = Math.abs(
+          Number(row.cashBalanceDelta ?? row.totalTraded ?? size * avgPrice),
+        );
+        const pnl = (currentPrice - avgPrice) * size;
+        const pnlPercent = avgPrice > 0 ? ((currentPrice - avgPrice) / avgPrice) * 100 : 0;
 
         items.push({
-          id: String(row.asset ?? `${conditionId}:${outcome}`),
+          id: conditionId,
           conditionId,
           title,
-          slug: String(row.slug ?? conditionId),
+          slug: String(row.slug ?? row.marketSlug ?? conditionId),
           outcome,
           size,
           avgPrice,
           currentPrice,
           totalTraded,
-          amountWon,
+          amountWon: 0,
           pnl,
           pnlPercent,
-          side: sideGuess as 'BUY' | 'SELL' | 'UNKNOWN',
+          side: 'BUY',
           status: 'OPEN',
           icon: row.icon ? String(row.icon) : null,
           eventSlug: row.eventSlug ? String(row.eventSlug) : null,
           updatedAt: new Date().toISOString(),
-        });
+        } satisfies WalletPosition);
       }
       return items.slice(0, limit);
     }
 
+    // CLOSED positions — inferred from redemptions
     const payload = await this.fetchJson(
-      `${this.dataApiBaseUrl}/activity?user=${encoded}&limit=1000&offset=0&sortBy=TIMESTAMP&sortDirection=DESC`,
+      `${this.dataApiBaseUrl}/value?user=${encoded}&limit=${limit}&offset=0`,
     );
     const rows = Array.isArray(payload)
       ? payload
@@ -288,6 +352,7 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
         ? ((payload as Record<string, unknown>).data as Array<Record<string, unknown>>)
         : [];
 
+    const totalTradedByCondition = new Map<string, number>();
     const redeemedByCondition = new Map<
       string,
       {
@@ -301,13 +366,11 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
         updatedAtMs: number;
       }
     >();
-    const totalTradedByCondition = new Map<string, number>();
 
     for (const row of rows) {
-      const conditionId = String(row.conditionId ?? '').trim();
-      if (!conditionId) {
-        continue;
-      }
+      const conditionId = String(row.conditionId ?? row.market ?? '').trim();
+      if (!conditionId) continue;
+
       const outcome = String(row.outcome ?? 'UNKNOWN').trim();
       const type = String(row.type ?? '').toUpperCase();
       const usdcSize = Math.abs(Number(row.usdcSize ?? 0));
@@ -320,9 +383,7 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
         );
       }
 
-      if (type !== 'REDEEM') {
-        continue;
-      }
+      if (type !== 'REDEEM') continue;
 
       const existing = redeemedByCondition.get(conditionId);
       const amountWon = Number(row.usdcSize ?? 0);
@@ -370,9 +431,7 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
 
   async getMarket(marketId: string): Promise<Market | null> {
     const response = await fetch(`${this.baseUrl}/markets/${marketId}`);
-    if (response.status === 404) {
-      return null;
-    }
+    if (response.status === 404) return null;
     if (!response.ok) {
       throw new Error(`Polymarket market fetch failed: ${response.status}`);
     }
@@ -405,16 +464,18 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
 
 function toEpochMs(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
-    if (value > 1_000_000_000_000) {
-      return value;
-    }
+    if (value > 1_000_000_000_000) return value;
     return value * 1000;
   }
-
   const parsed = new Date(String(value ?? '')).getTime();
-  if (Number.isFinite(parsed)) {
-    return parsed;
-  }
-
+  if (Number.isFinite(parsed)) return parsed;
   return Date.now();
+}
+
+export function createPolymarketDataAdapter(): PolymarketDataPort {
+  return new LivePolymarketAdapter('https://clob.polymarket.com');
+}
+
+export function createPolymarketTradingAdapter(_mode: 'LIVE'): PolymarketTradingPort {
+  return new LivePolymarketAdapter('https://clob.polymarket.com');
 }
