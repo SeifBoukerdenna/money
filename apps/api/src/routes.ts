@@ -25,6 +25,7 @@ import {
 import { reconcileWalletExposure } from './modules/reconciliation.js';
 import { resolveWalletAddress, shortenAddress } from './modules/wallet-input.js';
 import { getWalletLeaderboard } from './modules/wallet-analytics.js';
+import { registerForceCloseRoutes } from './modules/force-close-routes.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -1192,4 +1193,5 @@ export async function registerRoutes(app: any): Promise<void> {
       returnPct: Number(row.returnPct),
     }));
   });
+  registerForceCloseRoutes(app);
 }
