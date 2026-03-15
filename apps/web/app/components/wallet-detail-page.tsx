@@ -1,5 +1,5 @@
-import { LayoutShell } from '../../components/layout-shell';
-import { PolymarketProfileClient } from '../../components/polymarket-profile-client';
+import { LayoutShell } from "./layout-shell";
+import { PolymarketProfileClient } from "./polymarket-profile-client";
 
 export default async function WalletDetailPage({
     params,

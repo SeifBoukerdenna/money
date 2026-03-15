@@ -31,6 +31,7 @@ import { resolveWalletAddress, shortenAddress } from './modules/wallet-input.js'
 import { getWalletLeaderboard } from './modules/wallet-analytics.js';
 import { registerForceCloseRoutes } from './modules/force-close-routes.js';
 import { listSystemAlerts, raiseSystemAlert } from './modules/system-alerts.js';
+import { registerProfileParityRoutes } from './modules/profile-parity-routes.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -1842,4 +1843,5 @@ export async function registerRoutes(app: any): Promise<void> {
     }));
   });
   registerForceCloseRoutes(app);
+  registerProfileParityRoutes(app, { prisma, dataAdapter });
 }
