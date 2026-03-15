@@ -39,6 +39,7 @@ import {
   registerProfileParityRoutes,
 } from './modules/profile-parity-routes.js';
 import { buildProfileSummary } from './modules/profile-parity.js';
+import { registerPaperSessionMarketRoutes } from './paper-session-market-routes.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -793,7 +794,7 @@ export async function registerRoutes(app: any): Promise<void> {
     const query = z
       .object({
         unresolvedOnly: z.coerce.boolean().default(true),
-        limit: z.coerce.number().int().min(1).max(500).default(100),
+        limit: z.coerce.number().int().min(1).max(2500).default(100),
       })
       .parse(req.query ?? {});
 
@@ -2445,7 +2446,7 @@ export async function registerRoutes(app: any): Promise<void> {
     const query = z
       .object({
         status: z.enum(['OPEN', 'CLOSED', 'ALL']).default('ALL'),
-        limit: z.coerce.number().int().min(1).max(500).default(100),
+        limit: z.coerce.number().int().min(1).max(2500).default(100),
       })
       .parse(req.query ?? {});
     const rows = await db.paperCopyPosition.findMany({
@@ -2556,7 +2557,7 @@ export async function registerRoutes(app: any): Promise<void> {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
     const query = z
       .object({
-        limit: z.coerce.number().int().min(1).max(500).default(100),
+        limit: z.coerce.number().int().min(1).max(2500).default(100),
         status: z.enum(['PENDING', 'EXECUTED', 'SKIPPED', 'FAILED', 'ALL']).default('ALL'),
         decisionType: z
           .enum(['COPY', 'SKIP', 'REDUCE', 'CLOSE', 'BOOTSTRAP', 'NOOP', 'ALL'])
@@ -2670,4 +2671,5 @@ export async function registerRoutes(app: any): Promise<void> {
   });
   registerForceCloseRoutes(app);
   registerProfileParityRoutes(app, { prisma, dataAdapter });
+  registerPaperSessionMarketRoutes(app);
 }

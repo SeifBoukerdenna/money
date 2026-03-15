@@ -30,7 +30,7 @@ const MAX_METRIC_ROWS = 2000;
 const MIN_SNAPSHOT_INTERVAL_MS = 60_000;
 
 /** Maximum activity events processed per tick. Prevents runaway DB load. */
-const MAX_EVENTS_PER_TICK = 200;
+const MAX_EVENTS_PER_TICK = 1500;
 
 /**
  * Per-session in-process lock. Prevents concurrent ticks on the same session
@@ -349,36 +349,48 @@ export async function repairPaperCopySession(sessionId: string): Promise<{
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error('Session not found');
 
-  _sessionLocks.delete(sessionId);
+  // FIX-8: Acquire the session lock instead of blindly deleting it.
+  // If a tick is in progress, refuse to repair — user should pause first.
+  if (_sessionLocks.has(sessionId)) {
+    throw new Error(
+      'Session tick is currently in progress — pause the session first, then repair.',
+    );
+  }
+
+  _sessionLocks.add(sessionId);
   _lastSnapshotAt.delete(sessionId);
 
-  const previousStatus = session.status;
-  const cashBefore = Number(session.currentCash);
+  try {
+    const previousStatus = session.status;
+    const cashBefore = Number(session.currentCash);
 
-  await db.paperCopySession.update({
-    where: { id: sessionId },
-    data: { status: 'PAUSED' },
-  });
+    await db.paperCopySession.update({
+      where: { id: sessionId },
+      data: { status: 'PAUSED' },
+    });
 
-  const before = await db.paperCopyPosition.findMany({ where: { sessionId } });
-  const after = await materializePaperSessionState(sessionId);
-  const afterRows = await db.paperCopyPosition.findMany({ where: { sessionId } });
-  const positionsFixed = Math.abs(before.length - afterRows.length);
+    const before = await db.paperCopyPosition.findMany({ where: { sessionId } });
+    const after = await materializePaperSessionState(sessionId);
+    const afterRows = await db.paperCopyPosition.findMany({ where: { sessionId } });
+    const positionsFixed = Math.abs(before.length - afterRows.length);
 
-  await _writeSnapshot(sessionId, { force: true });
+    await _writeSnapshot(sessionId, { force: true });
 
-  logger.info(
-    { sessionId, previousStatus, cashBefore, cashAfter: after.cash, positionsFixed },
-    'session repaired',
-  );
+    logger.info(
+      { sessionId, previousStatus, cashBefore, cashAfter: after.cash, positionsFixed },
+      'session repaired',
+    );
 
-  return {
-    previousStatus,
-    cashBefore,
-    cashAfter: after.cash,
-    positionsFixed,
-    snapshotWritten: true,
-  };
+    return {
+      previousStatus,
+      cashBefore,
+      cashAfter: after.cash,
+      positionsFixed,
+      snapshotWritten: true,
+    };
+  } finally {
+    _sessionLocks.delete(sessionId);
+  }
 }
 
 /**
@@ -395,84 +407,111 @@ export async function reconcilePaperSessionPositions(sessionId: string): Promise
   openInSim: number;
   closedByReconciliation: number;
   cashRecalculated: boolean;
+  skipped?: boolean;
+  reason?: string;
 }> {
-  const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
-  if (!session) throw new Error('Session not found');
-
-  _sessionLocks.delete(sessionId);
-
-  // Fetch current open positions from Polymarket (ground truth)
-  const livePositions = await adapter.getWalletPositions(session.trackedWalletAddress, 'OPEN', 200);
-
-  // Build a set of market+outcome combos that are still open on-chain
-  const liveOpenKeys = new Set(
-    livePositions.map((p) => `${p.conditionId}:${p.outcome.toUpperCase()}`),
-  );
-
-  // Get all simulated open positions
-  const simOpen: Array<Record<string, any>> = await db.paperCopyPosition.findMany({
-    where: { sessionId, status: 'OPEN' },
-  });
-
-  let closedByReconciliation = 0;
-  const now = new Date();
-
-  for (const pos of simOpen) {
-    const key = `${pos.marketId}:${(pos.outcome ?? '').toUpperCase()}`;
-    if (!liveOpenKeys.has(key)) {
-      const markPrice = Number(pos.currentMarkPrice);
-      const closeShares = Number(pos.netShares);
-
-      await db.paperCopyTrade.create({
-        data: {
-          sessionId,
-          trackedWalletId: session.trackedWalletId,
-          walletAddress: session.trackedWalletAddress,
-          sourceType: 'RECONCILIATION',
-          sourceEventTimestamp: null,
-          sourceTxHash: null,
-          executorType: 'PAPER_SESSION_ENGINE',
-          isBootstrap: false,
-          sourceActivityEventId: null,
-          marketId: pos.marketId,
-          marketQuestion: pos.marketQuestion ?? null,
-          outcome: pos.outcome,
-          side: 'SELL',
-          action: 'RECONCILE_CLOSE',
-          sourcePrice: markPrice,
-          simulatedPrice: markPrice,
-          sourceShares: closeShares,
-          simulatedShares: closeShares,
-          notional: closeShares * markPrice,
-          feeApplied: 0,
-          slippageApplied: 0,
-          eventTimestamp: now,
-          processedAt: now,
-          reasoning: {
-            type: 'RECONCILE_CLOSE',
-            reason: 'Position no longer open on Polymarket — closed by reconciliation',
-          },
-        },
-      });
-
-      closedByReconciliation++;
-      logger.info(
-        { sessionId, marketId: pos.marketId, outcome: pos.outcome, closeShares, markPrice },
-        'position closed by reconciliation',
-      );
-    }
+  // FIX-8: Acquire the session lock instead of blindly deleting it.
+  // If a tick is currently in progress, skip reconciliation — the caller can retry.
+  // The old code called `_sessionLocks.delete(sessionId)` here, which cleared
+  // any existing lock and allowed a concurrent tick + reconciliation to run
+  // simultaneously, creating duplicate trade records.
+  if (_sessionLocks.has(sessionId)) {
+    logger.warn({ sessionId }, 'reconciliation skipped — session tick in progress');
+    return {
+      openOnChain: 0,
+      openInSim: 0,
+      closedByReconciliation: 0,
+      cashRecalculated: false,
+      skipped: true,
+      reason: 'Session tick in progress — retry after current tick completes',
+    };
   }
 
-  await materializePaperSessionState(sessionId);
+  _sessionLocks.add(sessionId);
 
-  await _writeSnapshot(sessionId, { force: true });
+  try {
+    const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
+    if (!session) throw new Error('Session not found');
 
-  return {
-    openOnChain: livePositions.length,
-    openInSim: simOpen.length,
-    closedByReconciliation,
-    cashRecalculated: false,
-  };
+    // Fetch current open positions from Polymarket (ground truth)
+    const livePositions = await adapter.getWalletPositions(
+      session.trackedWalletAddress,
+      'OPEN',
+      200,
+    );
+
+    // Build a set of market+outcome combos that are still open on-chain
+    const liveOpenKeys = new Set(
+      livePositions.map((p) => `${p.conditionId}:${p.outcome.toUpperCase()}`),
+    );
+
+    // Get all simulated open positions
+    const simOpen: Array<Record<string, any>> = await db.paperCopyPosition.findMany({
+      where: { sessionId, status: 'OPEN' },
+    });
+
+    let closedByReconciliation = 0;
+    const now = new Date();
+
+    for (const pos of simOpen) {
+      const key = `${pos.marketId}:${(pos.outcome ?? '').toUpperCase()}`;
+      if (!liveOpenKeys.has(key)) {
+        const markPrice = Number(pos.currentMarkPrice);
+        const closeShares = Number(pos.netShares);
+
+        await db.paperCopyTrade.create({
+          data: {
+            sessionId,
+            trackedWalletId: session.trackedWalletId,
+            walletAddress: session.trackedWalletAddress,
+            sourceType: 'RECONCILIATION',
+            sourceEventTimestamp: null,
+            sourceTxHash: null,
+            executorType: 'PAPER_SESSION_ENGINE',
+            isBootstrap: false,
+            sourceActivityEventId: null,
+            marketId: pos.marketId,
+            marketQuestion: pos.marketQuestion ?? null,
+            outcome: pos.outcome,
+            side: 'SELL',
+            action: 'RECONCILE_CLOSE',
+            sourcePrice: markPrice,
+            simulatedPrice: markPrice,
+            sourceShares: closeShares,
+            simulatedShares: closeShares,
+            notional: closeShares * markPrice,
+            feeApplied: 0,
+            slippageApplied: 0,
+            eventTimestamp: now,
+            processedAt: now,
+            reasoning: {
+              type: 'RECONCILE_CLOSE',
+              reason: 'Position no longer open on Polymarket — closed by reconciliation',
+            },
+          },
+        });
+
+        closedByReconciliation++;
+        logger.info(
+          { sessionId, marketId: pos.marketId, outcome: pos.outcome, closeShares, markPrice },
+          'position closed by reconciliation',
+        );
+      }
+    }
+
+    await materializePaperSessionState(sessionId);
+    await _writeSnapshot(sessionId, { force: true });
+
+    return {
+      openOnChain: livePositions.length,
+      openInSim: simOpen.length,
+      closedByReconciliation,
+      cashRecalculated: false,
+    };
+  } finally {
+    // Always release the lock, even if an error occurred
+    _sessionLocks.delete(sessionId);
+  }
 }
 
 /**
@@ -606,7 +645,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
 
   const startedAt: Date = session.startedAt ?? session.createdAt;
   const lastWatermark = session.lastProcessedEventAt ?? startedAt;
-  const overlapStart = new Date(lastWatermark.getTime() - 2 * 60_000);
+  const overlapStart = new Date(lastWatermark.getTime() - 2 * 15_000);
 
   // Fetch activity events after the last watermark.
   // CRITICAL: Do NOT filter on `side`, `price`, or `shares` here.

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { LayoutShell } from '../components/layout-shell';
+import { MarketHistoryView } from '../components/position-history';
 
 const API = process.env.NEXT_PUBLIC_WEB_API_URL ?? 'http://localhost:4000';
 
@@ -87,7 +88,7 @@ type PaperTrade = {
     eventTimestamp: string;
 };
 
-type TabKey = 'live' | 'positions' | 'history';
+type TabKey = 'live' | 'positions' | 'history' | 'market-history';
 type PositionSortKey = 'market' | 'shares' | 'value' | 'pnl' | 'since';
 type SortDir = 'asc' | 'desc';
 
@@ -651,9 +652,9 @@ export default function SimulationPage() {
 
                         <div className="panel overflow-hidden">
                             <div className="flex border-b border-slate-800/50">
-                                {(['live', 'positions', 'history'] as TabKey[]).map((t) => (
+                                {(['live', 'positions', 'history', 'market-history'] as TabKey[]).map((t) => (
                                     <button key={t} onClick={() => setActiveTab(t)} className={`px-5 py-3 text-xs font-semibold ${activeTab === t ? 'border-b-2 border-blue-400 text-blue-300' : 'text-slate-500 hover:text-slate-300'}`}>
-                                        {t === 'live' ? 'Live Feed' : t === 'positions' ? 'Positions' : 'History'}
+                                        {t === 'live' ? 'Live Feed' : t === 'positions' ? 'Positions' : t === 'market-history' ? 'market-history' : 'History'}
                                     </button>
                                 ))}
                             </div>
@@ -783,6 +784,9 @@ export default function SimulationPage() {
                                             </table>
                                         </div>
                                     </div>
+                                )}
+                                {activeTab === 'market-history' && (
+                                    <MarketHistoryView sessionId={activeSessionId} />
                                 )}
                             </div>
                         </div>
