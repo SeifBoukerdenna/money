@@ -130,6 +130,136 @@ function skipDecision(input: {
   };
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// POSITION MATCHING FOR CLOSE/REDEEM EVENTS
+//
+// Polymarket REDEEM events are unreliable for position matching:
+//   - outcome is almost always null
+//   - marketId on the REDEEM may be a DIFFERENT conditionId than the one
+//     used on the BUY (Polymarket uses per-outcome-token IDs)
+//
+// This function tries every available signal to find the matching open position:
+//   1. Exact key match (marketId:outcome) — fast path for normal SELLs
+//   2. marketId prefix scan — for null-outcome REDEEMs where marketId matches
+//   3. conditionId from event fields — different field might match
+//   4. conditionId from rawPayloadJson — Polymarket raw data often has it
+//   5. All candidate IDs from rawPayloadJson (market, asset_id, token_id, etc.)
+//
+// Returns the first open position found with netShares > 0.
+// ──────────────────────────────────────────────────────────────────────────────
+function findOpenPositionForCloseEvent(
+  event: Record<string, unknown>,
+  marketId: string | null,
+  outcome: string,
+  positionStateByKey: Map<string, ProjectedPositionState>,
+): { position: ProjectedPositionState; resolvedOutcome: string; matchMethod: string } | null {
+  // 1. Exact key match (marketId:outcome)
+  if (marketId) {
+    const exactKey = `${marketId}:${outcome}`;
+    const exact = positionStateByKey.get(exactKey);
+    if (exact && exact.netShares > 0) {
+      return { position: exact, resolvedOutcome: outcome, matchMethod: 'exact_key' };
+    }
+  }
+
+  // Helper: scan all positions for any key starting with a given ID prefix
+  const scanById = (
+    id: string,
+  ): { position: ProjectedPositionState; resolvedOutcome: string } | null => {
+    const prefix = `${id}:`;
+    for (const [k, p] of positionStateByKey) {
+      if (k.startsWith(prefix) && p.netShares > 0) {
+        return { position: p, resolvedOutcome: p.outcome };
+      }
+    }
+    return null;
+  };
+
+  // 2. marketId prefix scan (for null outcome → "UNKNOWN")
+  if (marketId) {
+    const found = scanById(marketId);
+    if (found) return { ...found, matchMethod: 'marketId_scan' };
+  }
+
+  // Collect ALL candidate IDs from every available source on the event
+  const candidateIds = new Set<string>();
+
+  // 3. conditionId from event fields
+  const conditionId = typeof event.conditionId === 'string' ? event.conditionId.trim() : null;
+  if (conditionId && conditionId.length > 0) candidateIds.add(conditionId);
+
+  // Also try marketSlug, slug etc as potential ID carriers
+  for (const field of [
+    'conditionId',
+    'condition_id',
+    'slug',
+    'marketSlug',
+    'market_slug',
+    'questionId',
+  ]) {
+    const val = event[field];
+    if (typeof val === 'string' && val.trim().length > 0) {
+      candidateIds.add(val.trim());
+    }
+  }
+
+  // 4. Dig into rawPayloadJson for any IDs
+  const raw =
+    event.rawPayloadJson && typeof event.rawPayloadJson === 'object'
+      ? (event.rawPayloadJson as Record<string, unknown>)
+      : null;
+
+  if (raw) {
+    for (const field of [
+      'conditionId',
+      'condition_id',
+      'marketId',
+      'market_id',
+      'market',
+      'asset_id',
+      'assetId',
+      'token_id',
+      'tokenId',
+      'questionId',
+      'question_id',
+      'slug',
+      'marketSlug',
+      'fpmmAddress',
+      'fpmm',
+    ]) {
+      const val = raw[field];
+      if (typeof val === 'string' && val.trim().length > 0) {
+        candidateIds.add(val.trim());
+      }
+    }
+  }
+
+  // Remove the marketId we already tried
+  if (marketId) candidateIds.delete(marketId);
+
+  // 5. Try each candidate ID
+  for (const id of candidateIds) {
+    const found = scanById(id);
+    if (found) return { ...found, matchMethod: `candidate_id:${id.slice(0, 16)}` };
+  }
+
+  // 6. Last resort: match by marketQuestion (title)
+  // This is safe because Polymarket 5-min markets have unique time-range names.
+  // Multiple positions for the same market (UP + DOWN) are fine — we close
+  // whichever has shares > 0. The next REDEEM closes the other side.
+  const eventQuestion =
+    typeof event.marketQuestion === 'string' ? event.marketQuestion.trim() : null;
+  if (eventQuestion && eventQuestion.length > 5) {
+    for (const [, p] of positionStateByKey) {
+      if (p.netShares > 0 && p.marketQuestion && p.marketQuestion.trim() === eventQuestion) {
+        return { position: p, resolvedOutcome: p.outcome, matchMethod: 'market_question' };
+      }
+    }
+  }
+
+  return null;
+}
+
 export function evaluatePaperEventDecision(input: {
   session: Pick<
     PaperCopySession,
@@ -198,7 +328,11 @@ export function evaluatePaperEventDecision(input: {
   }
 
   if (eventType === 'CLOSE' || eventType === 'REDEEM') {
-    if (!position || position.netShares <= 0) {
+    // Use comprehensive matching — tries marketId, conditionId, rawPayload IDs,
+    // and marketQuestion to find ANY open position this REDEEM belongs to.
+    const match = findOpenPositionForCloseEvent(event, marketId, outcome, positionStateByKey);
+
+    if (!match) {
       return skipDecision({
         marketId,
         marketQuestion,
@@ -207,20 +341,29 @@ export function evaluatePaperEventDecision(input: {
         copyRatio,
         reasonCode: PAPER_REASON_CODES.SKIP_NO_OPEN_POSITION,
         humanReason: 'Source exit event arrived but no open copied position exists to close.',
+        sizingInputsJson: {
+          eventType,
+          triedMarketId: marketId,
+          triedConditionId: typeof event.conditionId === 'string' ? event.conditionId : null,
+          eventOutcome: outcome,
+          openPositionKeys: [...positionStateByKey.keys()].slice(0, 20),
+        },
       });
     }
 
+    const resolvedPosition = match.position;
+    const resolvedOutcome = match.resolvedOutcome;
     const sourcePrice = asNumber(event.price) ?? 0;
     const closePrice = Math.max(0, sourcePrice);
-    const closeShares = position.netShares;
+    const closeShares = resolvedPosition.netShares;
 
     return {
       decisionType: 'CLOSE',
       status: 'PENDING',
       executorType: 'PAPER',
-      marketId,
-      marketQuestion,
-      outcome,
+      marketId: resolvedPosition.marketId,
+      marketQuestion: marketQuestion ?? resolvedPosition.marketQuestion,
+      outcome: resolvedOutcome,
       side: 'SELL',
       sourceShares: asNumber(event.shares),
       simulatedShares: closeShares,
@@ -229,7 +372,12 @@ export function evaluatePaperEventDecision(input: {
       copyRatio,
       sizingInputsJson: {
         eventType,
-        heldShares: position.netShares,
+        heldShares: resolvedPosition.netShares,
+        originalOutcome: outcome,
+        resolvedOutcome,
+        matchMethod: match.matchMethod,
+        eventMarketId: marketId,
+        positionMarketId: resolvedPosition.marketId,
       },
       reasonCode: PAPER_REASON_CODES.CLOSE_ON_SOURCE_EXIT,
       humanReason:
@@ -272,8 +420,6 @@ export function evaluatePaperEventDecision(input: {
     sourcePrice = sourceNotional / sourceShares;
   }
 
-  // Mirror-first behavior for sell/reduce events: if source doesn't provide
-  // explicit size, use current copied exposure instead of skipping.
   if (effectiveSide === 'SELL' && position && position.netShares > 0) {
     if (!sourceShares || sourceShares <= 0) {
       sourceShares = position.netShares;
@@ -283,7 +429,6 @@ export function evaluatePaperEventDecision(input: {
     }
   }
 
-  // Last resort for BUY events with only notional present.
   if (effectiveSide === 'BUY' && sourceNotional && sourceNotional > 0) {
     if (!sourcePrice || sourcePrice <= 0) sourcePrice = 0.5;
     if (!sourceShares || sourceShares <= 0) sourceShares = sourceNotional / sourcePrice;
@@ -336,10 +481,7 @@ export function evaluatePaperEventDecision(input: {
         copyRatio,
         reasonCode: PAPER_REASON_CODES.SKIP_NO_AVAILABLE_CASH,
         humanReason: 'Insufficient available cash for buy-side copy execution.',
-        riskChecksJson: {
-          projectedCash,
-          perMarketCap: maxPerMarket,
-        },
+        riskChecksJson: { projectedCash, perMarketCap: maxPerMarket },
       });
     }
 
@@ -359,11 +501,7 @@ export function evaluatePaperEventDecision(input: {
         copyRatio,
         reasonCode: PAPER_REASON_CODES.SKIP_OVER_MARKET_CAP,
         humanReason: 'Proposed buy would exceed maximum total exposure guardrail.',
-        riskChecksJson: {
-          projectedGrossExposure,
-          requestedNotional: notional,
-          maxTotalExposure,
-        },
+        riskChecksJson: { projectedGrossExposure, requestedNotional: notional, maxTotalExposure },
       });
     }
   } else {
@@ -396,10 +534,7 @@ export function evaluatePaperEventDecision(input: {
       copyRatio,
       reasonCode: PAPER_REASON_CODES.SKIP_BELOW_MIN_NOTIONAL,
       humanReason: 'Copy trade notional is below configured minimum threshold.',
-      riskChecksJson: {
-        minNotional,
-        computedNotional: notional,
-      },
+      riskChecksJson: { minNotional, computedNotional: notional },
     });
   }
 
@@ -417,17 +552,10 @@ export function evaluatePaperEventDecision(input: {
       sourcePrice,
       intendedFillPrice,
       copyRatio,
-      sizingInputsJson: {
-        eventType,
-        projectedCash,
-        maxPerMarket,
-      },
+      sizingInputsJson: { eventType, projectedCash, maxPerMarket },
       reasonCode: PAPER_REASON_CODES.COPY_APPROVED,
       humanReason: 'Source buy approved for copy execution under current session guardrails.',
-      riskChecksJson: {
-        projectedCash,
-        maxTotalExposure,
-      },
+      riskChecksJson: { projectedCash, maxTotalExposure },
       notes: null,
     };
   }
@@ -448,11 +576,7 @@ export function evaluatePaperEventDecision(input: {
     sourcePrice,
     intendedFillPrice,
     copyRatio,
-    sizingInputsJson: {
-      eventType,
-      heldShares: position?.netShares ?? 0,
-      remainingShares,
-    },
+    sizingInputsJson: { eventType, heldShares: position?.netShares ?? 0, remainingShares },
     reasonCode:
       decisionType === 'CLOSE'
         ? PAPER_REASON_CODES.CLOSE_ON_SOURCE_EXIT

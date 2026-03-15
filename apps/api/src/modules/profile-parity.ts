@@ -233,8 +233,8 @@ export async function buildPnlChart(walletId: string, range: PnlRange): Promise<
     }
   }
 
-  const firstTradeMs = trades[0].tradedAt.getTime();
-  const lastTradeMs = trades[trades.length - 1].tradedAt.getTime();
+  const firstTradeMs = trades[0]!.tradedAt.getTime();
+  const lastTradeMs = trades[trades.length - 1]!.tradedAt.getTime();
   const windowStart = sinceMs > 0 ? sinceMs : firstTradeMs;
   const bucketStart0 = floorToBucket(windowStart, bucketMs);
   const bucketEnd = floorToBucket(now, bucketMs) + bucketMs;
@@ -256,8 +256,8 @@ export async function buildPnlChart(walletId: string, range: PnlRange): Promise<
 
   for (const bStart of buckets) {
     const bEnd = bStart + bucketMs;
-    while (tradeIdx < trades.length && trades[tradeIdx].tradedAt.getTime() < bEnd) {
-      const trade = trades[tradeIdx];
+    while (tradeIdx < trades.length && trades[tradeIdx]!.tradedAt.getTime() < bEnd) {
+      const trade = trades[tradeIdx]!;
       const key = `${trade.marketId}:${trade.outcome}`;
       const sz = Number(trade.size);
       const px = Number(trade.price);

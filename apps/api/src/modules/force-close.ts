@@ -306,7 +306,7 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
   try {
     const sourceClosed = await deriveClosedPositionsFromDb(db, session.trackedWalletId);
     for (const pos of sourceClosed) {
-      const marketId = String(pos.conditionId ?? pos.marketId ?? '').trim();
+      const marketId = String(pos.conditionId ?? '').trim();
       const outcome = String(pos.outcome ?? '')
         .trim()
         .toUpperCase();

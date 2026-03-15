@@ -201,9 +201,9 @@ export function registerProfileParityRoutes(
 
     const { items, total } = sortAndFilterPositions(normalized, {
       status: query.status,
-      search: query.search,
-      sortBy: query.sortBy,
-      sortDir: query.sortDir,
+      ...(query.search !== undefined ? { search: query.search } : {}),
+      ...(query.sortBy !== undefined ? { sortBy: query.sortBy } : {}),
+      ...(query.sortDir !== undefined ? { sortDir: query.sortDir } : {}),
       page: query.page,
       pageSize: query.pageSize,
     });

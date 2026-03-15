@@ -2226,7 +2226,10 @@ export async function registerRoutes(app: any): Promise<void> {
     });
 
     rows.sort(
-      (a, b) => Math.abs(b.sourceOutcome.pnlUsd ?? 0) - Math.abs(a.sourceOutcome.pnlUsd ?? 0),
+      (
+        a: { sourceOutcome: { pnlUsd: number | null } },
+        b: { sourceOutcome: { pnlUsd: number | null } },
+      ) => Math.abs(b.sourceOutcome.pnlUsd ?? 0) - Math.abs(a.sourceOutcome.pnlUsd ?? 0),
     );
     return { items: rows };
   });

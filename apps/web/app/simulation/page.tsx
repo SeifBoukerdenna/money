@@ -93,7 +93,16 @@ type SortDir = 'asc' | 'desc';
 
 const fmtUsd = (n: number, dp = 2) =>
     `$${n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
-const fmtPnl = (n: number) => `${n >= 0 ? '+' : '-'}${fmtUsd(Math.abs(n))}`;
+
+// FIX: Epsilon-based normalization so +$0.00 / -$0.00 never appear
+const normMoney = (v: number) => (Math.abs(v) < 1e-9 ? 0 : v);
+const fmtPnl = (n: number) => {
+    const v = normMoney(n);
+    if (v > 0) return `+${fmtUsd(v)}`;
+    if (v < 0) return `-${fmtUsd(Math.abs(v))}`;
+    return `${fmtUsd(0)}`;
+};
+
 const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 const shortDateTime = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : '-');
 const pnlClass = (n: number) =>
@@ -381,16 +390,18 @@ export default function SimulationPage() {
         ]);
     };
 
+    // FIX: Use normMoney so breakeven (0 PnL) isn't counted as LOST
     const historySummary = useMemo(() => {
         const total = closedPositions.length;
-        const won = closedPositions.filter((p) => p.realizedPnl > 0).length;
-        const lost = total - won;
+        const won = closedPositions.filter((p) => normMoney(p.realizedPnl) > 0).length;
+        const lost = closedPositions.filter((p) => normMoney(p.realizedPnl) < 0).length;
         const totalPnl = closedPositions.reduce((sum, p) => sum + p.realizedPnl, 0);
+        const decisive = won + lost;
         return {
             total,
             won,
             lost,
-            winRate: total > 0 ? (won / total) * 100 : 0,
+            winRate: decisive > 0 ? (won / decisive) * 100 : 0,
             totalPnl,
         };
     }, [closedPositions]);
@@ -500,11 +511,13 @@ export default function SimulationPage() {
         [closedPositions],
     );
 
+    // FIX: Win rate excludes breakeven from denominator
     const closedWinRatePct = useMemo(() => {
-        const total = closedPositions.length;
-        if (total === 0) return 0;
-        const wins = closedPositions.filter((p) => p.realizedPnl > 0).length;
-        return (wins / total) * 100;
+        const wins = closedPositions.filter((p) => normMoney(p.realizedPnl) > 0).length;
+        const losses = closedPositions.filter((p) => normMoney(p.realizedPnl) < 0).length;
+        const decisive = wins + losses;
+        if (decisive === 0) return 0;
+        return (wins / decisive) * 100;
     }, [closedPositions]);
 
     const sortedOpenLots = useMemo(() => {
@@ -573,12 +586,7 @@ export default function SimulationPage() {
                         </div>
                         <div className="w-44">
                             <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Min Notional</label>
-                            <input
-                                className="input mt-1"
-                                value={minNotional}
-                                onChange={(e) => setMinNotional(e.target.value)}
-                                placeholder="0"
-                            />
+                            <input className="input mt-1" value={minNotional} onChange={(e) => setMinNotional(e.target.value)} placeholder="0" />
                         </div>
                         <button className="btn-primary h-10 px-5" disabled={creating} onClick={createAndStart}>
                             {creating ? 'Starting...' : 'Start Copy Trading ->'}
@@ -629,7 +637,7 @@ export default function SimulationPage() {
                             <div className="flex flex-wrap items-center justify-between gap-3">
                                 <div>
                                     <p className="text-lg font-semibold text-slate-100">{detail.trackedWalletLabel} | Started {shortDateTime(detail.startedAt)}</p>
-                                    <p className="mt-1 text-xs text-slate-400">Cash: {fmtUsd(detail.currentCash, 0)} | Open: {openLots.length} lots | P&amp;L: <span className={pnlClass(detail.totalPnl)}>{fmtPnl(detail.totalPnl)} ({fmtPct(detail.returnPct)})</span> | Unrealized: <span className={pnlClass(openLotsSummary.totalUnrealizedPnl)}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</span> | Realized: <span className={pnlClass(realizedPnlSummary)}>{fmtPnl(realizedPnlSummary)}</span> | Win rate (closed): {closedWinRatePct.toFixed(1)}%</p>
+                                    <p className="mt-1 text-xs text-slate-400">Cash: {fmtUsd(detail.currentCash, 0)} | Open: {openLots.length} lots | P&amp;L: <span className={pnlClass(detail.totalPnl)}>{fmtPnl(detail.totalPnl)} ({fmtPct(detail.returnPct)})</span> | Unrealized: <span className={pnlClass(openLotsSummary.totalUnrealizedPnl)}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</span> | Realized: <span className={pnlClass(realizedPnlSummary)}>{fmtPnl(realizedPnlSummary)}</span> | Win rate (closed): {detail.winRatePct.toFixed(1)}%</p>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${statusPill(detail.status)}`}>{detail.status}</span>
@@ -687,15 +695,25 @@ export default function SimulationPage() {
 
                                 {activeTab === 'positions' && (
                                     <div className="overflow-x-auto">
-                                        {openLots.length === 0 ? <p className="py-8 text-center text-sm text-slate-600">Waiting for source wallet to make a trade...</p> : (
+                                        {openLots.length === 0 ? (
+                                            <p className="py-8 text-center text-sm text-slate-500">No open positions.</p>
+                                        ) : (
                                             <>
-                                                <div className="mb-3 grid gap-2 sm:grid-cols-3">
-                                                    <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-2 text-xs text-slate-300">Unrealized P&amp;L: <span className={pnlClass(openLotsSummary.totalUnrealizedPnl)}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</span></div>
-                                                    <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-2 text-xs text-slate-300">Open Value: {fmtUsd(openLotsSummary.totalValue)}</div>
-                                                    <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-2 text-xs text-slate-300">Open Shares: {openLotsSummary.totalShares.toFixed(2)}</div>
-                                                </div>
+                                                <p className="mb-2 text-xs text-slate-400">{openLots.length} open lots — Value: {fmtUsd(openLotsSummary.totalValue)} — Unrealized: <span className={pnlClass(openLotsSummary.totalUnrealizedPnl)}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</span></p>
                                                 <table className="w-full text-xs">
-                                                    <thead><tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500"><th className="py-2 text-left"><button className="hover:text-slate-300" onClick={() => togglePositionSort('market')}>Market{sortLabel('market')}</button></th><th className="py-2 text-right">Outcome</th><th className="py-2 text-right"><button className="hover:text-slate-300" onClick={() => togglePositionSort('shares')}>Shares{sortLabel('shares')}</button></th><th className="py-2 text-right">Entry</th><th className="py-2 text-right">Current</th><th className="py-2 text-right"><button className="hover:text-slate-300" onClick={() => togglePositionSort('value')}>Value{sortLabel('value')}</button></th><th className="py-2 text-right"><button className="hover:text-slate-300" onClick={() => togglePositionSort('pnl')}>P&amp;L{sortLabel('pnl')}</button></th><th className="py-2 text-right"><button className="hover:text-slate-300" onClick={() => togglePositionSort('since')}>Since{sortLabel('since')}</button></th><th className="py-2 text-right">Action</th></tr></thead>
+                                                    <thead>
+                                                        <tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500">
+                                                            <th className="cursor-pointer py-2 text-left" onClick={() => togglePositionSort('market')}>Market{sortLabel('market')}</th>
+                                                            <th className="py-2 text-right">Outcome</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('shares')}>Shares{sortLabel('shares')}</th>
+                                                            <th className="py-2 text-right">Entry</th>
+                                                            <th className="py-2 text-right">Mark</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('value')}>Value{sortLabel('value')}</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('pnl')}>P&L{sortLabel('pnl')}</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('since')}>Since{sortLabel('since')}</th>
+                                                            <th className="py-2 text-right">Close</th>
+                                                        </tr>
+                                                    </thead>
                                                     <tbody className="divide-y divide-slate-800/25">
                                                         {sortedOpenLots.map((p) => {
                                                             const value = p.remainingShares * p.currentMarkPrice;
@@ -756,7 +774,8 @@ export default function SimulationPage() {
                                                             <td className="py-2 text-right text-slate-400">{p.avgEntryPrice.toFixed(3)} to {p.currentMarkPrice.toFixed(3)}</td>
                                                             <td className="py-2 text-right text-slate-300">{p.netShares.toFixed(2)}</td>
                                                             <td className={`py-2 text-right font-semibold ${pnlClass(p.realizedPnl)}`}>{fmtPnl(p.realizedPnl)}</td>
-                                                            <td className={`py-2 text-right ${p.realizedPnl > 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{p.realizedPnl > 0 ? 'WON' : 'LOST'}</td>
+                                                            {/* FIX: zero PnL shows EVEN instead of LOST */}
+                                                            <td className={`py-2 text-right ${normMoney(p.realizedPnl) > 0 ? 'text-emerald-300' : normMoney(p.realizedPnl) < 0 ? 'text-rose-300' : 'text-slate-400'}`}>{normMoney(p.realizedPnl) > 0 ? 'WON' : normMoney(p.realizedPnl) < 0 ? 'LOST' : 'EVEN'}</td>
                                                             <td className="py-2 text-right text-slate-500">{shortDateTime(p.closedAt)}</td>
                                                         </tr>
                                                     ))}

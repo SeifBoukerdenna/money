@@ -2,6 +2,7 @@ import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import type { Prisma } from '@prisma/client';
 import { createPolymarketDataAdapter } from './polymarket.js';
+import { normalizeMoney } from '../lib/money-utils.js';
 
 const dataAdapter = createPolymarketDataAdapter();
 
@@ -45,7 +46,7 @@ type LedgerWarning = {
   context?: Record<string, unknown>;
 };
 
-type ReducedSessionState = {
+export type ReducedSessionState = {
   cash: number;
   realizedPnl: number;
   unrealizedPnl: number;
@@ -103,7 +104,9 @@ function applyLedgerRow(
   }
 
   position.marketQuestion = row.marketQuestion ?? position.marketQuestion;
-  position.currentMarkPrice = price;
+  if (price > EPSILON || row.side === 'BUY') {
+    position.currentMarkPrice = price;
+  }
   position.lastEventAt = row.eventTimestamp;
 
   if (row.side === 'BUY') {
@@ -143,7 +146,7 @@ function applyLedgerRow(
     return 0;
   }
 
-  const realized = closeShares * (price - position.avgEntryPrice) - fee;
+  const realized = normalizeMoney(closeShares * (price - position.avgEntryPrice) - fee);
   position.realizedPnl += realized;
   position.netShares = Math.max(0, held - closeShares);
 
@@ -165,8 +168,6 @@ async function buildMarkMap(
 ): Promise<Map<string, number>> {
   const markMap = new Map<string, number>();
 
-  // Primary source for marks: live open positions from Polymarket for the tracked wallet.
-  // This keeps marks moving even when no new trade events are ingested.
   try {
     const openPositions = await dataAdapter.getWalletPositions(trackedWalletAddress, 'OPEN', 500);
     for (const p of openPositions as Array<Record<string, unknown>>) {
@@ -182,26 +183,16 @@ async function buildMarkMap(
     logger.warn({ trackedWalletId, err }, 'failed to fetch live wallet marks, using DB fallback');
   }
 
-  // Fallback/coverage source: most recent ingested activity prices.
   const rows = await prisma.walletActivityEvent.findMany({
-    where: {
-      trackedWalletId,
-      price: { not: null },
-    },
+    where: { trackedWalletId, price: { not: null } },
     orderBy: [{ eventTimestamp: 'desc' }, { createdAt: 'desc' }],
     take: 3000,
-    select: {
-      marketId: true,
-      outcome: true,
-      price: true,
-    },
+    select: { marketId: true, outcome: true, price: true },
   });
 
   for (const row of rows) {
     const price = row.price !== null ? Number(row.price) : NaN;
-    if (!Number.isFinite(price)) {
-      continue;
-    }
+    if (!Number.isFinite(price)) continue;
     const key = keyFor(row.marketId, (row.outcome ?? 'UNKNOWN').toUpperCase());
     if (!markMap.has(key)) {
       markMap.set(key, price);
@@ -213,16 +204,9 @@ async function buildMarkMap(
 export async function reducePaperSessionLedger(sessionId: string): Promise<ReducedSessionState> {
   const session = await prisma.paperCopySession.findUnique({
     where: { id: sessionId },
-    select: {
-      id: true,
-      trackedWalletId: true,
-      trackedWalletAddress: true,
-      startingCash: true,
-    },
+    select: { id: true, trackedWalletId: true, trackedWalletAddress: true, startingCash: true },
   });
-  if (!session) {
-    throw new Error('Session not found');
-  }
+  if (!session) throw new Error('Session not found');
 
   const rows = await prisma.paperCopyTrade.findMany({
     where: { sessionId },
@@ -266,61 +250,22 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
   const positions = Array.from(positionsByKey.values()).map((position) => {
     const key = keyFor(position.marketId, position.outcome);
     const mark = markMap.get(key) ?? position.currentMarkPrice ?? position.avgEntryPrice;
-
-    const normalizedMark = Number.isFinite(mark) ? mark : position.avgEntryPrice;
+    const normalizedMark = Number.isFinite(mark) ? Math.max(0, Math.min(1, mark)) : 0;
     position.currentMarkPrice = normalizedMark;
-    position.unrealizedPnl = position.netShares * (normalizedMark - position.avgEntryPrice);
 
-    if (!Number.isFinite(position.unrealizedPnl)) {
-      warnings.push({
-        code: 'NON_FINITE_POSITION_VALUE',
-        message: 'Position unrealized PnL became non-finite during ledger reduction.',
-        context: {
-          marketId: position.marketId,
-          outcome: position.outcome,
-          netShares: position.netShares,
-          markPrice: normalizedMark,
-          avgEntryPrice: position.avgEntryPrice,
-        },
-      });
+    position.realizedPnl = normalizeMoney(position.realizedPnl);
+    realizedPnl += position.realizedPnl;
+
+    if (position.status === 'OPEN' && position.netShares > EPSILON) {
+      position.unrealizedPnl = position.netShares * (normalizedMark - position.avgEntryPrice);
+    } else {
       position.unrealizedPnl = 0;
     }
-
-    if (position.status === 'OPEN' && position.netShares <= EPSILON) {
-      warnings.push({
-        code: 'OPEN_POSITION_ZERO_SHARES',
-        message: 'Position was OPEN with zero shares; it was normalized to CLOSED.',
-        context: {
-          marketId: position.marketId,
-          outcome: position.outcome,
-        },
-      });
-      position.status = 'CLOSED';
-      position.netShares = 0;
-      position.closedAt = position.lastEventAt;
-    }
-
-    if (position.status === 'CLOSED' && position.netShares > EPSILON) {
-      warnings.push({
-        code: 'CLOSED_POSITION_POSITIVE_SHARES',
-        message: 'Position was CLOSED with positive shares; it was normalized to OPEN.',
-        context: {
-          marketId: position.marketId,
-          outcome: position.outcome,
-          netShares: position.netShares,
-        },
-      });
-      position.status = 'OPEN';
-      position.closedAt = null;
-    }
-
-    realizedPnl += position.realizedPnl;
     unrealizedPnl += position.status === 'OPEN' ? position.unrealizedPnl : 0;
     if (position.status === 'OPEN') {
       openPositionsCount += 1;
       grossExposure += Math.abs(position.netShares * position.currentMarkPrice);
     }
-
     return position;
   });
 
@@ -336,13 +281,11 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     .filter((p) => p.status === 'OPEN')
     .reduce((sum, p) => sum + p.netShares * p.currentMarkPrice, 0);
 
-  const netLiquidationValue = cash + openMarketValue;
-
   return {
     cash,
     realizedPnl,
     unrealizedPnl,
-    netLiquidationValue,
+    netLiquidationValue: cash + openMarketValue,
     grossExposure,
     openPositionsCount,
     warnings,
@@ -379,18 +322,10 @@ export async function materializePaperSessionState(
     };
 
     if (row) {
-      await prisma.paperCopyPosition.update({
-        where: { id: row.id },
-        data,
-      });
+      await prisma.paperCopyPosition.update({ where: { id: row.id }, data });
     } else {
       await prisma.paperCopyPosition.create({
-        data: {
-          sessionId,
-          marketId: position.marketId,
-          outcome: position.outcome,
-          ...data,
-        },
+        data: { sessionId, marketId: position.marketId, outcome: position.outcome, ...data },
       });
     }
   }
@@ -399,16 +334,12 @@ export async function materializePaperSessionState(
     .filter((row) => !touchedKeys.has(keyFor(row.marketId, row.outcome)))
     .map((row) => row.id);
   if (staleIds.length > 0) {
-    await prisma.paperCopyPosition.deleteMany({
-      where: { id: { in: staleIds } },
-    });
+    await prisma.paperCopyPosition.deleteMany({ where: { id: { in: staleIds } } });
   }
 
   await prisma.paperCopySession.update({
     where: { id: sessionId },
-    data: {
-      currentCash: reduced.cash,
-    },
+    data: { currentCash: reduced.cash },
   });
 
   if (reduced.warnings.length > 0) {

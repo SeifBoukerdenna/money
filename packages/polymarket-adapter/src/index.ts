@@ -178,7 +178,7 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
     const events: WalletActivityFeedEvent[] = [];
 
     for (const row of payload) {
-      const marketId = String(row.market ?? row.marketId ?? row.conditionId ?? '').trim();
+      const marketId = String(row.conditionId ?? row.market ?? row.marketId ?? '').trim();
       const conditionIdRaw = String(row.conditionId ?? row.market ?? row.marketId ?? '').trim();
       const conditionId = conditionIdRaw.length > 0 ? conditionIdRaw : null;
       const tradedAtMs = toEpochMs(row.timestamp ?? row.tradedAt ?? row.createdAt ?? row.time);
