@@ -1,6 +1,14 @@
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import { createPolymarketDataAdapter } from './polymarket.js';
+import { materializePaperSessionState } from './paper-accounting.js';
+import {
+  applyProjectedExecution,
+  evaluatePaperEventDecision,
+  PAPER_REASON_CODES,
+} from './paper-decisioning.js';
+import { resolvePaperExecutor } from './paper-executor.js';
+import { raiseSystemAlert } from './system-alerts.js';
 
 const adapter = createPolymarketDataAdapter();
 const db = prisma as unknown as Record<string, any>;
@@ -45,6 +53,11 @@ export async function createPaperCopySession(input: {
   maxAllocationPerMarket?: number;
   maxTotalExposure?: number;
   minNotionalThreshold?: number;
+  minWalletTrades?: number;
+  minWalletWinRate?: number;
+  minWalletSharpeLike?: number;
+  dailyDrawdownLimitPct?: number;
+  autoPauseOnHealthDegradation?: boolean;
   feeBps?: number;
   slippageBps?: number;
 }) {
@@ -66,6 +79,11 @@ export async function createPaperCopySession(input: {
       maxAllocationPerMarket: input.maxAllocationPerMarket ?? startingCash * 0.05,
       maxTotalExposure: input.maxTotalExposure ?? startingCash * 0.8,
       minNotionalThreshold: input.minNotionalThreshold ?? 2,
+      minWalletTrades: input.minWalletTrades ?? null,
+      minWalletWinRate: input.minWalletWinRate ?? null,
+      minWalletSharpeLike: input.minWalletSharpeLike ?? null,
+      dailyDrawdownLimitPct: input.dailyDrawdownLimitPct ?? null,
+      autoPauseOnHealthDegradation: input.autoPauseOnHealthDegradation ?? false,
       // Polymarket charges a 2% taker fee (200 bps) on all orders.
       // Makers get 0% — but as a copy-follower you are always a taker.
       // Slippage of 20 bps is a conservative estimate for liquid mid-cap markets.
@@ -92,14 +110,10 @@ export async function startPaperCopySession(sessionId: string) {
       startedAt,
       estimatedSourceExposure: bootstrapped.estimatedSourceExposure,
       copyRatio: bootstrapped.copyRatio,
-      // Only deduct bootstrap notional on the very first start (not on resume)
-      ...(session.startedAt
-        ? {}
-        : {
-            currentCash: Math.max(0, Number(session.startingCash) - bootstrapped.bootstrapNotional),
-          }),
     },
   });
+
+  await materializePaperSessionState(sessionId);
 
   // Immediately catch up on any events that came in during bootstrap
   await _runTick(sessionId);
@@ -117,6 +131,136 @@ export async function resumePaperCopySession(sessionId: string) {
     where: { id: sessionId },
     data: { status: 'RUNNING' },
   });
+}
+
+export async function updatePaperCopySessionGuardrails(
+  sessionId: string,
+  input: {
+    minWalletTrades?: number | null | undefined;
+    minWalletWinRate?: number | null | undefined;
+    minWalletSharpeLike?: number | null | undefined;
+    dailyDrawdownLimitPct?: number | null | undefined;
+    autoPauseOnHealthDegradation?: boolean | undefined;
+  },
+) {
+  return db.paperCopySession.update({
+    where: { id: sessionId },
+    data: {
+      ...(input.minWalletTrades !== undefined ? { minWalletTrades: input.minWalletTrades } : {}),
+      ...(input.minWalletWinRate !== undefined ? { minWalletWinRate: input.minWalletWinRate } : {}),
+      ...(input.minWalletSharpeLike !== undefined
+        ? { minWalletSharpeLike: input.minWalletSharpeLike }
+        : {}),
+      ...(input.dailyDrawdownLimitPct !== undefined
+        ? { dailyDrawdownLimitPct: input.dailyDrawdownLimitPct }
+        : {}),
+      ...(input.autoPauseOnHealthDegradation !== undefined
+        ? { autoPauseOnHealthDegradation: input.autoPauseOnHealthDegradation }
+        : {}),
+    },
+  });
+}
+
+export async function getPaperCopySessionAnalytics(sessionId: string) {
+  const [session, decisions, trades, positions, latestSnapshot] = await Promise.all([
+    db.paperCopySession.findUnique({ where: { id: sessionId } }),
+    db.paperCopyDecision.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: 'desc' },
+      take: 5000,
+    }),
+    db.paperCopyTrade.findMany({
+      where: { sessionId },
+      orderBy: { eventTimestamp: 'desc' },
+      take: 5000,
+    }),
+    db.paperCopyPosition.findMany({ where: { sessionId } }),
+    db.paperPortfolioSnapshot.findFirst({
+      where: { sessionId },
+      orderBy: { timestamp: 'desc' },
+      select: { netLiquidationValue: true },
+    }),
+  ]);
+
+  if (!session) {
+    return null;
+  }
+
+  const decisionBreakdown = decisions.reduce((acc: Record<string, number>, row: any) => {
+    const key = row.reasonCode ?? 'UNKNOWN';
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const statusBreakdown = decisions.reduce((acc: Record<string, number>, row: any) => {
+    const key = row.status ?? 'UNKNOWN';
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const marketPnl = positions.reduce((acc: Record<string, number>, row: any) => {
+    const key = row.marketQuestion ?? row.marketId;
+    const pnl = Number(row.realizedPnl) + Number(row.unrealizedPnl);
+    acc[key] = (acc[key] ?? 0) + pnl;
+    return acc;
+  }, {});
+
+  const largestTrade = trades.reduce((best: any, row: any) => {
+    const notional = Math.abs(Number(row.notional));
+    if (!best || notional > best.notional) {
+      return {
+        id: row.id,
+        marketId: row.marketId,
+        marketQuestion: row.marketQuestion,
+        side: row.side,
+        notional,
+        eventTimestamp: row.eventTimestamp,
+      };
+    }
+    return best;
+  }, null);
+
+  const skippedWithNotional = decisions
+    .filter((row: any) => row.status === 'SKIPPED')
+    .map((row: any) => ({
+      id: row.id,
+      marketId: row.marketId,
+      marketQuestion: row.marketQuestion,
+      side: row.side,
+      reasonCode: row.reasonCode,
+      notional:
+        Number(row.sourceShares ?? 0) *
+        Number(row.sourcePrice ?? row.intendedFillPrice ?? 0) *
+        Number(row.copyRatio ?? 1),
+      createdAt: row.createdAt,
+    }))
+    .sort((a: any, b: any) => b.notional - a.notional);
+
+  const nlv = latestSnapshot
+    ? Number(latestSnapshot.netLiquidationValue)
+    : Number(session.currentCash);
+
+  return {
+    sessionId,
+    summary: {
+      startingCash: Number(session.startingCash),
+      currentNlv: nlv,
+      totalPnl: nlv - Number(session.startingCash),
+      trades: trades.length,
+      decisions: decisions.length,
+      openPositions: positions.filter((row: any) => row.status === 'OPEN').length,
+      closedPositions: positions.filter((row: any) => row.status === 'CLOSED').length,
+    },
+    decisionBreakdown,
+    executionStatusBreakdown: statusBreakdown,
+    topMarketPnl: Object.entries(marketPnl)
+      .map(([market, pnl]) => ({ market, pnl: Number(pnl) }))
+      .sort((a, b) => Math.abs(Number(b.pnl)) - Math.abs(Number(a.pnl)))
+      .slice(0, 8),
+    largestExecutedTrade: largestTrade,
+    largestSkippedOpportunity: skippedWithNotional[0] ?? null,
+    recentSkippedOpportunities: skippedWithNotional.slice(0, 10),
+  };
 }
 
 export async function stopPaperCopySession(sessionId: string) {
@@ -202,116 +346,33 @@ export async function repairPaperCopySession(sessionId: string): Promise<{
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error('Session not found');
 
-  // Release lock if held
   _sessionLocks.delete(sessionId);
   _lastSnapshotAt.delete(sessionId);
 
   const previousStatus = session.status;
   const cashBefore = Number(session.currentCash);
 
-  // ── Step 1: Force to PAUSED ────────────────────────────────────────────────
   await db.paperCopySession.update({
     where: { id: sessionId },
     data: { status: 'PAUSED' },
   });
 
-  // ── Step 2: Recalculate cash from trade history ────────────────────────────
-  const allTrades: Array<Record<string, any>> = await db.paperCopyTrade.findMany({
-    where: { sessionId },
-    orderBy: { eventTimestamp: 'asc' },
-  });
+  const before = await db.paperCopyPosition.findMany({ where: { sessionId } });
+  const after = await materializePaperSessionState(sessionId);
+  const afterRows = await db.paperCopyPosition.findMany({ where: { sessionId } });
+  const positionsFixed = Math.abs(before.length - afterRows.length);
 
-  let repairedCash = Number(session.startingCash);
-  for (const trade of allTrades) {
-    const notional = Number(trade.notional);
-    const fee = Number(trade.feeApplied);
-    if (trade.side === 'BUY') {
-      repairedCash -= notional + fee;
-    } else if (trade.side === 'SELL') {
-      repairedCash += notional - fee;
-    }
-    // BOOTSTRAP trades have fee=0 and their notional was already subtracted
-    // from startingCash at session start — skip them to avoid double-counting
-    if (trade.action === 'BOOTSTRAP') {
-      // Bootstrap notional was subtracted at start; undo the above
-      repairedCash += notional + fee; // restore
-      repairedCash -= notional; // deduct bootstrap cost (no fee)
-    }
-  }
-
-  await db.paperCopySession.update({
-    where: { id: sessionId },
-    data: { currentCash: repairedCash },
-  });
-
-  // ── Step 3 & 4: Recalculate each position from its trade slice ────────────
-  const positions: Array<Record<string, any>> = await db.paperCopyPosition.findMany({
-    where: { sessionId },
-  });
-
-  let positionsFixed = 0;
-
-  for (const pos of positions) {
-    const posTrades = allTrades.filter(
-      (t) => t.marketId === pos.marketId && t.outcome === pos.outcome,
-    );
-
-    let netShares = 0;
-    let totalCost = 0;
-    let realizedPnl = 0;
-    let avgEntry = Number(pos.avgEntryPrice);
-
-    for (const t of posTrades) {
-      const shares = Number(t.simulatedShares);
-      const price = Number(t.simulatedPrice);
-      const fee = Number(t.feeApplied);
-
-      if (t.side === 'BUY') {
-        const newTotal = netShares + shares;
-        if (newTotal > 0) {
-          avgEntry = (netShares * avgEntry + shares * price) / newTotal;
-        }
-        netShares = newTotal;
-        totalCost += shares * price + fee;
-      } else if (t.side === 'SELL') {
-        const closeShares = Math.min(netShares, shares);
-        realizedPnl += closeShares * (price - avgEntry) - fee;
-        netShares = Math.max(0, netShares - closeShares);
-      }
-    }
-
-    const needsFix =
-      Math.abs(netShares - Number(pos.netShares)) > 0.0001 ||
-      Math.abs(realizedPnl - Number(pos.realizedPnl)) > 0.01 ||
-      (netShares <= 0 && pos.status === 'OPEN');
-
-    if (needsFix) {
-      await db.paperCopyPosition.update({
-        where: { id: pos.id },
-        data: {
-          netShares: Math.max(0, netShares),
-          avgEntryPrice: avgEntry,
-          realizedPnl,
-          status: netShares <= 0 ? 'CLOSED' : 'OPEN',
-          closedAt: netShares <= 0 && !pos.closedAt ? new Date() : pos.closedAt,
-        },
-      });
-      positionsFixed++;
-    }
-  }
-
-  // ── Step 5: Write a fresh snapshot ────────────────────────────────────────
   await _writeSnapshot(sessionId, { force: true });
 
   logger.info(
-    { sessionId, previousStatus, cashBefore, cashAfter: repairedCash, positionsFixed },
+    { sessionId, previousStatus, cashBefore, cashAfter: after.cash, positionsFixed },
     'session repaired',
   );
 
   return {
     previousStatus,
     cashBefore,
-    cashAfter: repairedCash,
+    cashAfter: after.cash,
     positionsFixed,
     snapshotWritten: true,
   };
@@ -356,26 +417,19 @@ export async function reconcilePaperSessionPositions(sessionId: string): Promise
   for (const pos of simOpen) {
     const key = `${pos.marketId}:${(pos.outcome ?? '').toUpperCase()}`;
     if (!liveOpenKeys.has(key)) {
-      // This position was closed/resolved on-chain but we missed the event.
-      // Close it at the last known mark price.
       const markPrice = Number(pos.currentMarkPrice);
       const closeShares = Number(pos.netShares);
-      const realizedPnl = closeShares * (markPrice - Number(pos.avgEntryPrice));
 
-      await db.paperCopyPosition.update({
-        where: { id: pos.id },
-        data: {
-          netShares: 0,
-          status: 'CLOSED',
-          closedAt: now,
-          realizedPnl: Number(pos.realizedPnl) + realizedPnl,
-        },
-      });
-
-      // Record a synthetic CLOSE trade so the copy log shows the reconciliation
       await db.paperCopyTrade.create({
         data: {
           sessionId,
+          trackedWalletId: session.trackedWalletId,
+          walletAddress: session.trackedWalletAddress,
+          sourceType: 'RECONCILIATION',
+          sourceEventTimestamp: null,
+          sourceTxHash: null,
+          executorType: 'PAPER_SESSION_ENGINE',
+          isBootstrap: false,
           sourceActivityEventId: null,
           marketId: pos.marketId,
           marketQuestion: pos.marketQuestion ?? null,
@@ -398,16 +452,6 @@ export async function reconcilePaperSessionPositions(sessionId: string): Promise
         },
       });
 
-      // Add cash back for the closed position
-      await db.paperCopySession.update({
-        where: { id: sessionId },
-        data: {
-          currentCash: {
-            increment: closeShares * markPrice,
-          },
-        },
-      });
-
       closedByReconciliation++;
       logger.info(
         { sessionId, marketId: pos.marketId, outcome: pos.outcome, closeShares, markPrice },
@@ -415,6 +459,8 @@ export async function reconcilePaperSessionPositions(sessionId: string): Promise
       );
     }
   }
+
+  await materializePaperSessionState(sessionId);
 
   await _writeSnapshot(sessionId, { force: true });
 
@@ -480,6 +526,8 @@ export async function getSessionHealth(sessionId: string) {
     lastProcessedEventAt: session.lastProcessedEventAt ?? null,
     lagSeconds,
     isStale: lagSeconds > 120 && session.status === 'RUNNING',
+    consecutiveDecisionFailures: Number(session.consecutiveDecisionFailures ?? 0),
+    lastAutoPausedAt: session.lastAutoPausedAt ?? null,
     walletSyncStatus: session.trackedWallet?.syncStatus ?? 'UNKNOWN',
     walletLastSyncAt: session.trackedWallet?.lastSyncAt ?? null,
     walletLastSyncError: session.trackedWallet?.lastSyncError ?? null,
@@ -511,6 +559,42 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session || session.status !== 'RUNNING') return;
 
+  const wallet = await db.watchedWallet.findUnique({
+    where: { id: session.trackedWalletId },
+    select: { id: true, syncStatus: true, lastSyncAt: true },
+  });
+
+  if (session.autoPauseOnHealthDegradation && wallet) {
+    const staleMs = wallet.lastSyncAt
+      ? Date.now() - wallet.lastSyncAt.getTime()
+      : Number.POSITIVE_INFINITY;
+    const walletHealthy = wallet.syncStatus === 'ACTIVE' && staleMs <= 5 * 60_000;
+    if (!walletHealthy) {
+      await db.paperCopySession.update({
+        where: { id: sessionId },
+        data: {
+          status: 'PAUSED',
+          lastAutoPausedAt: new Date(),
+        },
+      });
+      await raiseSystemAlert({
+        dedupeKey: `SESSION_HEALTH:${sessionId}`,
+        alertType: 'SESSION_HEALTH_DEGRADED',
+        severity: 'WARN',
+        title: 'Session auto-paused due to source wallet health',
+        message: `Session ${sessionId} paused because wallet sync is degraded (${wallet.syncStatus}).`,
+        walletId: session.trackedWalletId,
+        sessionId,
+        payloadJson: {
+          syncStatus: wallet.syncStatus,
+          lastSyncAt: wallet.lastSyncAt?.toISOString() ?? null,
+          staleSeconds: Number.isFinite(staleMs) ? Math.floor(staleMs / 1000) : null,
+        },
+      });
+      return;
+    }
+  }
+
   const startedAt: Date = session.startedAt ?? session.createdAt;
 
   // Fetch activity events after the last watermark.
@@ -519,49 +603,437 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   //   - SELL/CLOSE events with side=null (eventType is the only signal)
   //   - REDEEM events (market resolution) with price=null, shares=null, side=null
   //     for worthless positions ($0 payout). These STILL need to close the position.
-  // Filtering on any of these fields causes exit events to be silently dropped.
+  // Phase 3: fetch all event types and record explicit SKIP decisions for
+  // unsupported/non-copy events rather than silently dropping them.
   const newEvents: Array<Record<string, any>> = await db.walletActivityEvent.findMany({
     where: {
       trackedWalletId: session.trackedWalletId,
       eventTimestamp: { gt: session.lastProcessedEventAt ?? startedAt },
-      eventType: {
-        in: ['BUY', 'SELL', 'TRADE', 'INCREASE', 'REDUCE', 'CLOSE', 'REDEEM'],
-      },
     },
     orderBy: { eventTimestamp: 'asc' },
     take: MAX_EVENTS_PER_TICK,
   });
 
   if (newEvents.length === 0) {
-    // Refresh marks + maybe write a snapshot even with no new events
-    await _refreshMarks(sessionId);
+    await materializePaperSessionState(sessionId);
     await _writeSnapshot(sessionId);
     return;
   }
 
-  // ---- Process events, accumulating cash delta ----
-  // We read session.currentCash once then maintain a running total.
-  // This avoids the original race where each applyEvent re-read stale cash.
-  let currentCash = Number(session.currentCash);
+  const reducedBefore = await materializePaperSessionState(sessionId);
+
+  if (session.dailyDrawdownLimitPct !== null && session.dailyDrawdownLimitPct !== undefined) {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const dayAnchorSnapshot = await db.paperPortfolioSnapshot.findFirst({
+      where: {
+        sessionId,
+        timestamp: { gte: dayStart },
+      },
+      orderBy: { timestamp: 'asc' },
+      select: { netLiquidationValue: true },
+    });
+
+    const anchorNlv = dayAnchorSnapshot
+      ? Number(dayAnchorSnapshot.netLiquidationValue)
+      : Number(session.startingCash);
+    const dailyPct =
+      anchorNlv > 0 ? ((reducedBefore.netLiquidationValue - anchorNlv) / anchorNlv) * 100 : 0;
+    const limitPct = Number(session.dailyDrawdownLimitPct);
+
+    if (dailyPct <= -Math.abs(limitPct)) {
+      await db.paperCopySession.update({
+        where: { id: sessionId },
+        data: {
+          status: 'PAUSED',
+          lastAutoPausedAt: new Date(),
+        },
+      });
+      await raiseSystemAlert({
+        dedupeKey: `SESSION_DRAWDOWN:${sessionId}`,
+        alertType: 'SESSION_DRAWDOWN_BREACH',
+        severity: 'CRITICAL',
+        title: 'Session auto-paused due to drawdown limit',
+        message: `Session ${sessionId} hit drawdown ${dailyPct.toFixed(2)}% (limit -${Math.abs(limitPct).toFixed(2)}%).`,
+        walletId: session.trackedWalletId,
+        sessionId,
+        payloadJson: {
+          dailyReturnPct: dailyPct,
+          drawdownLimitPct: -Math.abs(limitPct),
+          anchorNlv,
+          currentNlv: reducedBefore.netLiquidationValue,
+        },
+      });
+      return;
+    }
+  }
+
+  const latestWalletAnalytics = await db.walletAnalyticsSnapshot.findFirst({
+    where: { walletId: session.trackedWalletId },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  const walletQualityBlockReason = (() => {
+    if (!latestWalletAnalytics) return null;
+    const tradeCount = Number(latestWalletAnalytics.totalTrades ?? 0);
+    const winRate = Number(latestWalletAnalytics.winRate ?? 0);
+    const sharpeLike = Number(latestWalletAnalytics.sharpeLike ?? 0);
+
+    if (
+      session.minWalletTrades !== null &&
+      session.minWalletTrades !== undefined &&
+      tradeCount < Number(session.minWalletTrades)
+    ) {
+      return `Trade count ${tradeCount} below minimum ${Number(session.minWalletTrades)}.`;
+    }
+    if (
+      session.minWalletWinRate !== null &&
+      session.minWalletWinRate !== undefined &&
+      winRate < Number(session.minWalletWinRate)
+    ) {
+      return `Win rate ${(winRate * 100).toFixed(1)}% below minimum ${(Number(session.minWalletWinRate) * 100).toFixed(1)}%.`;
+    }
+    if (
+      session.minWalletSharpeLike !== null &&
+      session.minWalletSharpeLike !== undefined &&
+      sharpeLike < Number(session.minWalletSharpeLike)
+    ) {
+      return `Sharpe-like ${sharpeLike.toFixed(3)} below minimum ${Number(session.minWalletSharpeLike).toFixed(3)}.`;
+    }
+    return null;
+  })();
+
+  const executor = resolvePaperExecutor('PAPER');
+  const positionStateByKey = new Map(
+    reducedBefore.positions.map((position) => [
+      `${position.marketId}:${position.outcome.toUpperCase()}`,
+      {
+        marketId: position.marketId,
+        outcome: position.outcome.toUpperCase(),
+        avgEntryPrice: position.avgEntryPrice,
+        netShares: position.netShares,
+        marketQuestion: position.marketQuestion,
+      },
+    ]),
+  );
+  let projectedCash = reducedBefore.cash;
+  let projectedGrossExposure = reducedBefore.grossExposure;
+
   let lastEventTs: Date | null = session.lastProcessedEventAt;
+  let consecutiveFailures = Number(session.consecutiveDecisionFailures ?? 0);
+  let autoPausedByFailure = false;
 
   for (const event of newEvents) {
-    // Idempotency: skip if this event was already applied to this session
-    const already = await db.paperCopyTrade.findFirst({
-      where: { sessionId, sourceActivityEventId: event.id },
-      select: { id: true },
+    const alreadyProcessedDecision = await db.paperCopyDecision.findUnique({
+      where: {
+        sessionId_sourceActivityEventId: {
+          sessionId,
+          sourceActivityEventId: event.id,
+        },
+      },
+      select: { id: true, status: true },
     });
-    if (already) {
+    if (
+      alreadyProcessedDecision?.status === 'EXECUTED' ||
+      alreadyProcessedDecision?.status === 'SKIPPED'
+    ) {
       lastEventTs = event.eventTimestamp;
       continue;
     }
 
     try {
-      const delta = await _applyEvent(sessionId, session, event, currentCash);
-      currentCash += delta;
+      if (walletQualityBlockReason) {
+        await db.paperCopyDecision.upsert({
+          where: {
+            sessionId_sourceActivityEventId: {
+              sessionId,
+              sourceActivityEventId: event.id,
+            },
+          },
+          update: {
+            status: 'SKIPPED',
+            decisionType: 'SKIP',
+            executorType: 'PAPER',
+            marketId: event.marketId ?? null,
+            marketQuestion: event.marketQuestion ?? null,
+            outcome: event.outcome ? String(event.outcome).toUpperCase() : null,
+            side: null,
+            sourceShares: event.shares ?? null,
+            sourcePrice: event.price ?? null,
+            copyRatio: session.copyRatio ?? 1,
+            reasonCode: PAPER_REASON_CODES.SKIP_GUARDRAIL_WALLET_QUALITY,
+            humanReason: walletQualityBlockReason,
+            riskChecksJson: {
+              totalTrades: latestWalletAnalytics?.totalTrades ?? null,
+              winRate: latestWalletAnalytics?.winRate ?? null,
+              sharpeLike: latestWalletAnalytics?.sharpeLike ?? null,
+              minWalletTrades: session.minWalletTrades ?? null,
+              minWalletWinRate: session.minWalletWinRate ?? null,
+              minWalletSharpeLike: session.minWalletSharpeLike ?? null,
+            },
+            executionError: null,
+          },
+          create: {
+            sessionId,
+            trackedWalletId: session.trackedWalletId,
+            walletAddress: session.trackedWalletAddress,
+            sourceActivityEventId: event.id,
+            sourceEventTimestamp: event.eventTimestamp,
+            sourceTxHash: event.txHash ?? null,
+            decisionType: 'SKIP',
+            status: 'SKIPPED',
+            executorType: 'PAPER',
+            marketId: event.marketId ?? null,
+            marketQuestion: event.marketQuestion ?? null,
+            outcome: event.outcome ? String(event.outcome).toUpperCase() : null,
+            side: null,
+            sourceShares: event.shares ?? null,
+            simulatedShares: null,
+            sourcePrice: event.price ?? null,
+            intendedFillPrice: null,
+            copyRatio: session.copyRatio ?? 1,
+            sizingInputsJson: { eventType: event.eventType ?? null },
+            reasonCode: PAPER_REASON_CODES.SKIP_GUARDRAIL_WALLET_QUALITY,
+            humanReason: walletQualityBlockReason,
+            riskChecksJson: {
+              totalTrades: latestWalletAnalytics?.totalTrades ?? null,
+              winRate: latestWalletAnalytics?.winRate ?? null,
+              sharpeLike: latestWalletAnalytics?.sharpeLike ?? null,
+              minWalletTrades: session.minWalletTrades ?? null,
+              minWalletWinRate: session.minWalletWinRate ?? null,
+              minWalletSharpeLike: session.minWalletSharpeLike ?? null,
+            },
+            notes: null,
+            executionError: null,
+          },
+        });
+
+        lastEventTs = event.eventTimestamp;
+        consecutiveFailures = 0;
+        continue;
+      }
+
+      const draft = evaluatePaperEventDecision({
+        session,
+        event,
+        projectedCash,
+        projectedGrossExposure,
+        positionStateByKey,
+      });
+
+      const decision = await db.paperCopyDecision.upsert({
+        where: {
+          sessionId_sourceActivityEventId: {
+            sessionId,
+            sourceActivityEventId: event.id,
+          },
+        },
+        update: {
+          trackedWalletId: session.trackedWalletId,
+          walletAddress: session.trackedWalletAddress,
+          sourceEventTimestamp: event.eventTimestamp,
+          sourceTxHash: event.txHash ?? null,
+          decisionType: draft.decisionType,
+          status: draft.status,
+          executorType: draft.executorType,
+          marketId: draft.marketId,
+          marketQuestion: draft.marketQuestion,
+          outcome: draft.outcome,
+          side: draft.side,
+          sourceShares: draft.sourceShares,
+          simulatedShares: draft.simulatedShares,
+          sourcePrice: draft.sourcePrice,
+          intendedFillPrice: draft.intendedFillPrice,
+          copyRatio: draft.copyRatio,
+          sizingInputsJson: draft.sizingInputsJson,
+          reasonCode: draft.reasonCode,
+          humanReason: draft.humanReason,
+          riskChecksJson: draft.riskChecksJson,
+          notes: draft.notes,
+          executionError: null,
+        },
+        create: {
+          sessionId,
+          trackedWalletId: session.trackedWalletId,
+          walletAddress: session.trackedWalletAddress,
+          sourceActivityEventId: event.id,
+          sourceEventTimestamp: event.eventTimestamp,
+          sourceTxHash: event.txHash ?? null,
+          decisionType: draft.decisionType,
+          status: draft.status,
+          executorType: draft.executorType,
+          marketId: draft.marketId,
+          marketQuestion: draft.marketQuestion,
+          outcome: draft.outcome,
+          side: draft.side,
+          sourceShares: draft.sourceShares,
+          simulatedShares: draft.simulatedShares,
+          sourcePrice: draft.sourcePrice,
+          intendedFillPrice: draft.intendedFillPrice,
+          copyRatio: draft.copyRatio,
+          sizingInputsJson: draft.sizingInputsJson,
+          reasonCode: draft.reasonCode,
+          humanReason: draft.humanReason,
+          riskChecksJson: draft.riskChecksJson,
+          notes: draft.notes,
+        },
+      });
+
+      if (decision.status === 'SKIPPED') {
+        lastEventTs = event.eventTimestamp;
+        consecutiveFailures = 0;
+        continue;
+      }
+
+      const execution = await executor.execute({
+        session: {
+          id: session.id,
+          trackedWalletId: session.trackedWalletId,
+          trackedWalletAddress: session.trackedWalletAddress,
+          feeBps: session.feeBps,
+          slippageBps: session.slippageBps,
+        },
+        decision,
+      });
+
+      await db.paperCopyDecision.update({
+        where: { id: decision.id },
+        data: {
+          status: execution.status,
+          reasonCode: execution.reasonCode,
+          humanReason: execution.humanReason,
+          executionError: execution.errorMessage,
+        },
+      });
+
+      if (execution.status === 'FAILED') {
+        consecutiveFailures += 1;
+      } else {
+        consecutiveFailures = 0;
+      }
+
+      if (consecutiveFailures >= 5) {
+        autoPausedByFailure = true;
+        await db.paperCopySession.update({
+          where: { id: sessionId },
+          data: {
+            status: 'PAUSED',
+            lastAutoPausedAt: new Date(),
+            consecutiveDecisionFailures: consecutiveFailures,
+          },
+        });
+        await raiseSystemAlert({
+          dedupeKey: `SESSION_FAILURE_BURST:${sessionId}`,
+          alertType: 'SESSION_FAILURE_BURST',
+          severity: 'CRITICAL',
+          title: 'Session auto-paused after repeated decision failures',
+          message: `Session ${sessionId} has ${consecutiveFailures} consecutive decision/execution failures.`,
+          walletId: session.trackedWalletId,
+          sessionId,
+          payloadJson: {
+            eventId: event.id,
+            lastReason: execution.reasonCode,
+            threshold: 5,
+          },
+        });
+        lastEventTs = event.eventTimestamp;
+        break;
+      }
+
+      if (
+        execution.status === 'EXECUTED' &&
+        decision.side &&
+        decision.marketId &&
+        decision.outcome
+      ) {
+        applyProjectedExecution({
+          positionStateByKey,
+          marketId: decision.marketId,
+          marketQuestion: decision.marketQuestion,
+          outcome: decision.outcome,
+          side: decision.side,
+          fillPrice: execution.fillPrice,
+          fillShares: execution.fillShares,
+        });
+        projectedCash += execution.cashDelta;
+        const exposureDelta = execution.fillPrice * execution.fillShares;
+        projectedGrossExposure += decision.side === 'BUY' ? exposureDelta : -exposureDelta;
+        projectedGrossExposure = Math.max(0, projectedGrossExposure);
+      }
+
       lastEventTs = event.eventTimestamp;
     } catch (err) {
-      logger.warn({ sessionId, eventId: event.id, err }, 'failed to apply event to session');
+      const message = err instanceof Error ? err.message : 'Unknown decision/execution error';
+      await db.paperCopyDecision
+        .upsert({
+          where: {
+            sessionId_sourceActivityEventId: {
+              sessionId,
+              sourceActivityEventId: event.id,
+            },
+          },
+          update: {
+            status: 'FAILED',
+            reasonCode: PAPER_REASON_CODES.EXECUTION_FAILED_RUNTIME,
+            humanReason: 'Unexpected runtime error while processing paper decision pipeline.',
+            executionError: message,
+          },
+          create: {
+            sessionId,
+            trackedWalletId: session.trackedWalletId,
+            walletAddress: session.trackedWalletAddress,
+            sourceActivityEventId: event.id,
+            sourceEventTimestamp: event.eventTimestamp,
+            sourceTxHash: event.txHash ?? null,
+            decisionType: 'NOOP',
+            status: 'FAILED',
+            executorType: 'PAPER',
+            marketId: event.marketId ?? null,
+            marketQuestion: event.marketQuestion ?? null,
+            outcome: event.outcome ? String(event.outcome).toUpperCase() : null,
+            side: null,
+            sourceShares: event.shares ?? null,
+            simulatedShares: null,
+            sourcePrice: event.price ?? null,
+            intendedFillPrice: null,
+            copyRatio: session.copyRatio ?? 1,
+            sizingInputsJson: { eventType: event.eventType ?? null },
+            reasonCode: PAPER_REASON_CODES.EXECUTION_FAILED_RUNTIME,
+            humanReason: 'Unexpected runtime error while processing paper decision pipeline.',
+            riskChecksJson: {},
+            notes: null,
+            executionError: message,
+          },
+        })
+        .catch(() => undefined);
+      logger.warn({ sessionId, eventId: event.id, err }, 'failed to process decision/execution');
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= 5) {
+        autoPausedByFailure = true;
+        await db.paperCopySession.update({
+          where: { id: sessionId },
+          data: {
+            status: 'PAUSED',
+            lastAutoPausedAt: new Date(),
+            consecutiveDecisionFailures: consecutiveFailures,
+          },
+        });
+        await raiseSystemAlert({
+          dedupeKey: `SESSION_FAILURE_BURST:${sessionId}`,
+          alertType: 'SESSION_FAILURE_BURST',
+          severity: 'CRITICAL',
+          title: 'Session auto-paused after repeated decision failures',
+          message: `Session ${sessionId} has ${consecutiveFailures} consecutive decision/execution failures.`,
+          walletId: session.trackedWalletId,
+          sessionId,
+          payloadJson: {
+            eventId: event.id,
+            lastReason: 'EXECUTION_FAILED_RUNTIME',
+            threshold: 5,
+          },
+        });
+        break;
+      }
     }
   }
 
@@ -569,316 +1041,25 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   await db.paperCopySession.update({
     where: { id: sessionId },
     data: {
-      currentCash,
       ...(lastEventTs ? { lastProcessedEventAt: lastEventTs } : {}),
+      consecutiveDecisionFailures: consecutiveFailures,
     },
   });
 
-  await _refreshMarks(sessionId);
+  if (autoPausedByFailure) {
+    return;
+  }
+
+  await materializePaperSessionState(sessionId);
   await _writeSnapshot(sessionId);
 }
 
 // ---------------------------------------------------------------------------
-// Internal: apply single activity event to a session
-// Returns cash delta (negative = BUY, positive = SELL).
-// Does NOT write to paperCopySession.currentCash — caller flushes.
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the effective trade side from a WalletActivityEvent.
- *
- * Polymarket's data-api is inconsistent:
- *   - Some records have side = 'BUY' | 'SELL'
- *   - Others have side = null but eventType = 'SELL' | 'CLOSE' | 'REDUCE' | 'REDEEM'
- *   - TRADE events need the takerSide field from rawPayloadJson
- *
- * We treat CLOSE / REDUCE / REDEEM / SELL as effective SELLs.
- * Anything else that reaches this point is treated as BUY.
- */
-function _resolveEffectiveSide(event: Record<string, any>): 'BUY' | 'SELL' {
-  // Explicit side field wins
-  if (event.side === 'SELL') return 'SELL';
-  if (event.side === 'BUY') return 'BUY';
-
-  // Fall back to eventType
-  const et = (event.eventType ?? '').toUpperCase();
-  if (['SELL', 'CLOSE', 'REDUCE', 'REDEEM'].includes(et)) return 'SELL';
-
-  // Try rawPayloadJson for TRADE events where takerSide indicates the direction
-  const raw = event.rawPayloadJson as Record<string, unknown> | null;
-  if (raw) {
-    const takerSide = String(raw.takerSide ?? raw.side ?? '').toUpperCase();
-    if (takerSide === 'SELL') return 'SELL';
-  }
-
-  return 'BUY';
-}
-
-async function _applyEvent(
-  sessionId: string,
-  session: Record<string, any>,
-  event: Record<string, any>,
-  currentCash: number,
-): Promise<number> {
-  // Resolve effective side — critical for Polymarket where side can be null
-  const effectiveSide = _resolveEffectiveSide(event);
-  const eventType = (event.eventType ?? '').toUpperCase();
-
-  // Normalize outcome to uppercase to prevent case-mismatch misses.
-  // Polymarket returns "Up"/"Down" from positions API but "UP"/"DOWN" from activity API.
-  const outcome = (event.outcome ?? 'UNKNOWN').toUpperCase();
-  const copyRatio = Number(session.copyRatio ?? 1);
-
-  // ── Full-close events: CLOSE and REDEEM ─────────────────────────────────────
-  // These are market-resolution events. They must close the position regardless
-  // of whether price/shares are null (losing/worthless positions have both = null).
-  const isFullCloseEvent = ['CLOSE', 'REDEEM'].includes(eventType);
-
-  if (isFullCloseEvent) {
-    const existing = await db.paperCopyPosition.findUnique({
-      where: { sessionId_marketId_outcome: { sessionId, marketId: event.marketId, outcome } },
-    });
-    if (!existing || Number(existing.netShares) <= 0) return 0;
-
-    // For winning REDEEMs: price=1.0. For losing: price=0. Use whatever came in, floor at 0.
-    const closePrice = Math.max(0, event.price !== null ? Number(event.price) : 0);
-    const closeShares = Number(existing.netShares);
-    const realizedPnl = closeShares * (closePrice - Number(existing.avgEntryPrice));
-    const feeApplied = closeShares * closePrice * (Number(session.feeBps) / 10_000);
-
-    await db.paperCopyPosition.update({
-      where: { id: existing.id },
-      data: {
-        netShares: 0,
-        currentMarkPrice: closePrice,
-        realizedPnl: Number(existing.realizedPnl) + realizedPnl - feeApplied,
-        status: 'CLOSED',
-        closedAt: event.eventTimestamp,
-      },
-    });
-
-    const notional = closeShares * closePrice;
-    await db.paperCopyTrade.create({
-      data: {
-        sessionId,
-        sourceActivityEventId: event.id,
-        marketId: event.marketId,
-        marketQuestion: event.marketQuestion ?? null,
-        outcome,
-        side: 'SELL',
-        action: eventType,
-        sourcePrice: closePrice,
-        simulatedPrice: closePrice,
-        sourceShares: event.shares !== null ? Number(event.shares) : closeShares,
-        simulatedShares: closeShares,
-        notional,
-        feeApplied,
-        slippageApplied: 0,
-        eventTimestamp: event.eventTimestamp,
-        processedAt: new Date(),
-        reasoning: {
-          copyRatio,
-          feeBps: Number(session.feeBps),
-          slippageBps: Number(session.slippageBps),
-          sourceEventType: eventType,
-          resolvedSide: 'SELL',
-          originalSide: event.side ?? null,
-          closeReason: closePrice === 0 ? 'EXPIRED_WORTHLESS' : 'REDEEMED_WINNING',
-        },
-      },
-    });
-
-    const cashReceived = notional - feeApplied;
-    logger.info(
-      { sessionId, marketId: event.marketId, outcome, closeShares, closePrice, cashReceived },
-      'position closed by REDEEM/CLOSE event',
-    );
-    return cashReceived;
-  }
-
-  // ── BUY / SELL / REDUCE events ──────────────────────────────────────────────
-  // These require valid price and shares to size the trade.
-  if (event.shares === null || event.price === null) return 0;
-
-  const sourceShares = Number(event.shares);
-  const sourcePrice = Number(event.price);
-  if (sourcePrice <= 0 || sourceShares <= 0) return 0;
-
-  // Slippage: add for BUY (worse fill), subtract for SELL (worse fill)
-  const slippageSign = effectiveSide === 'BUY' ? 1 : -1;
-  const slippageApplied = sourcePrice * (Number(session.slippageBps) / 10_000) * slippageSign;
-  const simulatedPrice = Math.max(0.0001, sourcePrice + slippageApplied);
-
-  let simulatedShares = sourceShares * copyRatio;
-  let notional = simulatedShares * simulatedPrice;
-
-  // Skip below minimum notional threshold
-  if (notional < Number(session.minNotionalThreshold)) return 0;
-
-  // Cap BUY to available cash
-  if (effectiveSide === 'BUY') {
-    const maxBuy = Math.min(currentCash, Number(session.maxAllocationPerMarket));
-    if (maxBuy <= 0) {
-      logger.info({ sessionId, eventId: event.id }, 'BUY skipped — no cash available');
-      return 0;
-    }
-    if (notional > maxBuy) {
-      simulatedShares = maxBuy / simulatedPrice;
-      notional = simulatedShares * simulatedPrice;
-    }
-  }
-
-  const feeApplied = notional * (Number(session.feeBps) / 10_000);
-
-  const existing = await db.paperCopyPosition.findUnique({
-    where: { sessionId_marketId_outcome: { sessionId, marketId: event.marketId, outcome } },
-  });
-
-  if (effectiveSide === 'BUY') {
-    if (existing) {
-      const currShares = Number(existing.netShares);
-      const newShares = currShares + simulatedShares;
-      const newAvg =
-        newShares > 0
-          ? (currShares * Number(existing.avgEntryPrice) + simulatedShares * simulatedPrice) /
-            newShares
-          : Number(existing.avgEntryPrice);
-      await db.paperCopyPosition.update({
-        where: { id: existing.id },
-        data: {
-          netShares: newShares,
-          avgEntryPrice: newAvg,
-          currentMarkPrice: simulatedPrice,
-          status: 'OPEN',
-        },
-      });
-    } else {
-      await db.paperCopyPosition.create({
-        data: {
-          sessionId,
-          marketId: event.marketId,
-          marketQuestion: event.marketQuestion ?? null,
-          outcome,
-          netShares: simulatedShares,
-          avgEntryPrice: simulatedPrice,
-          currentMarkPrice: simulatedPrice,
-          realizedPnl: 0,
-          unrealizedPnl: 0,
-          status: 'OPEN',
-          openedAt: event.eventTimestamp,
-        },
-      });
-    }
-  } else {
-    // SELL / REDUCE
-    if (!existing) return 0;
-    const currShares = Number(existing.netShares);
-    if (currShares <= 0) return 0;
-
-    const closeShares = Math.min(currShares, simulatedShares);
-    const realizedPnl = closeShares * (simulatedPrice - Number(existing.avgEntryPrice));
-    const newShares = Math.max(0, currShares - closeShares);
-
-    await db.paperCopyPosition.update({
-      where: { id: existing.id },
-      data: {
-        netShares: newShares,
-        currentMarkPrice: simulatedPrice,
-        realizedPnl: Number(existing.realizedPnl) + realizedPnl - feeApplied,
-        status: newShares <= 0 ? 'CLOSED' : 'OPEN',
-        closedAt: newShares <= 0 ? event.eventTimestamp : null,
-      },
-    });
-
-    simulatedShares = closeShares;
-    notional = simulatedShares * simulatedPrice;
-  }
-
-  await db.paperCopyTrade.create({
-    data: {
-      sessionId,
-      sourceActivityEventId: event.id,
-      marketId: event.marketId,
-      marketQuestion: event.marketQuestion ?? null,
-      outcome,
-      side: effectiveSide,
-      action: event.eventType,
-      sourcePrice,
-      simulatedPrice,
-      sourceShares,
-      simulatedShares,
-      notional,
-      feeApplied,
-      slippageApplied,
-      eventTimestamp: event.eventTimestamp,
-      processedAt: new Date(),
-      reasoning: {
-        copyRatio,
-        feeBps: Number(session.feeBps),
-        slippageBps: Number(session.slippageBps),
-        sourceEventType: event.eventType,
-        resolvedSide: effectiveSide,
-        originalSide: event.side ?? null,
-      },
-    },
-  });
-
-  const cashDelta = effectiveSide === 'BUY' ? -(notional + feeApplied) : notional - feeApplied;
-  return cashDelta;
-}
-
-// ---------------------------------------------------------------------------
-// Internal: bulk mark refresh (fixes original N+1 query bug)
+// Internal: mark refresh
 // ---------------------------------------------------------------------------
 
 async function _refreshMarks(sessionId: string): Promise<void> {
-  const [session, openPositions] = await Promise.all([
-    db.paperCopySession.findUnique({
-      where: { id: sessionId },
-      select: { trackedWalletId: true },
-    }),
-    db.paperCopyPosition.findMany({
-      where: { sessionId, status: 'OPEN' },
-    }),
-  ]);
-
-  if (!session || openPositions.length === 0) return;
-
-  // Fetch the latest price for each unique marketId in a single query
-  const marketIds = [...new Set(openPositions.map((p: any) => p.marketId as string))];
-
-  const recentPrices: Array<Record<string, any>> = await db.walletActivityEvent.findMany({
-    where: {
-      trackedWalletId: session.trackedWalletId,
-      marketId: { in: marketIds },
-      price: { not: null },
-    },
-    orderBy: { eventTimestamp: 'desc' },
-    // Enough to cover all markets × outcomes with some buffer
-    take: marketIds.length * 6,
-    select: { marketId: true, outcome: true, price: true },
-  });
-
-  // Build price map: "marketId:outcome" → latest price
-  const priceMap = new Map<string, number>();
-  for (const row of recentPrices) {
-    const key = `${row.marketId}:${row.outcome}`;
-    if (!priceMap.has(key) && row.price !== null) {
-      priceMap.set(key, Number(row.price));
-    }
-  }
-
-  await Promise.all(
-    openPositions.map((pos: any) => {
-      const key = `${pos.marketId}:${pos.outcome}`;
-      const mark = priceMap.get(key) ?? Number(pos.currentMarkPrice);
-      const unrealized = Number(pos.netShares) * (mark - Number(pos.avgEntryPrice));
-      return db.paperCopyPosition.update({
-        where: { id: pos.id },
-        data: { currentMarkPrice: mark, unrealizedPnl: unrealized },
-      });
-    }),
-  );
+  await materializePaperSessionState(sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,6 +1199,7 @@ async function _bootstrapFromOpenPositions(
 
   const now = new Date();
   let bootstrapNotional = 0;
+  const executor = resolvePaperExecutor('PAPER');
 
   for (const position of openPositions) {
     const simulatedShares = position.size * copyRatio;
@@ -1030,60 +1212,66 @@ async function _bootstrapFromOpenPositions(
     // but activity events return "UP"/"DOWN". Must match for position lookups.
     const normalizedOutcome = position.outcome.toUpperCase();
 
-    // Idempotent — don't re-bootstrap if position already exists
-    const existing = await db.paperCopyPosition.findUnique({
+    const existingBootstrapEntry = await db.paperCopyTrade.findFirst({
       where: {
-        sessionId_marketId_outcome: {
-          sessionId,
-          marketId: position.conditionId,
-          outcome: normalizedOutcome,
-        },
+        sessionId,
+        marketId: position.conditionId,
+        outcome: normalizedOutcome,
+        action: 'BOOTSTRAP',
       },
     });
-    if (existing) continue;
+    if (existingBootstrapEntry) continue;
 
     bootstrapNotional += notional;
 
-    await db.paperCopyPosition.create({
+    const decision = await db.paperCopyDecision.create({
       data: {
         sessionId,
-        marketId: position.conditionId,
-        marketQuestion: position.title,
-        outcome: normalizedOutcome,
-        netShares: simulatedShares,
-        avgEntryPrice: simulatedPrice,
-        currentMarkPrice: simulatedPrice,
-        realizedPnl: 0,
-        unrealizedPnl: 0,
-        status: 'OPEN',
-        openedAt: now,
-      },
-    });
-
-    await db.paperCopyTrade.create({
-      data: {
-        sessionId,
+        trackedWalletId: session.trackedWalletId,
+        walletAddress,
         sourceActivityEventId: null,
+        sourceEventTimestamp: now,
+        sourceTxHash: null,
+        decisionType: 'BOOTSTRAP',
+        status: 'PENDING',
+        executorType: 'PAPER',
         marketId: position.conditionId,
         marketQuestion: position.title,
         outcome: normalizedOutcome,
         side: 'BUY',
-        action: 'BOOTSTRAP',
-        sourcePrice: simulatedPrice,
-        simulatedPrice,
         sourceShares: position.size,
         simulatedShares,
-        notional,
-        feeApplied: 0,
-        slippageApplied: 0,
-        eventTimestamp: now,
-        processedAt: now,
-        reasoning: {
-          type: 'BOOTSTRAP_OPEN_POSITION',
+        sourcePrice: simulatedPrice,
+        intendedFillPrice: simulatedPrice,
+        copyRatio,
+        sizingInputsJson: {
           sourceExposureEstimate: estimatedSourceExposure,
-          copyRatio,
-          rawOutcome: position.outcome,
         },
+        reasonCode: PAPER_REASON_CODES.BOOTSTRAP_EXISTING_POSITION,
+        humanReason: 'Bootstrapping existing source exposure into canonical copy ledger.',
+        riskChecksJson: {},
+        notes: 'BOOTSTRAP_OPEN_POSITION',
+      },
+    });
+
+    const execution = await executor.execute({
+      session: {
+        id: session.id,
+        trackedWalletId: session.trackedWalletId,
+        trackedWalletAddress: session.trackedWalletAddress,
+        feeBps: session.feeBps,
+        slippageBps: session.slippageBps,
+      },
+      decision,
+    });
+
+    await db.paperCopyDecision.update({
+      where: { id: decision.id },
+      data: {
+        status: execution.status,
+        reasonCode: execution.reasonCode,
+        humanReason: execution.humanReason,
+        executionError: execution.errorMessage,
       },
     });
   }

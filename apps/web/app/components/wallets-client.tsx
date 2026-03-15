@@ -18,6 +18,26 @@ type WalletRow = {
     totalTrades: number;
     lastPolledAt: string | null;
     nextPollAt: string | null;
+    lastActivitySyncAt?: string | null;
+    lastPositionsSyncAt?: string | null;
+    staleSeconds?: number | null;
+    isStale?: boolean;
+    mismatchCount?: number;
+    latestIngestion?: {
+        outcome: 'SUCCESS' | 'PARTIAL' | 'FAILED' | string;
+        createdAt: string;
+        errorClass: string | null;
+        message: string | null;
+        summary: {
+            fetchedEvents: number;
+            insertedActivityEvents: number;
+            insertedTradeEvents: number;
+            duplicateEvents: number;
+            parseErrors: number;
+            dbInsertErrors: number;
+            decisionEnqueueErrors: number;
+        } | null;
+    } | null;
 };
 
 export function WalletsClient({ initialWallets }: { initialWallets: WalletRow[] }) {
@@ -105,6 +125,22 @@ export function WalletsClient({ initialWallets }: { initialWallets: WalletRow[] 
                             <Info label="Next Poll" value={wallet.nextPollAt ? new Date(wallet.nextPollAt).toLocaleTimeString() : '—'} />
                             <Info label="Tracking" value={wallet.enabled ? 'Enabled' : 'Paused'} />
                         </div>
+                        <div className="mt-2 grid grid-cols-2 gap-3 text-xs text-slate-300 md:grid-cols-4">
+                            <Info label="Last Activity Sync" value={wallet.lastActivitySyncAt ? new Date(wallet.lastActivitySyncAt).toLocaleString() : '—'} />
+                            <Info label="Last Position Sync" value={wallet.lastPositionsSyncAt ? new Date(wallet.lastPositionsSyncAt).toLocaleString() : '—'} />
+                            <Info label="Stale" value={wallet.staleSeconds !== null && wallet.staleSeconds !== undefined ? `${wallet.staleSeconds}s${wallet.isStale ? ' (yes)' : ''}` : '—'} />
+                            <Info label="Reconcile Mismatches" value={wallet.mismatchCount !== undefined ? String(wallet.mismatchCount) : '—'} />
+                        </div>
+                        {wallet.latestIngestion && (
+                            <p className="mt-2 text-xs text-slate-400">
+                                Ingestion: {wallet.latestIngestion.outcome}
+                                {wallet.latestIngestion.errorClass ? ` • ${wallet.latestIngestion.errorClass}` : ''}
+                                {wallet.latestIngestion.message ? ` • ${wallet.latestIngestion.message}` : ''}
+                            </p>
+                        )}
+                        {wallet.isStale && (
+                            <p className="mt-2 text-xs text-amber-300">Wallet sync appears stale. Last update: {wallet.staleSeconds ?? 'unknown'}s ago.</p>
+                        )}
                         {wallet.lastSyncError && <p className="mt-2 text-xs text-rose-300">{wallet.lastSyncError}</p>}
 
                         <div className="mt-4 flex flex-wrap gap-2">

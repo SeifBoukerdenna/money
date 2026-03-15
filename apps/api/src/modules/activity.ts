@@ -2,22 +2,32 @@ import type { WalletActivityFeedEvent } from '@copytrader/polymarket-adapter';
 
 export function buildActivityDedupeKey(event: WalletActivityFeedEvent): string {
   if (event.externalEventId) {
-    return `ext:${event.externalEventId}`;
-  }
-  if (event.txHash) {
-    return `tx:${event.txHash}`;
-  }
-  if (event.orderId) {
-    return `ord:${event.orderId}`;
+    return `src:POLYMARKET_DATA_API:event:${event.externalEventId}`;
   }
 
-  const timestampSec = Math.floor(new Date(event.eventTimestamp).getTime() / 1000);
-  // Use effectiveSide derived from eventType when side is null
-  const side = event.side ?? _effectiveSideFromType(event.eventType);
-  const shares = event.shares?.toFixed(6) ?? '0';
-  const price = event.price?.toFixed(6) ?? '0';
+  if (event.txHash && Number.isInteger(event.logIndex)) {
+    return `src:POLYMARKET_DATA_API:txlog:${event.txHash}:${event.logIndex}`;
+  }
+
+  if (event.txHash && event.orderId) {
+    return `src:POLYMARKET_DATA_API:txord:${event.txHash}:${event.orderId}`;
+  }
+
+  if (event.blockNumber !== null && event.marketId) {
+    const side = event.effectiveSide ?? event.side ?? _effectiveSideFromType(event.eventType);
+    const shares = event.shares?.toFixed(8) ?? '0';
+    const price = event.price?.toFixed(8) ?? '0';
+    const outcome = event.outcome ?? 'UNKNOWN';
+    return `src:POLYMARKET_DATA_API:block:${event.blockNumber}:${event.marketId}:${outcome}:${side}:${shares}:${price}:${event.eventType}`;
+  }
+
+  const timestampMs = new Date(event.eventTimestamp).getTime();
+  const side = event.effectiveSide ?? event.side ?? _effectiveSideFromType(event.eventType);
+  const shares = event.shares?.toFixed(8) ?? '0';
+  const price = event.price?.toFixed(8) ?? '0';
   const outcome = event.outcome ?? 'UNKNOWN';
-  return `f:${timestampSec}:${event.marketId}:${outcome}:${side}:${shares}:${price}`;
+  const conditionId = event.conditionId ?? 'NONE';
+  return `src:POLYMARKET_DATA_API:fallback:${timestampMs}:${event.marketId}:${conditionId}:${outcome}:${side}:${shares}:${price}:${event.eventType}`;
 }
 
 /**

@@ -158,9 +158,9 @@ export async function processDecision(strategyId: string, tradeEventId: string):
       { strategyId, decisionId: created.id },
       {
         removeOnComplete: 1000,
-        removeOnFail: 1000,
+        removeOnFail: 5000,
         attempts: 5,
-        backoff: { type: 'exponential', delay: 500 },
+        backoff: { type: 'exponential', delay: 1000 },
       },
     );
   }

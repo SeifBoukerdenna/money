@@ -1,5 +1,27 @@
 import { prisma } from '../lib/prisma.js';
 import { publishEvent } from './event-stream.js';
+import { config } from '../config.js';
+
+const INTEL_RETENTION_ROWS = Math.max(120, config.MARKET_INTELLIGENCE_RETENTION_ROWS);
+
+async function pruneMarketSnapshots(marketId: string): Promise<void> {
+  const count = await prisma.marketIntelligenceSnapshot.count({ where: { marketId } });
+  if (count <= INTEL_RETENTION_ROWS + 40) {
+    return;
+  }
+  const staleRows = await prisma.marketIntelligenceSnapshot.findMany({
+    where: { marketId },
+    orderBy: { createdAt: 'asc' },
+    take: count - INTEL_RETENTION_ROWS,
+    select: { id: true },
+  });
+  if (staleRows.length === 0) {
+    return;
+  }
+  await prisma.marketIntelligenceSnapshot.deleteMany({
+    where: { id: { in: staleRows.map((row) => row.id) } },
+  });
+}
 
 function computeMarketIntelligence(
   trades: Array<{
@@ -40,7 +62,7 @@ export async function refreshMarketIntelligenceSnapshots(): Promise<void> {
   const trades = await prisma.tradeEvent.findMany({
     include: { wallet: true },
     orderBy: { tradedAt: 'desc' },
-    take: 5000,
+    take: 2500,
   });
   const intelligence = computeMarketIntelligence(
     trades.map((row: (typeof trades)[number]) => ({
@@ -64,6 +86,8 @@ export async function refreshMarketIntelligenceSnapshots(): Promise<void> {
         sellPressure: metric.sellPressure,
       },
     });
+
+    await pruneMarketSnapshots(metric.marketId);
 
     await publishEvent('MARKET_SENTIMENT_UPDATE', {
       marketId: metric.marketId,

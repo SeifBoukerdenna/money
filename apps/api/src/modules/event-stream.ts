@@ -1,4 +1,5 @@
 import { prisma } from '../lib/prisma.js';
+import { config } from '../config.js';
 import type { Prisma } from '@prisma/client';
 
 type StreamEventType =
@@ -28,14 +29,49 @@ class EventStreamBus {
   }
 
   subscribe(listener: Listener) {
+    if (this.listeners.size >= config.EVENT_BUS_MAX_LISTENERS) {
+      throw new Error('Event stream listener limit reached');
+    }
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
     };
   }
+
+  listenerCount() {
+    return this.listeners.size;
+  }
 }
 
 export const eventBus = new EventStreamBus();
+
+let _lastPruneAtMs = 0;
+
+async function pruneStreamEventsIfNeeded() {
+  const nowMs = Date.now();
+  if (nowMs - _lastPruneAtMs < 60_000) {
+    return;
+  }
+  _lastPruneAtMs = nowMs;
+
+  const cap = Math.max(500, config.STREAM_EVENT_RETENTION_ROWS);
+  const total = await prisma.streamEvent.count();
+  if (total <= cap + 200) {
+    return;
+  }
+
+  const rowsToDelete = await prisma.streamEvent.findMany({
+    orderBy: { createdAt: 'asc' },
+    take: total - cap,
+    select: { id: true },
+  });
+  if (rowsToDelete.length === 0) {
+    return;
+  }
+  await prisma.streamEvent.deleteMany({
+    where: { id: { in: rowsToDelete.map((row) => row.id) } },
+  });
+}
 
 export async function publishEvent(
   type: StreamEventType,
@@ -59,6 +95,7 @@ export async function publishEvent(
       createdAt: new Date(event.createdAt),
     },
   });
+  await pruneStreamEventsIfNeeded();
   eventBus.publish(event);
   return event;
 }

@@ -5,23 +5,232 @@ import {
   pollLatency,
   tradeDetectionLatency,
 } from '../lib/metrics.js';
+import { createHash } from 'node:crypto';
 import { config } from '../config.js';
 import { prisma } from '../lib/prisma.js';
 import { redis } from '../lib/redis.js';
 import { logger } from '../lib/logger.js';
 import { createPolymarketDataAdapter } from './polymarket.js';
 import type { Prisma } from '@prisma/client';
+import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
+import type {
+  WalletActivityFeedEvent,
+  WalletActivityFeedQuery,
+} from '@copytrader/polymarket-adapter';
 import { handleWhaleAlert } from './alerts.js';
 import { detectAndPersistClusterSignal } from './cluster-signals.js';
 import { publishEvent } from './event-stream.js';
 import { decisionQueue, ingestQueue } from './queue.js';
 import { buildActivityDedupeKey, isTradeLikeActivity } from './activity.js';
+import { incrementDuplicatePollSkip } from './runtime-ops.js';
 
 const dataAdapter = createPolymarketDataAdapter();
+const SOURCE_NAME = 'POLYMARKET_DATA_API';
+const SOURCE_TYPE = 'HTTP_API';
 
 const MAX_MONITOR_CONCURRENCY = 30;
 const hexWalletRegex = /^0x[a-fA-F0-9]{40}$/;
 const profileHandleRegex = /^[a-zA-Z0-9._-]{2,64}$/;
+
+type IngestionErrorClass =
+  | 'DUPLICATE_EVENT'
+  | 'TRANSIENT_FETCH_ERROR'
+  | 'PARSE_NORMALIZATION_ERROR'
+  | 'DB_INSERT_ERROR'
+  | 'CURSOR_STATE_UPDATE_ERROR'
+  | 'RECONCILIATION_WARNING';
+
+type IngestionRunSummary = {
+  mode: 'BACKFILL' | 'INCREMENTAL';
+  overlapWindowSec: number;
+  previousHighWatermark: string | null;
+  nextHighWatermark: string | null;
+  fetchedEvents: number;
+  insertedActivityEvents: number;
+  insertedTradeEvents: number;
+  duplicateEvents: number;
+  parseErrors: number;
+  dbInsertErrors: number;
+  decisionEnqueueErrors: number;
+  gapIssuesDetected: number;
+  warnings: number;
+};
+
+type CursorState = {
+  id: string;
+  highWatermarkTimestamp: Date | null;
+  highWatermarkCursor: string | null;
+  overlapWindowSec: number;
+};
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
+function classifyFetchError(error: unknown): IngestionErrorClass {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (
+    message.includes('429') ||
+    message.includes('timeout') ||
+    message.includes('etimedout') ||
+    message.includes('econnreset') ||
+    message.includes('temporar')
+  ) {
+    return 'TRANSIENT_FETCH_ERROR';
+  }
+  if (
+    message.includes('400') ||
+    message.includes('404') ||
+    message.includes('invalid') ||
+    message.includes('malformed')
+  ) {
+    return 'PARSE_NORMALIZATION_ERROR';
+  }
+  return 'TRANSIENT_FETCH_ERROR';
+}
+
+async function acquireWalletPollLock(walletId: string): Promise<string | null> {
+  const lockToken = crypto.randomUUID();
+  const key = `wallet:poll:lock:${walletId}`;
+  const acquired = await redis.set(key, lockToken, 'EX', 90, 'NX');
+  if (acquired !== 'OK') {
+    return null;
+  }
+  return lockToken;
+}
+
+async function releaseWalletPollLock(walletId: string, lockToken: string) {
+  const key = `wallet:poll:lock:${walletId}`;
+  const current = await redis.get(key);
+  if (current === lockToken) {
+    await redis.del(key);
+  }
+}
+
+function asIsoString(value: Date | null): string | null {
+  return value ? value.toISOString() : null;
+}
+
+function safeObservedAtIso(value: string | null | undefined): string {
+  if (!value) {
+    return new Date().toISOString();
+  }
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return new Date().toISOString();
+  }
+  return date.toISOString();
+}
+
+function computeRawPayloadHash(payload: Prisma.InputJsonValue): string {
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+async function getOrCreateCursor(walletId: string): Promise<CursorState> {
+  const row = await prisma.walletSyncCursor.upsert({
+    where: {
+      trackedWalletId_sourceName: {
+        trackedWalletId: walletId,
+        sourceName: SOURCE_NAME,
+      },
+    },
+    create: {
+      trackedWalletId: walletId,
+      sourceName: SOURCE_NAME,
+      sourceType: SOURCE_TYPE,
+      overlapWindowSec: config.INGEST_OVERLAP_WINDOW_SEC,
+      status: 'ACTIVE',
+    },
+    update: {
+      overlapWindowSec: config.INGEST_OVERLAP_WINDOW_SEC,
+      sourceType: SOURCE_TYPE,
+    },
+    select: {
+      id: true,
+      highWatermarkTimestamp: true,
+      highWatermarkCursor: true,
+      overlapWindowSec: true,
+    },
+  });
+
+  return {
+    id: row.id,
+    highWatermarkTimestamp: row.highWatermarkTimestamp,
+    highWatermarkCursor: row.highWatermarkCursor,
+    overlapWindowSec: row.overlapWindowSec,
+  };
+}
+
+async function fetchWalletActivityPages(
+  address: string,
+  baseQuery: Omit<WalletActivityFeedQuery, 'offset' | 'limit'>,
+): Promise<WalletActivityFeedEvent[]> {
+  const pageLimit = config.INGEST_BACKFILL_PAGE_LIMIT;
+  const pageSize = config.INGEST_ACTIVITY_PAGE_SIZE;
+  const results: WalletActivityFeedEvent[] = [];
+
+  for (let page = 0; page < pageLimit; page += 1) {
+    const offset = page * pageSize;
+    const batch = await dataAdapter.getWalletActivityFeed(address, {
+      ...baseQuery,
+      offset,
+      limit: pageSize,
+    });
+    if (batch.length === 0) {
+      break;
+    }
+    results.push(...batch);
+    if (batch.length < pageSize) {
+      break;
+    }
+  }
+
+  return results;
+}
+
+function sourceEventIdForTradeEvent(event: WalletActivityFeedEvent, dedupeKey: string): string {
+  if (event.externalEventId) return event.externalEventId;
+  if (event.txHash && Number.isInteger(event.logIndex)) {
+    return `${event.txHash}:${event.logIndex}`;
+  }
+  if (event.txHash && event.orderId) {
+    return `${event.txHash}:${event.orderId}`;
+  }
+  return dedupeKey;
+}
+
+async function recordIngestionDiagnostic(input: {
+  walletId: string;
+  address: string;
+  outcome: 'SUCCESS' | 'PARTIAL' | 'FAILED';
+  errorClass?: IngestionErrorClass;
+  message?: string;
+  summary: IngestionRunSummary;
+  startedAt: Date;
+  durationMs: number;
+}): Promise<void> {
+  try {
+    await prisma.auditLog.create({
+      data: {
+        category: 'INGESTION',
+        entityId: input.walletId,
+        action: input.outcome,
+        payload: {
+          walletId: input.walletId,
+          address: input.address,
+          startedAt: input.startedAt.toISOString(),
+          durationMs: input.durationMs,
+          errorClass: input.errorClass ?? null,
+          message: input.message ?? null,
+          summary: input.summary,
+        },
+      },
+    });
+  } catch (error) {
+    logger.warn({ walletId: input.walletId, error }, 'failed to persist ingestion diagnostic');
+  }
+}
 
 function isPollIdentifierValid(addressOrHandle: string): boolean {
   if (hexWalletRegex.test(addressOrHandle)) {
@@ -99,9 +308,10 @@ export async function scheduleWalletPolls(): Promise<void> {
           'poll-wallet',
           { walletId: wallet.id, address: wallet.address, tier: active ? 'ACTIVE' : 'INACTIVE' },
           {
+            jobId: `poll-wallet:${wallet.id}`,
             priority: active ? 1 : 10,
             removeOnComplete: 1000,
-            removeOnFail: 1000,
+            removeOnFail: 5000,
             attempts: 5,
             backoff: { type: 'exponential', delay: 500 },
           },
@@ -112,206 +322,474 @@ export async function scheduleWalletPolls(): Promise<void> {
 }
 
 export async function processWalletPoll(walletId: string, address: string): Promise<void> {
-  if (!isPollIdentifierValid(address)) {
-    await prisma.watchedWallet.update({
-      where: { id: walletId },
-      data: {
-        enabled: false,
-        copyEnabled: false,
-        syncStatus: 'ERROR',
-        lastSyncError:
-          'Invalid wallet identifier. Use a Polymarket profile handle or full 0x address.',
-        lastPolledAt: new Date(),
-      },
-    });
-    logger.warn({ walletId, address }, 'wallet disabled due to invalid identifier');
+  const lockToken = await acquireWalletPollLock(walletId);
+  if (!lockToken) {
+    incrementDuplicatePollSkip();
+    logger.debug({ walletId }, 'wallet poll skipped due to active lock owner');
     return;
   }
 
-  const start = Date.now();
-  await redis.set(`wallet:last-poll:${walletId}`, String(start));
+  const runStartedAt = new Date();
+  let cursorState: CursorState | null = null;
+  const summary: IngestionRunSummary = {
+    mode: 'INCREMENTAL',
+    overlapWindowSec: config.INGEST_OVERLAP_WINDOW_SEC,
+    previousHighWatermark: null,
+    nextHighWatermark: null,
+    fetchedEvents: 0,
+    insertedActivityEvents: 0,
+    insertedTradeEvents: 0,
+    duplicateEvents: 0,
+    parseErrors: 0,
+    dbInsertErrors: 0,
+    decisionEnqueueErrors: 0,
+    gapIssuesDetected: 0,
+    warnings: 0,
+  };
 
-  await prisma.watchedWallet.update({
-    where: { id: walletId },
-    data: {
-      syncStatus: 'SYNCING',
-      lastSyncError: null,
-    },
-  });
-
-  const latest = await prisma.walletActivityEvent.findFirst({
-    where: { trackedWalletId: walletId },
-    orderBy: { eventTimestamp: 'desc' },
-  });
-  const sinceIso = latest?.eventTimestamp.toISOString();
-
-  const apiStart = Date.now();
-  let events: Awaited<ReturnType<typeof dataAdapter.getWalletActivityFeed>> = [];
   try {
-    events = await dataAdapter.getWalletActivityFeed(address, sinceIso);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown ingestion error';
-    await prisma.watchedWallet.update({
-      where: { id: walletId },
-      data: {
-        syncStatus: 'ERROR',
-        lastSyncError: message,
-        lastPolledAt: new Date(),
-      },
-    });
-    logger.warn({ walletId, address, message }, 'wallet poll failed');
-    apiLatency.observe({ adapter: 'polymarket' }, Date.now() - apiStart);
-    return;
-  }
-  apiLatency.observe({ adapter: 'polymarket' }, Date.now() - apiStart);
-
-  const activeTier = isRecentlyActive(latest?.eventTimestamp ?? null) ? 'ACTIVE' : 'INACTIVE';
-
-  let latestSeenActivityAt: Date | null = null;
-
-  for (const event of events) {
-    const eventTs = new Date(event.eventTimestamp);
-    const dedupeKey = buildActivityDedupeKey(event);
-    const detectedMs = Math.max(0, Date.now() - eventTs.getTime());
-    detectionLatency.observe(detectedMs);
-    tradeDetectionLatency.observe(detectedMs);
-
-    try {
-      const activityRow = await prisma.walletActivityEvent.create({
+    if (!isPollIdentifierValid(address)) {
+      await prisma.watchedWallet.update({
+        where: { id: walletId },
         data: {
-          trackedWalletId: walletId,
-          walletAddress: event.walletAddress,
-          externalEventId: event.externalEventId ?? null,
-          dedupeKey,
-          eventType: event.eventType,
-          marketId: event.marketId,
-          marketQuestion: event.marketQuestion ?? null,
-          outcome: event.outcome ?? null,
-          side: event.side,
-          price: event.price,
-          shares: event.shares,
-          notional: event.notional,
-          fee: event.fee,
-          txHash: event.txHash,
-          orderId: event.orderId,
-          eventTimestamp: eventTs,
-          detectedAt: new Date(event.detectedAt),
-          rawPayloadJson: event.rawPayload as Prisma.InputJsonValue,
+          enabled: false,
+          copyEnabled: false,
+          syncStatus: 'ERROR',
+          lastSyncError:
+            '[PARSE_NORMALIZATION_ERROR] Invalid wallet identifier. Use a Polymarket profile handle or full 0x address.',
+          lastPolledAt: new Date(),
         },
       });
+      await recordIngestionDiagnostic({
+        walletId,
+        address,
+        outcome: 'FAILED',
+        errorClass: 'PARSE_NORMALIZATION_ERROR',
+        message: 'Invalid wallet identifier. Use a Polymarket profile handle or full 0x address.',
+        summary,
+        startedAt: runStartedAt,
+        durationMs: 0,
+      });
+      logger.warn({ walletId, address }, 'wallet disabled due to invalid identifier');
+      return;
+    }
+
+    const start = Date.now();
+    await redis.set(`wallet:last-poll:${walletId}`, String(start));
+
+    try {
+      cursorState = await getOrCreateCursor(walletId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load wallet sync cursor';
+      await prisma.watchedWallet.update({
+        where: { id: walletId },
+        data: {
+          syncStatus: 'ERROR',
+          lastSyncError: `[CURSOR_STATE_UPDATE_ERROR] ${message}`,
+          lastPolledAt: new Date(),
+        },
+      });
+      await recordIngestionDiagnostic({
+        walletId,
+        address,
+        outcome: 'FAILED',
+        errorClass: 'CURSOR_STATE_UPDATE_ERROR',
+        message,
+        summary,
+        startedAt: runStartedAt,
+        durationMs: Date.now() - start,
+      });
+      return;
+    }
+
+    summary.overlapWindowSec = cursorState.overlapWindowSec;
+    summary.previousHighWatermark = asIsoString(cursorState.highWatermarkTimestamp);
+    const cursor = cursorState;
+
+    await prisma.watchedWallet.update({
+      where: { id: walletId },
+      data: {
+        syncStatus: 'SYNCING',
+        lastSyncError: null,
+      },
+    });
+
+    const apiStart = Date.now();
+    let events: WalletActivityFeedEvent[] = [];
+    const now = Date.now();
+    const overlapStartMs = cursorState.highWatermarkTimestamp
+      ? Math.max(
+          0,
+          cursorState.highWatermarkTimestamp.getTime() - cursorState.overlapWindowSec * 1000,
+        )
+      : null;
+
+    summary.mode = cursorState.highWatermarkTimestamp ? 'INCREMENTAL' : 'BACKFILL';
+
+    // Overlap window is intentional: strict event_ts > high_watermark can miss
+    // same-timestamp or delayed-index events at poll boundaries.
+    const incrementalQuery: Omit<WalletActivityFeedQuery, 'offset' | 'limit'> =
+      overlapStartMs !== null ? { sinceIso: new Date(overlapStartMs).toISOString() } : {};
+
+    const lookbackStartMs = now - config.INGEST_BACKFILL_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+
+    try {
+      if (summary.mode === 'BACKFILL') {
+        const fetched = await fetchWalletActivityPages(address, {});
+        events = fetched.filter((event) => {
+          const ts = new Date(event.eventTimestamp).getTime();
+          return Number.isFinite(ts) && ts >= lookbackStartMs;
+        });
+      } else {
+        events = await fetchWalletActivityPages(address, incrementalQuery);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown ingestion fetch error';
+      const errorClass = classifyFetchError(error);
+      await prisma.watchedWallet.update({
+        where: { id: walletId },
+        data: {
+          syncStatus: 'ERROR',
+          lastSyncError: `[${errorClass}] ${message}`,
+          lastPolledAt: new Date(),
+          nextPollAt: new Date(Date.now() + config.INGEST_POLL_MAX_INTERVAL_MS),
+        },
+      });
+      await prisma.walletSyncCursor.update({
+        where: { id: cursor.id },
+        data: {
+          lastFailureAt: new Date(),
+          lastErrorClass: errorClass,
+          status: 'ERROR',
+        },
+      });
+      await recordIngestionDiagnostic({
+        walletId,
+        address,
+        outcome: 'FAILED',
+        errorClass,
+        message,
+        summary,
+        startedAt: runStartedAt,
+        durationMs: Date.now() - start,
+      });
+      logger.warn({ walletId, address, message, errorClass }, 'wallet poll failed');
+      apiLatency.observe({ adapter: 'polymarket' }, Date.now() - apiStart);
+      return;
+    }
+    apiLatency.observe({ adapter: 'polymarket' }, Date.now() - apiStart);
+    summary.fetchedEvents = events.length;
+
+    const activeTier = isRecentlyActive(cursor.highWatermarkTimestamp) ? 'ACTIVE' : 'INACTIVE';
+
+    let latestSeenActivityAt: Date | null = null;
+    let latestSeenCursor: string | null = cursorState.highWatermarkCursor;
+
+    for (const event of events) {
+      const eventTs = new Date(event.eventTimestamp);
+      if (!Number.isFinite(eventTs.getTime())) {
+        summary.parseErrors += 1;
+        logger.warn(
+          {
+            walletId,
+            externalEventId: event.externalEventId ?? null,
+            eventTimestamp: event.eventTimestamp,
+          },
+          'skipping event with invalid timestamp',
+        );
+        continue;
+      }
+      if (!event.marketId || event.marketId.trim().length === 0) {
+        summary.parseErrors += 1;
+        logger.warn(
+          { walletId, externalEventId: event.externalEventId ?? null },
+          'skipping event with missing marketId',
+        );
+        continue;
+      }
+      const dedupeKey = buildActivityDedupeKey(event);
+      const detectedMs = Math.max(0, Date.now() - eventTs.getTime());
+      detectionLatency.observe(detectedMs);
+      tradeDetectionLatency.observe(detectedMs);
+
+      let activityRow: { id: string } | null = null;
+      try {
+        const rawPayloadJson = event.rawPayload as Prisma.InputJsonValue;
+        const rawPayloadHash = computeRawPayloadHash(rawPayloadJson);
+
+        activityRow = await prisma.walletActivityEvent.create({
+          data: {
+            trackedWalletId: walletId,
+            walletAddress: event.walletAddress,
+            sourceName: SOURCE_NAME,
+            sourceType: SOURCE_TYPE,
+            externalEventId: event.externalEventId ?? null,
+            sourceEventId: event.externalEventId ?? null,
+            sourceCursor: event.sourceCursor ?? event.externalEventId ?? null,
+            dedupeKey,
+            eventType: event.eventType,
+            marketId: event.marketId,
+            conditionId: event.conditionId,
+            marketQuestion: event.marketQuestion ?? null,
+            outcome: event.outcome ?? null,
+            side: event.side,
+            effectiveSide: event.effectiveSide,
+            price: event.price,
+            shares: event.shares,
+            notional: event.notional,
+            fee: event.fee,
+            blockNumber: event.blockNumber,
+            logIndex: event.logIndex,
+            sourceTxHash: event.txHash,
+            txHash: event.txHash,
+            orderId: event.orderId,
+            eventTimestamp: eventTs,
+            observedAt: new Date(safeObservedAtIso(event.detectedAt)),
+            detectedAt: new Date(safeObservedAtIso(event.detectedAt)),
+            rawPayloadHash,
+            rawPayloadJson,
+            provenanceNote:
+              summary.mode === 'BACKFILL'
+                ? 'Historical backfill event'
+                : 'Incremental overlap poll event',
+          },
+        });
+        summary.insertedActivityEvents += 1;
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          summary.duplicateEvents += 1;
+          logger.debug(
+            { walletId, dedupeKey, externalEventId: event.externalEventId ?? null },
+            'skipping duplicate wallet activity event',
+          );
+          continue;
+        }
+        summary.dbInsertErrors += 1;
+        logger.warn(
+          {
+            walletId,
+            dedupeKey,
+            externalEventId: event.externalEventId ?? null,
+            error,
+          },
+          'failed to insert wallet activity event',
+        );
+        continue;
+      }
 
       if (!latestSeenActivityAt || eventTs > latestSeenActivityAt) {
         latestSeenActivityAt = eventTs;
+        latestSeenCursor = event.sourceCursor ?? event.externalEventId ?? latestSeenCursor;
       }
 
       if (!isTradeLikeActivity(event)) {
         continue;
       }
 
-      const row = await prisma.tradeEvent.create({
-        data: {
-          walletId,
-          sourceEventId: event.externalEventId ?? event.orderId ?? event.txHash ?? activityRow.id,
-          sourceWalletAddress: event.walletAddress,
-          marketId: event.marketId,
-          marketQuestion: event.marketQuestion,
-          outcome: event.outcome ?? 'UNKNOWN',
-          side: event.side!,
-          size: event.shares!,
-          price: event.price!,
-          txHash: event.txHash,
-          orderId: event.orderId,
-          tradedAt: eventTs,
-          observedAt: new Date(event.detectedAt),
-        },
-      });
+      try {
+        const row = await prisma.tradeEvent.create({
+          data: {
+            walletId,
+            sourceEventId: sourceEventIdForTradeEvent(event, dedupeKey),
+            sourceWalletAddress: event.walletAddress,
+            marketId: event.marketId,
+            marketQuestion: event.marketQuestion,
+            outcome: event.outcome ?? 'UNKNOWN',
+            side: event.side!,
+            size: event.shares!,
+            price: event.price!,
+            txHash: event.txHash,
+            orderId: event.orderId,
+            tradedAt: eventTs,
+            observedAt: new Date(safeObservedAtIso(event.detectedAt)),
+          },
+        });
+        summary.insertedTradeEvents += 1;
 
-      ingestionRate.inc({ wallet_tier: activeTier.toLowerCase() });
+        ingestionRate.inc({ wallet_tier: activeTier.toLowerCase() });
 
-      await publishEvent(
-        'WALLET_TRADE_DETECTED',
-        {
-          walletId,
-          walletAddress: event.walletAddress,
-          activityEventId: activityRow.id,
-          eventType: event.eventType,
-          marketId: event.marketId,
-          side: event.side,
-          size: event.shares,
-          price: event.price,
-          tradedAt: event.eventTimestamp,
-          detectionLatencyMs: detectedMs,
-        },
-        row.id,
-      );
+        await publishEvent(
+          'WALLET_TRADE_DETECTED',
+          {
+            walletId,
+            walletAddress: event.walletAddress,
+            activityEventId: activityRow.id,
+            eventType: event.eventType,
+            marketId: event.marketId,
+            side: event.side,
+            size: event.shares,
+            price: event.price,
+            tradedAt: event.eventTimestamp,
+            detectionLatencyMs: detectedMs,
+          },
+          row.id,
+        );
 
-      const recentEntriesInWindow = await prisma.tradeEvent.count({
-        where: {
+        const recentEntriesInWindow = await prisma.tradeEvent.count({
+          where: {
+            walletId,
+            marketId: row.marketId,
+            side: row.side,
+            tradedAt: {
+              gte: new Date(row.tradedAt.getTime() - config.CLUSTER_WINDOW_SECONDS * 1000),
+              lte: row.tradedAt,
+            },
+          },
+        });
+
+        const marketLiquidityApprox = Number(row.size) * Number(row.price) * 20;
+        await handleWhaleAlert({
           walletId,
+          tradeEventId: row.id,
+          walletAddress: row.sourceWalletAddress,
           marketId: row.marketId,
           side: row.side,
-          tradedAt: {
-            gte: new Date(row.tradedAt.getTime() - config.CLUSTER_WINDOW_SECONDS * 1000),
-            lte: row.tradedAt,
-          },
-        },
-      });
+          price: Number(row.price),
+          size: Number(row.size),
+          liquidity: marketLiquidityApprox,
+          tradedAt: row.tradedAt,
+          recentEntriesInWindow,
+        });
 
-      const marketLiquidityApprox = Number(row.size) * Number(row.price) * 20;
-      await handleWhaleAlert({
-        walletId,
-        tradeEventId: row.id,
-        walletAddress: row.sourceWalletAddress,
-        marketId: row.marketId,
-        side: row.side,
-        price: Number(row.price),
-        size: Number(row.size),
-        liquidity: marketLiquidityApprox,
-        tradedAt: row.tradedAt,
-        recentEntriesInWindow,
-      });
+        await detectAndPersistClusterSignal(row.id);
 
-      await detectAndPersistClusterSignal(row.id);
-
-      const strategies = await prisma.strategy.findMany({
-        where: { walletId, enabled: true },
-        select: { id: true },
-      });
-      for (const strategy of strategies) {
-        await decisionQueue.add(
-          'decision',
-          { strategyId: strategy.id, tradeEventId: row.id, activityEventId: activityRow.id },
-          {
-            removeOnComplete: 1000,
-            removeOnFail: 1000,
-            attempts: 5,
-            backoff: { type: 'exponential', delay: 500 },
-          },
+        const strategies = await prisma.strategy.findMany({
+          where: { walletId, enabled: true },
+          select: { id: true },
+        });
+        for (const strategy of strategies) {
+          try {
+            await decisionQueue.add(
+              'decision',
+              { strategyId: strategy.id, tradeEventId: row.id, activityEventId: activityRow.id },
+              {
+                jobId: `decision:${strategy.id}:${row.id}`,
+                removeOnComplete: 1000,
+                removeOnFail: 5000,
+                attempts: 5,
+                backoff: { type: 'exponential', delay: 500 },
+              },
+            );
+          } catch (error) {
+            summary.decisionEnqueueErrors += 1;
+            logger.warn(
+              { walletId, strategyId: strategy.id, tradeEventId: row.id, error },
+              'failed to enqueue decision job',
+            );
+          }
+        }
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          summary.duplicateEvents += 1;
+          logger.debug(
+            { walletId, dedupeKey, externalEventId: event.externalEventId ?? null },
+            'skipping duplicate trade event',
+          );
+          continue;
+        }
+        summary.dbInsertErrors += 1;
+        logger.warn(
+          { walletId, dedupeKey, externalEventId: event.externalEventId ?? null, error },
+          'failed to process trade-like activity event',
         );
       }
-    } catch (error) {
-      logger.debug(
-        { error, dedupeKey, externalEventId: event.externalEventId ?? null },
-        'activity event duplicate or insert failed',
-      );
     }
-  }
 
-  const nextInterval = computeNextPollIntervalMs(activeTier === 'ACTIVE');
-  const walletUpdateData: Record<string, unknown> = {
-    syncStatus: 'ACTIVE',
-    lastSyncAt: new Date(),
-    lastPolledAt: new Date(),
-    nextPollAt: new Date(Date.now() + nextInterval),
-    priorityTier: activeTier,
-  };
-  if (latestSeenActivityAt) {
-    walletUpdateData.lastActivitySyncedAt = latestSeenActivityAt;
-  }
-  await prisma.watchedWallet.update({
-    where: { id: walletId },
-    data: walletUpdateData,
-  });
+    const nextInterval = computeNextPollIntervalMs(activeTier === 'ACTIVE');
+    const hasHardFailures = summary.dbInsertErrors > 0 || summary.parseErrors > 0;
+    const hasWarnings = summary.decisionEnqueueErrors > 0;
+    summary.warnings = hasWarnings ? 1 : 0;
+    const outcome: 'SUCCESS' | 'PARTIAL' = hasHardFailures || hasWarnings ? 'PARTIAL' : 'SUCCESS';
 
-  pollLatency.observe(Date.now() - start);
+    if (latestSeenActivityAt) {
+      summary.nextHighWatermark = latestSeenActivityAt.toISOString();
+    }
+
+    const walletUpdateData: Record<string, unknown> = {
+      syncStatus: outcome === 'SUCCESS' ? 'ACTIVE' : 'DEGRADED',
+      lastSyncAt: new Date(),
+      lastPolledAt: new Date(),
+      nextPollAt: new Date(Date.now() + nextInterval),
+      priorityTier: activeTier,
+      lastSyncError:
+        outcome === 'SUCCESS'
+          ? null
+          : `[${hasHardFailures ? 'DB_INSERT_ERROR|PARSE_NORMALIZATION_ERROR' : 'QUEUE_WARNING'}] Poll completed with warnings/errors. Check ingestion diagnostics.`,
+    };
+    if (latestSeenActivityAt) {
+      walletUpdateData.lastActivitySyncedAt = latestSeenActivityAt;
+    }
+
+    try {
+      const lagSec = latestSeenActivityAt
+        ? Math.max(0, Math.floor((Date.now() - latestSeenActivityAt.getTime()) / 1000))
+        : null;
+
+      await prisma.$transaction([
+        prisma.watchedWallet.update({
+          where: { id: walletId },
+          data: walletUpdateData,
+        }),
+        prisma.walletSyncCursor.update({
+          where: { id: cursor.id },
+          data: {
+            highWatermarkTimestamp: latestSeenActivityAt ?? cursor.highWatermarkTimestamp,
+            highWatermarkCursor: latestSeenCursor,
+            overlapWindowSec: cursor.overlapWindowSec,
+            lastSuccessAt: new Date(),
+            lastErrorClass: null,
+            lagSec,
+            status: outcome === 'SUCCESS' ? 'ACTIVE' : 'DEGRADED',
+            lastFetchedCount: summary.fetchedEvents,
+            lastInsertedCount: summary.insertedActivityEvents,
+            lastDuplicateCount: summary.duplicateEvents,
+            lastParseErrorCount: summary.parseErrors,
+            lastInsertErrorCount: summary.dbInsertErrors,
+          },
+        }),
+      ]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to update wallet sync state';
+      await prisma.walletSyncCursor
+        .update({
+          where: { id: cursor.id },
+          data: {
+            lastFailureAt: new Date(),
+            lastErrorClass: 'CURSOR_STATE_UPDATE_ERROR',
+            status: 'ERROR',
+          },
+        })
+        .catch(() => undefined);
+
+      await recordIngestionDiagnostic({
+        walletId,
+        address,
+        outcome: 'FAILED',
+        errorClass: 'CURSOR_STATE_UPDATE_ERROR',
+        message,
+        summary,
+        startedAt: runStartedAt,
+        durationMs: Date.now() - start,
+      });
+      logger.error({ walletId, error }, 'failed to update wallet sync state');
+      return;
+    }
+
+    await recordIngestionDiagnostic({
+      walletId,
+      address,
+      outcome,
+      message:
+        outcome === 'SUCCESS'
+          ? 'Wallet poll completed successfully'
+          : 'Wallet poll completed with partial failures/warnings',
+      summary,
+      startedAt: runStartedAt,
+      durationMs: Date.now() - start,
+    });
+
+    pollLatency.observe(Date.now() - start);
+  } finally {
+    await releaseWalletPollLock(walletId, lockToken).catch(() => undefined);
+  }
 }

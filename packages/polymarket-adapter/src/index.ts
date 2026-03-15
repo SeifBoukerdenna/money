@@ -22,7 +22,7 @@ export interface PolymarketDataPort {
   getWalletActivity(walletAddress: string, sinceIso?: string): Promise<TradeEvent[]>;
   getWalletActivityFeed(
     walletAddress: string,
-    sinceIso?: string,
+    query?: WalletActivityFeedQuery,
   ): Promise<WalletActivityFeedEvent[]>;
   getWalletPositions(
     walletAddress: string,
@@ -31,6 +31,13 @@ export interface PolymarketDataPort {
   ): Promise<WalletPosition[]>;
   getMarket(marketId: string): Promise<Market | null>;
 }
+
+export type WalletActivityFeedQuery = {
+  sinceIso?: string;
+  untilIso?: string;
+  offset?: number;
+  limit?: number;
+};
 
 export interface PolymarketTradingPort {
   submitOrder(request: PolymarketOrderRequest): Promise<PolymarketOrderResponse>;
@@ -59,15 +66,20 @@ export type WalletPosition = {
 export type WalletActivityFeedEvent = {
   id: string;
   externalEventId?: string;
+  sourceCursor?: string | null;
   eventType: string;
   marketId: string;
+  conditionId: string | null;
   marketQuestion: string | null;
   outcome: string | null;
   side: Side | null;
+  effectiveSide: Side | null;
   price: number | null;
   shares: number | null;
   notional: number | null;
   fee: number | null;
+  blockNumber: number | null;
+  logIndex: number | null;
   txHash: string | null;
   orderId: string | null;
   eventTimestamp: string;
@@ -95,7 +107,10 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
   }
 
   async getWalletActivity(walletAddress: string, sinceIso?: string): Promise<TradeEvent[]> {
-    const events = await this.getWalletActivityFeed(walletAddress, sinceIso);
+    const events = await this.getWalletActivityFeed(
+      walletAddress,
+      sinceIso ? { sinceIso } : undefined,
+    );
     return events
       .filter(
         (event) =>
@@ -124,12 +139,17 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
 
   async getWalletActivityFeed(
     walletAddress: string,
-    sinceIso?: string,
+    query?: WalletActivityFeedQuery,
   ): Promise<WalletActivityFeedEvent[]> {
+    const sinceIso = query?.sinceIso;
+    const untilIso = query?.untilIso;
+    const offset = Math.max(0, query?.offset ?? 0);
+    const limit = Math.max(1, Math.min(500, query?.limit ?? 500));
+
     const encoded = encodeURIComponent(walletAddress.toLowerCase());
     const candidates = [
-      `${this.dataApiBaseUrl}/activity?user=${encoded}&limit=500&offset=0&sortBy=TIMESTAMP&sortDirection=DESC`,
-      `${this.dataApiBaseUrl}/trades?user=${encoded}&limit=500&offset=0`,
+      `${this.dataApiBaseUrl}/activity?user=${encoded}&limit=${limit}&offset=${offset}&sortBy=TIMESTAMP&sortDirection=DESC`,
+      `${this.dataApiBaseUrl}/trades?user=${encoded}&limit=${limit}&offset=${offset}`,
     ];
 
     let payload: Array<Record<string, unknown>> | null = null;
@@ -154,10 +174,13 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
     }
 
     const sinceMs = sinceIso ? new Date(sinceIso).getTime() : null;
+    const untilMs = untilIso ? new Date(untilIso).getTime() : null;
     const events: WalletActivityFeedEvent[] = [];
 
     for (const row of payload) {
       const marketId = String(row.market ?? row.marketId ?? row.conditionId ?? '').trim();
+      const conditionIdRaw = String(row.conditionId ?? row.market ?? row.marketId ?? '').trim();
+      const conditionId = conditionIdRaw.length > 0 ? conditionIdRaw : null;
       const tradedAtMs = toEpochMs(row.timestamp ?? row.tradedAt ?? row.createdAt ?? row.time);
       const size = Number(row.size ?? row.amount ?? row.shares ?? row.usdcSize ?? 0);
       const price = Number(row.price ?? row.avgPrice ?? 0);
@@ -222,6 +245,9 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
       if (sinceMs && Number.isFinite(sinceMs) && tradedAtMs <= sinceMs) {
         continue;
       }
+      if (untilMs && Number.isFinite(untilMs) && tradedAtMs > untilMs) {
+        continue;
+      }
       if (!marketId) {
         continue;
       }
@@ -256,15 +282,20 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
       events.push({
         id: crypto.randomUUID(),
         ...(externalEventId ? { externalEventId } : {}),
+        sourceCursor: externalEventId ?? null,
         eventType: normalizedType,
         marketId,
+        conditionId,
         marketQuestion: row.title ? String(row.title) : null,
         outcome: normalizedOutcome,
         side: effectiveSide,
+        effectiveSide,
         price: eventPrice,
         shares: eventShares,
         notional: eventShares !== null && eventPrice !== null ? eventShares * eventPrice : null,
         fee: null,
+        blockNumber: numberOrNull(row.blockNumber ?? row.block_num ?? row.block),
+        logIndex: numberOrNull(row.logIndex ?? row.log_index ?? row.index),
         txHash: row.transactionHash
           ? String(row.transactionHash)
           : row.txHash
@@ -460,6 +491,14 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
       'LivePolymarketAdapter.submitOrder requires official Polymarket CLOB SDK wiring',
     );
   }
+}
+
+function numberOrNull(value: unknown): number | null {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  return num;
 }
 
 function toEpochMs(value: unknown): number {

@@ -15,6 +15,7 @@
 
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
+import { materializePaperSessionState } from './paper-accounting.js';
 
 const db = prisma as any;
 
@@ -59,22 +60,16 @@ export async function forceClosePosition(
   const cashReturned = notional - feeApplied;
   const now = new Date();
 
-  // Update position
-  await db.paperCopyPosition.update({
-    where: { id: pos.id },
-    data: {
-      netShares: 0,
-      currentMarkPrice: closePrice,
-      realizedPnl: Number(pos.realizedPnl) + realizedPnl - feeApplied,
-      status: 'CLOSED',
-      closedAt: now,
-    },
-  });
-
-  // Record a FORCE_CLOSE trade
   await db.paperCopyTrade.create({
     data: {
       sessionId,
+      trackedWalletId: session.trackedWalletId,
+      walletAddress: session.trackedWalletAddress,
+      sourceType: 'MANUAL_FORCE_CLOSE',
+      sourceEventTimestamp: now,
+      sourceTxHash: null,
+      executorType: 'FORCE_CLOSE_TOOLING',
+      isBootstrap: false,
       sourceActivityEventId: null,
       marketId: pos.marketId,
       marketQuestion: pos.marketQuestion ?? null,
@@ -100,11 +95,7 @@ export async function forceClosePosition(
     },
   });
 
-  // Update cash
-  await db.paperCopySession.update({
-    where: { id: sessionId },
-    data: { currentCash: { increment: cashReturned } },
-  });
+  await materializePaperSessionState(sessionId);
 
   logger.info(
     {
@@ -165,20 +156,16 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
     const feeApplied = notional * (Number(session.feeBps) / 10_000);
     const cashReturned = notional - feeApplied;
 
-    await db.paperCopyPosition.update({
-      where: { id: pos.id },
-      data: {
-        netShares: 0,
-        currentMarkPrice: closePrice,
-        realizedPnl: Number(pos.realizedPnl) + realizedPnl - feeApplied,
-        status: 'CLOSED',
-        closedAt: now,
-      },
-    });
-
     await db.paperCopyTrade.create({
       data: {
         sessionId,
+        trackedWalletId: session.trackedWalletId,
+        walletAddress: session.trackedWalletAddress,
+        sourceType: 'AUTO_RESOLUTION_CLOSE',
+        sourceEventTimestamp: now,
+        sourceTxHash: null,
+        executorType: 'FORCE_CLOSE_TOOLING',
+        isBootstrap: false,
         sourceActivityEventId: null,
         marketId: pos.marketId,
         marketQuestion: pos.marketQuestion ?? null,
@@ -203,11 +190,6 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
       },
     });
 
-    await db.paperCopySession.update({
-      where: { id: sessionId },
-      data: { currentCash: { increment: cashReturned } },
-    });
-
     totalRealizedPnl += realizedPnl;
     totalCashReturned += cashReturned;
     closed++;
@@ -224,6 +206,10 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
       },
       'position auto-closed — market resolved (mark ≈ 0 or 1)',
     );
+  }
+
+  if (closed > 0) {
+    await materializePaperSessionState(sessionId);
   }
 
   return {

@@ -29,6 +29,28 @@ enum ExecutionStatus {
   SKIPPED
 }
 
+enum PaperDecisionType {
+  COPY
+  SKIP
+  REDUCE
+  CLOSE
+  BOOTSTRAP
+  NOOP
+}
+
+enum PaperDecisionStatus {
+  PENDING
+  EXECUTED
+  SKIPPED
+  FAILED
+}
+
+enum PaperExecutorType {
+  PAPER
+  DRY_RUN
+  LIVE
+}
+
 model WatchedWallet {
   id             String     @id @default(uuid())
   address        String     @unique
@@ -47,39 +69,104 @@ model WatchedWallet {
   lastSyncError  String?
   strategies     Strategy[]
   activityEvents WalletActivityEvent[]
+  syncCursors    WalletSyncCursor[]
+  reconciliationIssues WalletReconciliationIssue[]
   tradeEvents    TradeEvent[]
   analyticsSnapshots WalletAnalyticsSnapshot[]
   whaleAlerts    WhaleAlert[]
   paperSessions  PaperCopySession[]
+  systemAlerts   SystemAlert[]
 }
 
 model WalletActivityEvent {
   id                String   @id @default(uuid())
   trackedWalletId   String
   walletAddress     String
+  sourceName        String   @default("POLYMARKET_DATA_API")
+  sourceType        String   @default("HTTP_API")
   externalEventId   String?
+  sourceEventId     String?
+  sourceCursor      String?
   dedupeKey         String
   eventType         String
   marketId          String
+  conditionId       String?
   marketQuestion    String?
   outcome           String?
   side              Side?
+  effectiveSide     Side?
   price             Decimal?
   shares            Decimal?
   notional          Decimal?
   fee               Decimal?
+  blockNumber       Int?
+  logIndex          Int?
+  sourceTxHash      String?
   txHash            String?
   orderId           String?
   eventTimestamp    DateTime
+  observedAt        DateTime?
   detectedAt        DateTime
+  rawPayloadHash    String?
   rawPayloadJson    Json
+  provenanceNote    String?
   createdAt         DateTime @default(now())
   trackedWallet     WatchedWallet @relation(fields: [trackedWalletId], references: [id], onDelete: Cascade)
   paperTrades       PaperCopyTrade[]
+  paperDecisions    PaperCopyDecision[]
 
   @@unique([trackedWalletId, dedupeKey])
+  @@index([trackedWalletId, sourceName, sourceEventId])
+  @@index([trackedWalletId, sourceTxHash, logIndex])
   @@index([trackedWalletId, eventTimestamp])
   @@index([marketId, eventTimestamp])
+}
+
+model WalletSyncCursor {
+  id                     String   @id @default(uuid())
+  trackedWalletId        String
+  sourceName             String
+  sourceType             String   @default("HTTP_API")
+  highWatermarkTimestamp DateTime?
+  highWatermarkCursor    String?
+  overlapWindowSec       Int      @default(180)
+  lastSuccessAt          DateTime?
+  lastFailureAt          DateTime?
+  lastErrorClass         String?
+  lagSec                 Int?
+  status                 String   @default("ACTIVE")
+  lastFetchedCount       Int      @default(0)
+  lastInsertedCount      Int      @default(0)
+  lastDuplicateCount     Int      @default(0)
+  lastParseErrorCount    Int      @default(0)
+  lastInsertErrorCount   Int      @default(0)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+  trackedWallet          WatchedWallet @relation(fields: [trackedWalletId], references: [id], onDelete: Cascade)
+
+  @@unique([trackedWalletId, sourceName])
+  @@index([sourceName, status])
+}
+
+model WalletReconciliationIssue {
+  id              String   @id @default(uuid())
+  trackedWalletId String
+  sourceName      String   @default("POLYMARKET_DATA_API")
+  issueType       String
+  severity        String   @default("WARN")
+  marketId        String?
+  conditionId     String?
+  expectedValue   Json?
+  actualValue     Json?
+  notes           String?
+  detectedAt      DateTime @default(now())
+  resolvedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  trackedWallet   WatchedWallet @relation(fields: [trackedWalletId], references: [id], onDelete: Cascade)
+
+  @@index([trackedWalletId, detectedAt])
+  @@index([trackedWalletId, issueType, resolvedAt])
 }
 
 model Strategy {
@@ -351,6 +438,13 @@ model PaperCopySession {
   maxAllocationPerMarket Decimal @default(2500)
   maxTotalExposure      Decimal @default(10000)
   minNotionalThreshold  Decimal @default(2)
+  minWalletTrades       Int?
+  minWalletWinRate      Decimal?
+  minWalletSharpeLike   Decimal?
+  dailyDrawdownLimitPct Decimal?
+  autoPauseOnHealthDegradation Boolean @default(false)
+  consecutiveDecisionFailures Int @default(0)
+  lastAutoPausedAt      DateTime?
   feeBps                Int     @default(0)
   slippageBps           Int     @default(0)
   startedAt             DateTime?
@@ -360,18 +454,55 @@ model PaperCopySession {
   updatedAt             DateTime @updatedAt
   trackedWallet         WatchedWallet @relation(fields: [trackedWalletId], references: [id], onDelete: Cascade)
   trades                PaperCopyTrade[]
+  decisions             PaperCopyDecision[]
   positions             PaperCopyPosition[]
   snapshots             PaperPortfolioSnapshot[]
   metricPoints          PaperSessionMetricPoint[]
+  systemAlerts          SystemAlert[]
 
   @@index([trackedWalletId, createdAt])
   @@index([status, updatedAt])
 }
 
+model SystemAlert {
+  id          String   @id @default(uuid())
+  dedupeKey   String   @unique
+  alertType   String
+  severity    String
+  status      String   @default("OPEN")
+  title       String
+  message     String
+  walletId    String?
+  sessionId   String?
+  payloadJson Json?
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  resolvedAt  DateTime?
+  count       Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  wallet   WatchedWallet?   @relation(fields: [walletId], references: [id], onDelete: SetNull)
+  session  PaperCopySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([status, severity, lastSeenAt])
+  @@index([alertType, lastSeenAt])
+  @@index([walletId, lastSeenAt])
+  @@index([sessionId, lastSeenAt])
+}
+
 model PaperCopyTrade {
   id                    String   @id @default(uuid())
   sessionId             String
+  trackedWalletId       String?
+  walletAddress         String?
+  sourceType            String   @default("WALLET_ACTIVITY")
+  sourceEventTimestamp  DateTime?
+  sourceTxHash          String?
+  executorType          String   @default("PAPER_SESSION_ENGINE")
+  isBootstrap           Boolean  @default(false)
   sourceActivityEventId String?
+  decisionId            String?
   marketId              String
   marketQuestion        String?
   outcome               String
@@ -390,9 +521,48 @@ model PaperCopyTrade {
   createdAt             DateTime @default(now())
   session               PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   sourceActivityEvent   WalletActivityEvent? @relation(fields: [sourceActivityEventId], references: [id], onDelete: SetNull)
+  decision              PaperCopyDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
 
   @@unique([sessionId, sourceActivityEventId])
   @@index([sessionId, eventTimestamp])
+}
+
+model PaperCopyDecision {
+  id                    String              @id @default(uuid())
+  sessionId             String
+  trackedWalletId       String?
+  walletAddress         String?
+  sourceActivityEventId String?
+  sourceEventTimestamp  DateTime?
+  sourceTxHash          String?
+  decisionType          PaperDecisionType
+  status                PaperDecisionStatus @default(PENDING)
+  executorType          PaperExecutorType   @default(PAPER)
+  marketId              String?
+  marketQuestion        String?
+  outcome               String?
+  side                  Side?
+  sourceShares          Decimal?
+  simulatedShares       Decimal?
+  sourcePrice           Decimal?
+  intendedFillPrice     Decimal?
+  copyRatio             Decimal?
+  sizingInputsJson      Json?
+  reasonCode            String
+  humanReason           String
+  riskChecksJson        Json?
+  notes                 String?
+  executionError        String?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  session               PaperCopySession    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  sourceActivityEvent   WalletActivityEvent? @relation(fields: [sourceActivityEventId], references: [id], onDelete: SetNull)
+  trades                PaperCopyTrade[]
+
+  @@unique([sessionId, sourceActivityEventId])
+  @@index([sessionId, createdAt])
+  @@index([sessionId, status, createdAt])
+  @@index([sessionId, sourceEventTimestamp])
 }
 
 model PaperCopyPosition {

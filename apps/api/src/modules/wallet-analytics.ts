@@ -1,4 +1,26 @@
 import { prisma } from '../lib/prisma.js';
+import { config } from '../config.js';
+
+const ANALYTICS_RETENTION_ROWS = Math.max(48, config.WALLET_ANALYTICS_RETENTION_ROWS);
+
+async function pruneWalletAnalyticsSnapshots(walletId: string): Promise<void> {
+  const count = await prisma.walletAnalyticsSnapshot.count({ where: { walletId } });
+  if (count <= ANALYTICS_RETENTION_ROWS + 24) {
+    return;
+  }
+  const staleRows = await prisma.walletAnalyticsSnapshot.findMany({
+    where: { walletId },
+    orderBy: { createdAt: 'asc' },
+    take: count - ANALYTICS_RETENTION_ROWS,
+    select: { id: true },
+  });
+  if (staleRows.length === 0) {
+    return;
+  }
+  await prisma.walletAnalyticsSnapshot.deleteMany({
+    where: { id: { in: staleRows.map((row) => row.id) } },
+  });
+}
 
 function computeWalletAnalytics(
   trades: Array<{
@@ -137,10 +159,23 @@ export async function refreshWalletAnalyticsSnapshots(): Promise<void> {
   const wallets = await prisma.watchedWallet.findMany({ where: { enabled: true } });
 
   for (const wallet of wallets) {
+    const latestSnapshot = await prisma.walletAnalyticsSnapshot.findFirst({
+      where: { walletId: wallet.id },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    });
+
+    if (
+      latestSnapshot &&
+      Date.now() - latestSnapshot.createdAt.getTime() < config.WALLET_ANALYTICS_INTERVAL_MS
+    ) {
+      continue;
+    }
+
     const trades = await prisma.tradeEvent.findMany({
       where: { walletId: wallet.id },
       orderBy: { tradedAt: 'asc' },
-      take: 10000,
+      take: 3000,
     });
 
     const metrics = computeWalletAnalytics(
@@ -178,6 +213,8 @@ export async function refreshWalletAnalyticsSnapshots(): Promise<void> {
         marketsTraded: metrics.marketsTraded,
       },
     });
+
+    await pruneWalletAnalyticsSnapshots(wallet.id);
   }
 }
 

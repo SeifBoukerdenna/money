@@ -9,23 +9,74 @@ type WalletDetail = {
     syncStatus: string;
     lastSyncAt: string | null;
     lastSyncError: string | null;
+    lastActivitySyncAt: string | null;
+    lastPositionsSyncAt: string | null;
+    lastPolledAt: string | null;
+    nextPollAt: string | null;
+    staleSeconds: number | null;
+    isStale: boolean;
+    mismatchCount: number;
+    unresolvedGapCount: number;
+    latestIngestion: {
+        outcome: string;
+        createdAt: string;
+        errorClass: string | null;
+        message: string | null;
+        summary: {
+            fetchedEvents: number;
+            insertedActivityEvents: number;
+            insertedTradeEvents: number;
+            duplicateEvents: number;
+            parseErrors: number;
+            dbInsertErrors: number;
+            decisionEnqueueErrors: number;
+        } | null;
+    } | null;
+    syncCursor: {
+        sourceName: string;
+        sourceType: string;
+        highWatermarkTimestamp: string | null;
+        highWatermarkCursor: string | null;
+        overlapWindowSec: number;
+        lastSuccessAt: string | null;
+        lastFailureAt: string | null;
+        lastErrorClass: string | null;
+        lagSec: number | null;
+        status: string;
+        lastFetchedCount: number;
+        lastInsertedCount: number;
+        lastDuplicateCount: number;
+        lastParseErrorCount: number;
+        lastInsertErrorCount: number;
+    } | null;
     totalTrades: number;
     recentMarkets: Array<{ marketId: string; marketQuestion: string | null; trades: number }>;
 };
 
 type ActivityItem = {
     id: string;
+    sourceName: string;
+    sourceType: string;
+    sourceEventId: string | null;
+    sourceCursor: string | null;
+    sourceTxHash: string | null;
+    blockNumber: number | null;
+    logIndex: number | null;
     eventType: string;
     eventTimestamp: string;
     marketId: string;
+    conditionId: string | null;
     marketQuestion: string | null;
     outcome: string | null;
     side: 'BUY' | 'SELL' | null;
+    effectiveSide: 'BUY' | 'SELL' | null;
     price: number | null;
     shares: number | null;
     notional: number | null;
     txHash: string | null;
     orderId: string | null;
+    observedAt: string | null;
+    provenanceNote: string | null;
 };
 
 type PositionItem = {
@@ -164,6 +215,32 @@ export function WalletDetailClient({ walletId }: { walletId: string }) {
                         <Info label="Recent Markets" value={String(detail.recentMarkets.length)} />
                         <Info label="Status" value={detail.syncStatus} />
                     </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+                        <Info label="Last Activity Sync" value={detail.lastActivitySyncAt ? new Date(detail.lastActivitySyncAt).toLocaleString() : '—'} />
+                        <Info label="Last Position Sync" value={detail.lastPositionsSyncAt ? new Date(detail.lastPositionsSyncAt).toLocaleString() : '—'} />
+                        <Info label="Last Poll" value={detail.lastPolledAt ? new Date(detail.lastPolledAt).toLocaleString() : '—'} />
+                        <Info label="Next Poll" value={detail.nextPollAt ? new Date(detail.nextPollAt).toLocaleString() : '—'} />
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+                        <Info label="Stale" value={detail.staleSeconds !== null ? `${detail.staleSeconds}s${detail.isStale ? ' (yes)' : ''}` : '—'} />
+                        <Info label="Mismatch Count" value={String(detail.mismatchCount)} />
+                        <Info label="Gap Issues" value={String(detail.unresolvedGapCount)} />
+                        <Info label="Latest Ingestion" value={detail.latestIngestion?.outcome ?? '—'} />
+                        <Info label="Ingestion Error Class" value={detail.latestIngestion?.errorClass ?? '—'} />
+                    </div>
+                    {detail.syncCursor && (
+                        <p className="mt-1 text-xs text-slate-500">
+                            source={detail.syncCursor.sourceName} • status={detail.syncCursor.status} • overlap={detail.syncCursor.overlapWindowSec}s • watermark={detail.syncCursor.highWatermarkTimestamp ? new Date(detail.syncCursor.highWatermarkTimestamp).toLocaleString() : '—'} • lag={detail.syncCursor.lagSec ?? '—'}s
+                        </p>
+                    )}
+                    {detail.latestIngestion?.message && (
+                        <p className="mt-2 text-xs text-slate-400">{detail.latestIngestion.message}</p>
+                    )}
+                    {detail.latestIngestion?.summary && (
+                        <p className="mt-1 text-xs text-slate-500">
+                            fetched={detail.latestIngestion.summary.fetchedEvents} • activity={detail.latestIngestion.summary.insertedActivityEvents} • trades={detail.latestIngestion.summary.insertedTradeEvents} • dup={detail.latestIngestion.summary.duplicateEvents} • parseErr={detail.latestIngestion.summary.parseErrors} • dbErr={detail.latestIngestion.summary.dbInsertErrors}
+                        </p>
+                    )}
                     {detail.lastSyncError && <p className="mt-2 text-xs text-rose-300">{detail.lastSyncError}</p>}
                 </div>
             )}
@@ -187,6 +264,7 @@ export function WalletDetailClient({ walletId }: { walletId: string }) {
                     <input className="input" type="date" value={to} onChange={(event) => { setPage(1); setTo(event.target.value); }} />
                     <button className="btn-muted" onClick={() => { setPage(1); loadTrades(); }}>Apply</button>
                 </div>
+                <p className="mt-3 text-xs text-slate-500">Canonical source-wallet timeline only: this table shows ingested wallet activity events, not copy decisions or simulated ledger executions.</p>
             </div>
 
             <div className="panel overflow-hidden">
@@ -262,14 +340,16 @@ export function WalletDetailClient({ walletId }: { walletId: string }) {
                         <thead className="sticky top-0 z-10 bg-slate-900/95 text-xs uppercase tracking-wide text-slate-400 backdrop-blur">
                             <tr>
                                 <th className="px-3 py-2">Timestamp</th>
-                                <th className="px-3 py-2">Type</th>
+                                <th className="px-3 py-2">Event Type</th>
                                 <th className="px-3 py-2">Market</th>
                                 <th className="px-3 py-2">Outcome</th>
                                 <th className="px-3 py-2">Side</th>
                                 <th className="px-3 py-2">Price</th>
                                 <th className="px-3 py-2">Shares</th>
                                 <th className="px-3 py-2">Notional</th>
-                                <th className="px-3 py-2">Identifier</th>
+                                <th className="px-3 py-2">Tx Hash</th>
+                                <th className="px-3 py-2">Provenance</th>
+                                <th className="px-3 py-2">Trace</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -287,18 +367,29 @@ export function WalletDetailClient({ walletId }: { walletId: string }) {
                                     <td className="px-3 py-2">{trade.shares !== null ? trade.shares.toFixed(2) : '—'}</td>
                                     <td className="px-3 py-2">{trade.notional !== null ? trade.notional.toFixed(2) : '—'}</td>
                                     <td className="px-3 py-2 text-xs text-slate-400">
+                                        {trade.txHash ? (
+                                            <a
+                                                className="text-sky-300 hover:text-sky-200"
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                href={`https://polygonscan.com/tx/${trade.txHash}`}
+                                                title={trade.txHash}
+                                            >
+                                                {shortId(trade.txHash)}
+                                            </a>
+                                        ) : (
+                                            '—'
+                                        )}
+                                    </td>
+                                    <td className="px-3 py-2 text-xs text-slate-400">
                                         <div className="flex flex-col gap-1">
-                                            {trade.txHash && (
-                                                <a
-                                                    className="text-sky-300 hover:text-sky-200"
-                                                    target="_blank"
-                                                    rel="noreferrer"
-                                                    href={`https://polygonscan.com/tx/${trade.txHash}`}
-                                                    title={trade.txHash}
-                                                >
-                                                    tx: {shortId(trade.txHash)}
-                                                </a>
-                                            )}
+                                            <span>{trade.sourceName}</span>
+                                            <span>{trade.sourceType}</span>
+                                            {trade.provenanceNote && <span className="text-slate-500">{trade.provenanceNote}</span>}
+                                        </div>
+                                    </td>
+                                    <td className="px-3 py-2 text-xs text-slate-400">
+                                        <div className="flex flex-col gap-1">
                                             {trade.orderId && (
                                                 <a
                                                     className="text-sky-300 hover:text-sky-200"
@@ -310,7 +401,9 @@ export function WalletDetailClient({ walletId }: { walletId: string }) {
                                                     order: {shortId(trade.orderId)}
                                                 </a>
                                             )}
-                                            {!trade.txHash && !trade.orderId && <span>—</span>}
+                                            {trade.sourceEventId && <span>src: {shortId(trade.sourceEventId)}</span>}
+                                            {trade.sourceCursor && <span>cursor: {shortId(trade.sourceCursor)}</span>}
+                                            {!trade.orderId && !trade.sourceEventId && !trade.sourceCursor && <span>—</span>}
                                         </div>
                                     </td>
                                 </tr>
@@ -321,7 +414,7 @@ export function WalletDetailClient({ walletId }: { walletId: string }) {
 
                 {loading && <p className="p-3 text-sm text-slate-400">Loading trades…</p>}
                 {error && <p className="p-3 text-sm text-rose-300">{error}</p>}
-                {!loading && !error && items.length === 0 && <p className="p-3 text-sm text-slate-400">No trades found for this wallet yet.</p>}
+                {!loading && !error && items.length === 0 && <p className="p-3 text-sm text-slate-400">No source wallet events tracked yet.</p>}
 
                 <div className="flex items-center justify-between border-t border-slate-800/70 px-3 py-2 text-xs text-slate-400">
                     <p>Total {total}</p>

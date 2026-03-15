@@ -6,13 +6,16 @@ import { config } from './config.js';
 import { metricsRegistry } from './lib/metrics.js';
 import { prisma } from './lib/prisma.js';
 import { eventBus, loadRecentEvents } from './modules/event-stream.js';
+import { getRuntimeOpsSnapshot } from './modules/runtime-ops.js';
 import { scheduleWalletPolls } from './modules/ingestion.js';
 import { getLatestMarketIntelligence } from './modules/market-intelligence.js';
 import { processWalletPoll } from './modules/ingestion.js';
 import { createPolymarketDataAdapter } from './modules/polymarket.js';
+import { decisionQueue, executionQueue, ingestQueue } from './modules/queue.js';
 import {
   createPaperCopySession,
   deletePaperCopySession,
+  getPaperCopySessionAnalytics,
   getSessionHealth,
   killAllPaperSessions,
   pausePaperCopySession,
@@ -21,11 +24,13 @@ import {
   resumePaperCopySession,
   startPaperCopySession,
   stopPaperCopySession,
+  updatePaperCopySessionGuardrails,
 } from './modules/paper-copy.js';
 import { reconcileWalletExposure } from './modules/reconciliation.js';
 import { resolveWalletAddress, shortenAddress } from './modules/wallet-input.js';
 import { getWalletLeaderboard } from './modules/wallet-analytics.js';
 import { registerForceCloseRoutes } from './modules/force-close-routes.js';
+import { listSystemAlerts, raiseSystemAlert } from './modules/system-alerts.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -64,6 +69,95 @@ const smartConfigSchema = z.object({
 
 const dataAdapter = createPolymarketDataAdapter();
 
+async function getLatestIngestionDiagnostic(walletId: string) {
+  const row = await prisma.auditLog.findFirst({
+    where: { category: 'INGESTION', entityId: walletId },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!row) return null;
+  const payload = row.payload as Record<string, unknown>;
+  const summary =
+    payload && typeof payload.summary === 'object'
+      ? (payload.summary as Record<string, unknown>)
+      : null;
+
+  return {
+    outcome: row.action,
+    createdAt: row.createdAt,
+    errorClass: typeof payload?.errorClass === 'string' ? payload.errorClass : null,
+    message: typeof payload?.message === 'string' ? payload.message : null,
+    summary: summary
+      ? {
+          fetchedEvents: Number(summary.fetchedEvents ?? 0),
+          insertedActivityEvents: Number(summary.insertedActivityEvents ?? 0),
+          insertedTradeEvents: Number(summary.insertedTradeEvents ?? 0),
+          duplicateEvents: Number(summary.duplicateEvents ?? 0),
+          parseErrors: Number(summary.parseErrors ?? 0),
+          dbInsertErrors: Number(summary.dbInsertErrors ?? 0),
+          decisionEnqueueErrors: Number(summary.decisionEnqueueErrors ?? 0),
+        }
+      : null,
+  };
+}
+
+async function getWalletSyncVisibility(walletId: string, lastActivitySyncedAt: Date | null) {
+  const [latestDiagnostic, mismatchCount, unresolvedGapCount, cursor] = await Promise.all([
+    getLatestIngestionDiagnostic(walletId),
+    prisma.auditLog.count({
+      where: {
+        category: 'RECONCILIATION',
+        entityId: walletId,
+        action: 'MISMATCH',
+      },
+    }),
+    prisma.walletReconciliationIssue.count({
+      where: {
+        trackedWalletId: walletId,
+        resolvedAt: null,
+      },
+    }),
+    prisma.walletSyncCursor.findUnique({
+      where: {
+        trackedWalletId_sourceName: {
+          trackedWalletId: walletId,
+          sourceName: 'POLYMARKET_DATA_API',
+        },
+      },
+      select: {
+        sourceName: true,
+        sourceType: true,
+        highWatermarkTimestamp: true,
+        highWatermarkCursor: true,
+        overlapWindowSec: true,
+        lastSuccessAt: true,
+        lastFailureAt: true,
+        lastErrorClass: true,
+        lagSec: true,
+        status: true,
+        lastFetchedCount: true,
+        lastInsertedCount: true,
+        lastDuplicateCount: true,
+        lastParseErrorCount: true,
+        lastInsertErrorCount: true,
+      },
+    }),
+  ]);
+
+  const now = Date.now();
+  const basisTs =
+    cursor?.highWatermarkTimestamp ?? lastActivitySyncedAt ?? latestDiagnostic?.createdAt ?? null;
+  const staleSeconds = basisTs ? Math.floor((now - basisTs.getTime()) / 1000) : null;
+
+  return {
+    latestIngestion: latestDiagnostic,
+    mismatchCount,
+    unresolvedGapCount,
+    staleSeconds,
+    isStale: staleSeconds !== null ? staleSeconds > 120 : false,
+    cursor,
+  };
+}
+
 export async function registerRoutes(app: any): Promise<void> {
   const db = prisma as unknown as Record<string, any>;
 
@@ -78,9 +172,174 @@ export async function registerRoutes(app: any): Promise<void> {
     return { status: 'ready' };
   });
 
+  app.get('/health/ops', async () => {
+    const now = Date.now();
+    const staleCutoff = new Date(now - 5 * 60_000);
+    const [
+      ingestWaiting,
+      decisionWaiting,
+      executionWaiting,
+      staleWalletSyncCount,
+      staleSessionCount,
+    ] = await Promise.all([
+      ingestQueue.getWaitingCount(),
+      decisionQueue.getWaitingCount(),
+      executionQueue.getWaitingCount(),
+      prisma.watchedWallet.count({
+        where: {
+          enabled: true,
+          copyEnabled: true,
+          OR: [{ lastSyncAt: null }, { lastSyncAt: { lt: staleCutoff } }, { syncStatus: 'ERROR' }],
+        },
+      }),
+      prisma.paperCopySession.count({
+        where: {
+          status: 'RUNNING',
+          OR: [{ lastProcessedEventAt: null }, { lastProcessedEventAt: { lt: staleCutoff } }],
+        },
+      }),
+    ]);
+
+    if (staleWalletSyncCount > 0) {
+      await raiseSystemAlert({
+        dedupeKey: 'OPS:STALE_WALLETS',
+        alertType: 'STALE_WALLET_SYNC',
+        severity: 'WARN',
+        title: 'Stale wallet polling detected',
+        message: `${staleWalletSyncCount} tracked wallet(s) are stale or in sync error state.`,
+        payloadJson: {
+          staleWalletSyncCount,
+          staleCutoffIso: staleCutoff.toISOString(),
+        },
+      }).catch(() => undefined);
+    }
+
+    if (staleSessionCount > 0) {
+      await raiseSystemAlert({
+        dedupeKey: 'OPS:STALE_SESSIONS',
+        alertType: 'STALE_PAPER_SESSION',
+        severity: 'WARN',
+        title: 'Stale paper sessions detected',
+        message: `${staleSessionCount} running paper session(s) have not processed recent source events.`,
+        payloadJson: {
+          staleSessionCount,
+          staleCutoffIso: staleCutoff.toISOString(),
+        },
+      }).catch(() => undefined);
+    }
+
+    const mem = process.memoryUsage();
+    return {
+      runtime: getRuntimeOpsSnapshot(),
+      queue: {
+        ingestWaiting,
+        decisionWaiting,
+        executionWaiting,
+      },
+      stale: {
+        staleWalletSyncCount,
+        staleSessionCount,
+      },
+      process: {
+        pid: process.pid,
+        uptimeSec: Math.floor(process.uptime()),
+        memoryMb: {
+          rss: Math.round((mem.rss / 1024 / 1024) * 100) / 100,
+          heapUsed: Math.round((mem.heapUsed / 1024 / 1024) * 100) / 100,
+          heapTotal: Math.round((mem.heapTotal / 1024 / 1024) * 100) / 100,
+          external: Math.round((mem.external / 1024 / 1024) * 100) / 100,
+        },
+      },
+      eventBus: {
+        listenerCount: eventBus.listenerCount(),
+      },
+    };
+  });
+
   app.get('/metrics', async (_: any, reply: any) => {
     reply.header('content-type', metricsRegistry.contentType);
     return metricsRegistry.metrics();
+  });
+
+  app.get('/alerts/system', async (req: any) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(200).default(50),
+        status: z.enum(['OPEN', 'RESOLVED', 'ALL']).default('OPEN'),
+        sessionId: z.string().uuid().optional(),
+        walletId: z.string().uuid().optional(),
+      })
+      .parse(req.query ?? {});
+
+    return listSystemAlerts({
+      limit: query.limit,
+      status: query.status,
+      ...(query.sessionId ? { sessionId: query.sessionId } : {}),
+      ...(query.walletId ? { walletId: query.walletId } : {}),
+    });
+  });
+
+  app.get('/admin/ops/advanced', async () => {
+    const staleCutoff = new Date(Date.now() - 5 * 60_000);
+
+    const [staleWallets, atRiskSessions, latestAlerts] = await Promise.all([
+      prisma.watchedWallet.findMany({
+        where: {
+          enabled: true,
+          copyEnabled: true,
+          OR: [{ lastSyncAt: null }, { lastSyncAt: { lt: staleCutoff } }, { syncStatus: 'ERROR' }],
+        },
+        orderBy: { lastSyncAt: 'asc' },
+        take: 50,
+        select: {
+          id: true,
+          label: true,
+          address: true,
+          syncStatus: true,
+          lastSyncAt: true,
+          lastSyncError: true,
+        },
+      }),
+      prisma.paperCopySession.findMany({
+        where: {
+          status: { in: ['RUNNING', 'PAUSED'] },
+          OR: [
+            { consecutiveDecisionFailures: { gte: 3 } },
+            { lastProcessedEventAt: { lt: staleCutoff } },
+          ],
+        },
+        orderBy: [{ consecutiveDecisionFailures: 'desc' }, { updatedAt: 'desc' }],
+        take: 50,
+        select: {
+          id: true,
+          status: true,
+          trackedWalletId: true,
+          trackedWalletAddress: true,
+          consecutiveDecisionFailures: true,
+          lastProcessedEventAt: true,
+          lastAutoPausedAt: true,
+          minWalletTrades: true,
+          minWalletWinRate: true,
+          minWalletSharpeLike: true,
+          dailyDrawdownLimitPct: true,
+        },
+      }),
+      listSystemAlerts({ limit: 30, status: 'OPEN' }),
+    ]);
+
+    return {
+      generatedAt: new Date().toISOString(),
+      staleWallets,
+      atRiskSessions: atRiskSessions.map((row: any) => ({
+        ...row,
+        minWalletWinRate: row.minWalletWinRate !== null ? Number(row.minWalletWinRate) : null,
+        minWalletSharpeLike:
+          row.minWalletSharpeLike !== null ? Number(row.minWalletSharpeLike) : null,
+        dailyDrawdownLimitPct:
+          row.dailyDrawdownLimitPct !== null ? Number(row.dailyDrawdownLimitPct) : null,
+      })),
+      alerts: latestAlerts,
+    };
   });
 
   // ---------------------------------------------------------------------------
@@ -151,6 +410,78 @@ export async function registerRoutes(app: any): Promise<void> {
     };
   });
 
+  app.get('/intelligence/scorecards', async (req: any) => {
+    const query = z
+      .object({ limit: z.coerce.number().int().min(1).max(100).default(30) })
+      .parse(req.query ?? {});
+
+    const snapshots = await prisma.walletAnalyticsSnapshot.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: { wallet: true },
+      take: 5000,
+    });
+
+    const latestByWallet = new Map<string, (typeof snapshots)[number]>();
+    for (const row of snapshots) {
+      if (!latestByWallet.has(row.walletId)) {
+        latestByWallet.set(row.walletId, row);
+      }
+    }
+
+    const nowMs = Date.now();
+    const rows = Array.from(latestByWallet.values())
+      .map((row) => {
+        const trades = Number(row.totalTrades ?? 0);
+        const winRate = Number(row.winRate ?? 0);
+        const sharpeLike = Number(row.sharpeLike ?? 0);
+        const pnl = Number(row.realizedPnl ?? 0);
+        const maxDrawdown = Number(row.maxDrawdown ?? 0);
+        const recencyHours = Math.max(0, (nowMs - row.createdAt.getTime()) / 3_600_000);
+        const sampleConfidence = Math.min(1, trades / 120);
+        const recencyConfidence = Math.max(0, 1 - recencyHours / 24);
+        const confidence = Number((sampleConfidence * 0.7 + recencyConfidence * 0.3).toFixed(3));
+        const normalizedPnl = Math.tanh(pnl / 4_000);
+        const normalizedSharpe = Math.tanh(sharpeLike / 2.2);
+        const normalizedWinRate = Math.max(-1, Math.min(1, (winRate - 0.5) * 2));
+        const normalizedDrawdown = Math.tanh(maxDrawdown / 2_000);
+        const compositeScore = Number(
+          (
+            (normalizedPnl * 0.45 +
+              normalizedSharpe * 0.25 +
+              normalizedWinRate * 0.2 -
+              normalizedDrawdown * 0.1) *
+            confidence
+          ).toFixed(4),
+        );
+        return {
+          walletId: row.walletId,
+          label: row.wallet.label,
+          wallet: row.wallet.address,
+          totalTrades: trades,
+          winRate,
+          sharpeLike,
+          realizedPnl: pnl,
+          maxDrawdown,
+          confidence,
+          recencyHours: Number(recencyHours.toFixed(2)),
+          compositeScore,
+          snapshotAt: row.createdAt,
+        };
+      })
+      .sort((a, b) => b.compositeScore - a.compositeScore)
+      .slice(0, query.limit);
+
+    return {
+      methodology: {
+        version: 'phase6-v1',
+        confidence: '70% sample size + 30% recency',
+        score:
+          '45% pnl + 25% sharpe-like + 20% win rate - 10% drawdown, then multiplied by confidence',
+      },
+      rows,
+    };
+  });
+
   // ---------------------------------------------------------------------------
   // Wallets
   // ---------------------------------------------------------------------------
@@ -160,20 +491,34 @@ export async function registerRoutes(app: any): Promise<void> {
       orderBy: { createdAt: 'desc' },
       include: { _count: { select: { tradeEvents: true } } },
     });
-    return wallets.map((w: any) => ({
-      id: w.id,
-      address: w.address,
-      shortAddress: w.address.slice(0, 6) + '…' + w.address.slice(-4),
-      label: w.label,
-      enabled: w.enabled,
-      copyEnabled: w.copyEnabled,
-      syncStatus: w.syncStatus,
-      lastSyncAt: w.lastSyncAt,
-      lastSyncError: w.lastSyncError,
-      totalTrades: w._count.tradeEvents,
-      lastPolledAt: w.lastPolledAt,
-      nextPollAt: w.nextPollAt,
-    }));
+    const enriched = await Promise.all(
+      wallets.map(async (w: any) => {
+        const visibility = await getWalletSyncVisibility(w.id, w.lastActivitySyncedAt ?? null);
+        return {
+          id: w.id,
+          address: w.address,
+          shortAddress: w.address.slice(0, 6) + '…' + w.address.slice(-4),
+          label: w.label,
+          enabled: w.enabled,
+          copyEnabled: w.copyEnabled,
+          syncStatus: w.syncStatus,
+          lastSyncAt: w.lastSyncAt,
+          lastSyncError: w.lastSyncError,
+          lastActivitySyncAt: w.lastActivitySyncedAt,
+          lastPositionsSyncAt: w.lastPositionsSyncedAt,
+          totalTrades: w._count.tradeEvents,
+          lastPolledAt: w.lastPolledAt,
+          nextPollAt: w.nextPollAt,
+          staleSeconds: visibility.staleSeconds,
+          isStale: visibility.isStale,
+          mismatchCount: visibility.mismatchCount,
+          unresolvedGapCount: visibility.unresolvedGapCount,
+          latestIngestion: visibility.latestIngestion,
+          syncCursor: visibility.cursor,
+        };
+      }),
+    );
+    return enriched;
   });
 
   app.post('/wallets', async (req: any) => {
@@ -271,6 +616,11 @@ export async function registerRoutes(app: any): Promise<void> {
       take: 10,
     });
 
+    const visibility = await getWalletSyncVisibility(
+      wallet.id,
+      wallet.lastActivitySyncedAt ?? null,
+    );
+
     return {
       id: wallet.id,
       address: wallet.address,
@@ -278,6 +628,16 @@ export async function registerRoutes(app: any): Promise<void> {
       syncStatus: wallet.syncStatus,
       lastSyncAt: wallet.lastSyncAt,
       lastSyncError: wallet.lastSyncError,
+      lastActivitySyncAt: wallet.lastActivitySyncedAt,
+      lastPositionsSyncAt: wallet.lastPositionsSyncedAt,
+      lastPolledAt: wallet.lastPolledAt,
+      nextPollAt: wallet.nextPollAt,
+      staleSeconds: visibility.staleSeconds,
+      isStale: visibility.isStale,
+      mismatchCount: visibility.mismatchCount,
+      unresolvedGapCount: visibility.unresolvedGapCount,
+      latestIngestion: visibility.latestIngestion,
+      syncCursor: visibility.cursor,
       totalTrades: wallet._count.tradeEvents,
       recentMarkets: recentMarkets.map((row: any) => ({
         marketId: row.marketId,
@@ -316,7 +676,7 @@ export async function registerRoutes(app: any): Promise<void> {
       prisma.walletActivityEvent.count({ where }),
       prisma.walletActivityEvent.findMany({
         where,
-        orderBy: { eventTimestamp: 'desc' },
+        orderBy: [{ eventTimestamp: 'desc' }, { createdAt: 'desc' }],
         skip: (query.page - 1) * query.pageSize,
         take: query.pageSize,
       }),
@@ -328,18 +688,29 @@ export async function registerRoutes(app: any): Promise<void> {
       total,
       items: rows.map((row: any) => ({
         id: row.id,
+        sourceName: row.sourceName,
+        sourceType: row.sourceType,
+        sourceEventId: row.sourceEventId,
+        sourceCursor: row.sourceCursor,
+        sourceTxHash: row.sourceTxHash,
+        blockNumber: row.blockNumber,
+        logIndex: row.logIndex,
         eventType: row.eventType,
         marketId: row.marketId,
+        conditionId: row.conditionId,
         marketQuestion: row.marketQuestion,
         outcome: row.outcome,
         side: row.side,
+        effectiveSide: row.effectiveSide,
         price: row.price ? Number(row.price) : null,
         shares: row.shares ? Number(row.shares) : null,
         notional: row.notional ? Number(row.notional) : null,
         txHash: row.txHash,
         orderId: row.orderId,
         eventTimestamp: row.eventTimestamp,
+        observedAt: row.observedAt,
         detectedAt: row.detectedAt,
+        provenanceNote: row.provenanceNote,
       })),
     };
   });
@@ -379,6 +750,35 @@ export async function registerRoutes(app: any): Promise<void> {
     if (!wallet) throw app.httpErrors.notFound('Wallet not found');
     await reconcileWalletExposure(wallet.id, wallet.address);
     return { reconciled: true };
+  });
+
+  app.get('/wallets/:id/reconciliation-issues', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const query = z
+      .object({
+        unresolvedOnly: z.coerce.boolean().default(true),
+        limit: z.coerce.number().int().min(1).max(500).default(100),
+      })
+      .parse(req.query ?? {});
+
+    const where: Record<string, unknown> = {
+      trackedWalletId: params.id,
+    };
+    if (query.unresolvedOnly) {
+      where.resolvedAt = null;
+    }
+
+    const rows = await prisma.walletReconciliationIssue.findMany({
+      where,
+      orderBy: [{ detectedAt: 'desc' }, { createdAt: 'desc' }],
+      take: query.limit,
+    });
+
+    return {
+      walletId: params.id,
+      total: rows.length,
+      items: rows,
+    };
   });
 
   app.delete('/wallets/:id', async (req: any) => {
@@ -489,6 +889,56 @@ export async function registerRoutes(app: any): Promise<void> {
     }));
   });
 
+  app.get('/markets/:id', async (req: any) => {
+    const params = z.object({ id: z.string().min(1) }).parse(req.params);
+
+    const [agg, recentTrades] = await Promise.all([
+      prisma.tradeEvent.aggregate({
+        where: { marketId: params.id },
+        _count: { _all: true },
+        _sum: { size: true },
+        _max: { tradedAt: true },
+      }),
+      prisma.tradeEvent.findMany({
+        where: { marketId: params.id },
+        orderBy: { tradedAt: 'desc' },
+        take: 50,
+      }),
+    ]);
+
+    if ((agg._count._all ?? 0) === 0) {
+      throw app.httpErrors.notFound('Market not found');
+    }
+
+    const sourceNotional = recentTrades.reduce(
+      (sum: number, row: any) => sum + Number(row.size) * Number(row.price),
+      0,
+    );
+
+    return {
+      marketId: params.id,
+      marketQuestion: recentTrades[0]?.marketQuestion ?? null,
+      eventCount: agg._count._all ?? 0,
+      tradeCount: agg._count._all ?? 0,
+      latestTradeAt: agg._max.tradedAt ?? null,
+      sourceNotional,
+      decisionsAvailable: false,
+      decisionsAvailabilityMessage:
+        'Copy-decision and execution records are not exposed on this endpoint in Phase 0.',
+      recentTrades: recentTrades.map((row: any) => ({
+        id: row.id,
+        side: row.side,
+        outcome: row.outcome,
+        price: Number(row.price),
+        size: Number(row.size),
+        notional: Number(row.price) * Number(row.size),
+        tradedAt: row.tradedAt,
+        sourceWalletAddress: row.sourceWalletAddress,
+        txHash: row.txHash,
+      })),
+    };
+  });
+
   // ---------------------------------------------------------------------------
   // Intelligence
   // ---------------------------------------------------------------------------
@@ -562,11 +1012,26 @@ export async function registerRoutes(app: any): Promise<void> {
   });
 
   app.get('/events/ws', { websocket: true }, (connection: any) => {
-    const unsubscribe = eventBus.subscribe((event) => {
-      connection.socket.send(JSON.stringify(event));
-    });
+    let unsubscribe: (() => void) | null = null;
+    try {
+      unsubscribe = eventBus.subscribe((event) => {
+        connection.socket.send(JSON.stringify(event));
+      });
+    } catch (error) {
+      connection.socket.send(
+        JSON.stringify({
+          type: 'ERROR',
+          message: error instanceof Error ? error.message : 'Event stream unavailable',
+        }),
+      );
+      connection.socket.close();
+      return;
+    }
+
     connection.socket.on('close', () => {
-      unsubscribe();
+      if (unsubscribe) {
+        unsubscribe();
+      }
     });
   });
 
@@ -810,6 +1275,11 @@ export async function registerRoutes(app: any): Promise<void> {
         maxAllocationPerMarket: z.number().positive().optional(),
         maxTotalExposure: z.number().positive().optional(),
         minNotionalThreshold: z.number().positive().optional(),
+        minWalletTrades: z.number().int().min(0).max(100000).optional(),
+        minWalletWinRate: z.number().min(0).max(1).optional(),
+        minWalletSharpeLike: z.number().min(-5).max(10).optional(),
+        dailyDrawdownLimitPct: z.number().positive().max(100).optional(),
+        autoPauseOnHealthDegradation: z.boolean().optional(),
         feeBps: z.number().nonnegative().max(500).optional(),
         slippageBps: z.number().nonnegative().max(500).optional(),
       })
@@ -824,6 +1294,17 @@ export async function registerRoutes(app: any): Promise<void> {
       ...(body.maxTotalExposure !== undefined ? { maxTotalExposure: body.maxTotalExposure } : {}),
       ...(body.minNotionalThreshold !== undefined
         ? { minNotionalThreshold: body.minNotionalThreshold }
+        : {}),
+      ...(body.minWalletTrades !== undefined ? { minWalletTrades: body.minWalletTrades } : {}),
+      ...(body.minWalletWinRate !== undefined ? { minWalletWinRate: body.minWalletWinRate } : {}),
+      ...(body.minWalletSharpeLike !== undefined
+        ? { minWalletSharpeLike: body.minWalletSharpeLike }
+        : {}),
+      ...(body.dailyDrawdownLimitPct !== undefined
+        ? { dailyDrawdownLimitPct: body.dailyDrawdownLimitPct }
+        : {}),
+      ...(body.autoPauseOnHealthDegradation !== undefined
+        ? { autoPauseOnHealthDegradation: body.autoPauseOnHealthDegradation }
         : {}),
       ...(body.feeBps !== undefined ? { feeBps: body.feeBps } : {}),
       ...(body.slippageBps !== undefined ? { slippageBps: body.slippageBps } : {}),
@@ -846,6 +1327,44 @@ export async function registerRoutes(app: any): Promise<void> {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
     await resumePaperCopySession(params.id);
     return { resumed: true };
+  });
+
+  app.patch('/paper-copy-sessions/:id/guardrails', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const body = z
+      .object({
+        minWalletTrades: z.number().int().min(0).max(100000).nullable().optional(),
+        minWalletWinRate: z.number().min(0).max(1).nullable().optional(),
+        minWalletSharpeLike: z.number().min(-5).max(10).nullable().optional(),
+        dailyDrawdownLimitPct: z.number().positive().max(100).nullable().optional(),
+        autoPauseOnHealthDegradation: z.boolean().optional(),
+      })
+      .parse(req.body ?? {});
+
+    const updated = await updatePaperCopySessionGuardrails(params.id, {
+      ...(body.minWalletTrades !== undefined ? { minWalletTrades: body.minWalletTrades } : {}),
+      ...(body.minWalletWinRate !== undefined ? { minWalletWinRate: body.minWalletWinRate } : {}),
+      ...(body.minWalletSharpeLike !== undefined
+        ? { minWalletSharpeLike: body.minWalletSharpeLike }
+        : {}),
+      ...(body.dailyDrawdownLimitPct !== undefined
+        ? { dailyDrawdownLimitPct: body.dailyDrawdownLimitPct }
+        : {}),
+      ...(body.autoPauseOnHealthDegradation !== undefined
+        ? { autoPauseOnHealthDegradation: body.autoPauseOnHealthDegradation }
+        : {}),
+    });
+    return {
+      id: updated.id,
+      minWalletTrades: updated.minWalletTrades,
+      minWalletWinRate: updated.minWalletWinRate !== null ? Number(updated.minWalletWinRate) : null,
+      minWalletSharpeLike:
+        updated.minWalletSharpeLike !== null ? Number(updated.minWalletSharpeLike) : null,
+      dailyDrawdownLimitPct:
+        updated.dailyDrawdownLimitPct !== null ? Number(updated.dailyDrawdownLimitPct) : null,
+      autoPauseOnHealthDegradation: updated.autoPauseOnHealthDegradation,
+      updatedAt: updated.updatedAt,
+    };
   });
 
   app.post('/paper-copy-sessions/:id/stop', async (req: any) => {
@@ -989,6 +1508,15 @@ export async function registerRoutes(app: any): Promise<void> {
           endedAt: row.endedAt,
           createdAt: row.createdAt,
           lastProcessedEventAt: row.lastProcessedEventAt,
+          minWalletTrades: row.minWalletTrades,
+          minWalletWinRate: row.minWalletWinRate !== null ? Number(row.minWalletWinRate) : null,
+          minWalletSharpeLike:
+            row.minWalletSharpeLike !== null ? Number(row.minWalletSharpeLike) : null,
+          dailyDrawdownLimitPct:
+            row.dailyDrawdownLimitPct !== null ? Number(row.dailyDrawdownLimitPct) : null,
+          autoPauseOnHealthDegradation: Boolean(row.autoPauseOnHealthDegradation),
+          consecutiveDecisionFailures: Number(row.consecutiveDecisionFailures ?? 0),
+          lastAutoPausedAt: row.lastAutoPausedAt,
           totalPnl: latestSnapshot ? Number(latestSnapshot.totalPnl) : 0,
           returnPct: latestSnapshot ? Number(latestSnapshot.returnPct) : 0,
           netLiquidationValue: latestSnapshot
@@ -1034,6 +1562,15 @@ export async function registerRoutes(app: any): Promise<void> {
       startedAt: row.startedAt,
       endedAt: row.endedAt,
       lastProcessedEventAt: row.lastProcessedEventAt,
+      minWalletTrades: row.minWalletTrades,
+      minWalletWinRate: row.minWalletWinRate !== null ? Number(row.minWalletWinRate) : null,
+      minWalletSharpeLike:
+        row.minWalletSharpeLike !== null ? Number(row.minWalletSharpeLike) : null,
+      dailyDrawdownLimitPct:
+        row.dailyDrawdownLimitPct !== null ? Number(row.dailyDrawdownLimitPct) : null,
+      autoPauseOnHealthDegradation: Boolean(row.autoPauseOnHealthDegradation),
+      consecutiveDecisionFailures: Number(row.consecutiveDecisionFailures ?? 0),
+      lastAutoPausedAt: row.lastAutoPausedAt,
       estimatedSourceExposure: row.estimatedSourceExposure
         ? Number(row.estimatedSourceExposure)
         : null,
@@ -1067,6 +1604,13 @@ export async function registerRoutes(app: any): Promise<void> {
       netLiquidationValue: Number(row.netLiquidationValue),
       openPositionsCount: row.openPositionsCount,
     }));
+  });
+
+  app.get('/paper-copy-sessions/:id/analytics', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const result = await getPaperCopySessionAnalytics(params.id);
+    if (!result) throw app.httpErrors.notFound('Session not found');
+    return result;
   });
 
   app.get('/paper-copy-sessions/:id/positions', async (req: any) => {
@@ -1113,6 +1657,7 @@ export async function registerRoutes(app: any): Promise<void> {
         sourceActivityEvent: {
           select: {
             id: true,
+            eventType: true,
             walletAddress: true,
             eventTimestamp: true,
             txHash: true,
@@ -1144,6 +1689,16 @@ export async function registerRoutes(app: any): Promise<void> {
 
     return rows.map((row: any) => ({
       id: row.id,
+      trackedWalletId: row.trackedWalletId,
+      walletAddress: row.walletAddress,
+      sourceType: row.sourceType,
+      decisionId: row.decisionId ?? null,
+      sourceEventTimestamp:
+        row.sourceEventTimestamp ?? row.sourceActivityEvent?.eventTimestamp ?? null,
+      sourceTxHash: row.sourceTxHash ?? row.sourceActivityEvent?.txHash ?? null,
+      sourceEventType: row.sourceActivityEvent?.eventType ?? null,
+      executorType: row.executorType,
+      isBootstrap: row.isBootstrap,
       marketId: row.marketId,
       marketUrl: marketUrlFor(row.marketId, row.sourceActivityEvent?.rawPayloadJson),
       marketQuestion: row.marketQuestion,
@@ -1159,8 +1714,6 @@ export async function registerRoutes(app: any): Promise<void> {
       feeApplied: Number(row.feeApplied),
       slippageApplied: Number(row.slippageApplied),
       sourceWalletAddress: row.sourceActivityEvent?.walletAddress ?? null,
-      sourceEventTimestamp: row.sourceActivityEvent?.eventTimestamp ?? null,
-      sourceTxHash: row.sourceActivityEvent?.txHash ?? null,
       sourceTxUrl: row.sourceActivityEvent?.txHash
         ? `https://polygonscan.com/tx/${row.sourceActivityEvent.txHash}`
         : null,
@@ -1170,6 +1723,101 @@ export async function registerRoutes(app: any): Promise<void> {
       processedAt: row.processedAt,
       reasoning: row.reasoning,
     }));
+  });
+
+  app.get('/paper-copy-sessions/:id/decisions', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(500).default(100),
+        status: z.enum(['PENDING', 'EXECUTED', 'SKIPPED', 'FAILED', 'ALL']).default('ALL'),
+        decisionType: z
+          .enum(['COPY', 'SKIP', 'REDUCE', 'CLOSE', 'BOOTSTRAP', 'NOOP', 'ALL'])
+          .default('ALL'),
+      })
+      .parse(req.query ?? {});
+
+    const where: Record<string, unknown> = { sessionId: params.id };
+    if (query.status !== 'ALL') {
+      where.status = query.status;
+    }
+    if (query.decisionType !== 'ALL') {
+      where.decisionType = query.decisionType;
+    }
+
+    const rows = await db.paperCopyDecision.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: query.limit,
+      include: {
+        sourceActivityEvent: {
+          select: {
+            eventType: true,
+            sourceName: true,
+            sourceType: true,
+          },
+        },
+        trades: {
+          select: {
+            id: true,
+            eventTimestamp: true,
+            simulatedPrice: true,
+            simulatedShares: true,
+            notional: true,
+            feeApplied: true,
+          },
+          take: 1,
+        },
+      },
+    });
+
+    return rows.map((row: any) => {
+      const trade = row.trades[0] ?? null;
+      return {
+        id: row.id,
+        sessionId: row.sessionId,
+        trackedWalletId: row.trackedWalletId,
+        walletAddress: row.walletAddress,
+        sourceActivityEventId: row.sourceActivityEventId,
+        sourceEventType: row.sourceActivityEvent?.eventType ?? null,
+        sourceEventName: row.sourceActivityEvent?.sourceName ?? null,
+        sourceEventSourceType: row.sourceActivityEvent?.sourceType ?? null,
+        sourceEventTimestamp: row.sourceEventTimestamp,
+        sourceTxHash: row.sourceTxHash,
+        decisionType: row.decisionType,
+        status: row.status,
+        executorType: row.executorType,
+        marketId: row.marketId,
+        marketQuestion: row.marketQuestion,
+        outcome: row.outcome,
+        side: row.side,
+        sourceShares: row.sourceShares ? Number(row.sourceShares) : null,
+        simulatedShares: row.simulatedShares ? Number(row.simulatedShares) : null,
+        sourcePrice: row.sourcePrice ? Number(row.sourcePrice) : null,
+        intendedFillPrice: row.intendedFillPrice ? Number(row.intendedFillPrice) : null,
+        copyRatio: row.copyRatio ? Number(row.copyRatio) : null,
+        reasonCode: row.reasonCode,
+        humanReason: row.humanReason,
+        sizingInputs: row.sizingInputsJson,
+        riskChecks: row.riskChecksJson,
+        notes: row.notes,
+        executionError: row.executionError,
+        executedTrade:
+          trade === null
+            ? null
+            : {
+                id: trade.id,
+                ledgerEntryId: trade.id,
+                eventTimestamp: trade.eventTimestamp,
+                simulatedPrice: Number(trade.simulatedPrice),
+                simulatedShares: Number(trade.simulatedShares),
+                notional: Number(trade.notional),
+                feeApplied: Number(trade.feeApplied),
+              },
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      };
+    });
   });
 
   app.get('/paper-copy-sessions/:id/snapshots', async (req: any) => {

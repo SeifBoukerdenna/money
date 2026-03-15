@@ -20,12 +20,16 @@ const FEE_PRESETS = [
 
 // Types
 type Wallet = { id: string; label: string; address: string; enabled: boolean; syncStatus: string };
-type SessionListItem = { id: string; trackedWalletId: string; trackedWalletAddress: string; trackedWalletLabel: string; status: string; startingCash: number; currentCash: number; startedAt: string | null; endedAt: string | null; createdAt: string; lastProcessedEventAt: string | null; totalPnl: number; returnPct: number; netLiquidationValue: number };
-type SessionDetail = { id: string; trackedWalletId: string; trackedWalletAddress: string; trackedWalletLabel: string; status: string; startingCash: number; currentCash: number; startedAt: string | null; endedAt: string | null; lastProcessedEventAt: string | null; estimatedSourceExposure: number | null; copyRatio: number | null; netLiquidationValue: number; totalPnl: number; returnPct: number; summarySentence: string; stats: { openPositionsCount: number } };
-type Health = { status: string; lastProcessedEventAt: string | null; lagSeconds: number; isStale: boolean; walletSyncStatus: string; walletLastSyncAt: string | null; walletLastSyncError: string | null; walletNextPollAt: string | null; latestSourceEventAt: string | null };
+type SessionListItem = { id: string; trackedWalletId: string; trackedWalletAddress: string; trackedWalletLabel: string; status: string; startingCash: number; currentCash: number; startedAt: string | null; endedAt: string | null; createdAt: string; lastProcessedEventAt: string | null; totalPnl: number; returnPct: number; netLiquidationValue: number; minWalletTrades?: number | null; minWalletWinRate?: number | null; minWalletSharpeLike?: number | null; dailyDrawdownLimitPct?: number | null; autoPauseOnHealthDegradation?: boolean; consecutiveDecisionFailures?: number; lastAutoPausedAt?: string | null };
+type SessionDetail = { id: string; trackedWalletId: string; trackedWalletAddress: string; trackedWalletLabel: string; status: string; startingCash: number; currentCash: number; startedAt: string | null; endedAt: string | null; lastProcessedEventAt: string | null; estimatedSourceExposure: number | null; copyRatio: number | null; netLiquidationValue: number; totalPnl: number; returnPct: number; summarySentence: string; stats: { openPositionsCount: number }; minWalletTrades?: number | null; minWalletWinRate?: number | null; minWalletSharpeLike?: number | null; dailyDrawdownLimitPct?: number | null; autoPauseOnHealthDegradation?: boolean; consecutiveDecisionFailures?: number; lastAutoPausedAt?: string | null };
+type Health = { status: string; lastProcessedEventAt: string | null; lagSeconds: number; isStale: boolean; consecutiveDecisionFailures?: number; lastAutoPausedAt?: string | null; walletSyncStatus: string; walletLastSyncAt: string | null; walletLastSyncError: string | null; walletNextPollAt: string | null; latestSourceEventAt: string | null };
+type OpsHealth = { stale: { staleWalletSyncCount: number; staleSessionCount: number }; queue: { ingestWaiting: number; decisionWaiting: number; executionWaiting: number } };
+type SystemAlert = { id: string; alertType: string; severity: string; status: string; title: string; message: string; count: number; lastSeenAt: string; session: { id: string; status: string; trackedWalletAddress: string } | null; wallet: { id: string; label: string; address: string } | null };
+type SessionAnalytics = { summary: { startingCash: number; currentNlv: number; totalPnl: number; trades: number; decisions: number; openPositions: number; closedPositions: number }; decisionBreakdown: Record<string, number>; executionStatusBreakdown: Record<string, number>; topMarketPnl: Array<{ market: string; pnl: number }>; largestExecutedTrade: { marketQuestion: string | null; marketId: string; side: string; notional: number } | null; largestSkippedOpportunity: { marketQuestion: string | null; marketId: string | null; reasonCode: string; notional: number } | null };
 type ChartPoint = { ts: number; label: string; pnlPct: number; pnlAbs: number };
 type Position = { id: string; marketId: string; marketQuestion: string | null; outcome: string; netShares: number; avgEntryPrice: number; currentMarkPrice: number; realizedPnl: number; unrealizedPnl: number; status: string; openedAt: string; closedAt: string | null };
-type Trade = { id: string; marketId: string; marketUrl?: string; marketQuestion: string | null; outcome: string; side: 'BUY' | 'SELL'; action: string; sourcePrice: number | null; simulatedPrice: number; sourceShares: number | null; simulatedShares: number; notional: number; feeApplied: number; slippageApplied: number; eventTimestamp: string; processedAt: string; reasoning: Record<string, unknown>; sourceEventTimestamp: string | null; sourceTxHash: string | null; sourceTxUrl: string | null; sourceWalletAddress?: string | null };
+type Trade = { id: string; decisionId: string | null; marketId: string; marketUrl?: string; marketQuestion: string | null; outcome: string; side: 'BUY' | 'SELL'; action: string; sourceType: string; isBootstrap: boolean; sourceEventType: string | null; sourcePrice: number | null; simulatedPrice: number; sourceShares: number | null; simulatedShares: number; notional: number; feeApplied: number; slippageApplied: number; eventTimestamp: string; processedAt: string; reasoning: Record<string, unknown>; sourceEventTimestamp: string | null; sourceTxHash: string | null; sourceTxUrl: string | null; sourceWalletAddress?: string | null; sourceActivityEventId?: string | null };
+type Decision = { id: string; sourceActivityEventId: string | null; sourceEventType: string | null; sourceEventName: string | null; sourceEventSourceType: string | null; sourceEventTimestamp: string | null; sourceTxHash: string | null; decisionType: 'COPY' | 'SKIP' | 'REDUCE' | 'CLOSE' | 'BOOTSTRAP' | 'NOOP'; status: 'PENDING' | 'EXECUTED' | 'SKIPPED' | 'FAILED'; executorType: 'PAPER' | 'DRY_RUN' | 'LIVE'; marketId: string | null; marketQuestion: string | null; outcome: string | null; side: 'BUY' | 'SELL' | null; sourceShares: number | null; simulatedShares: number | null; sourcePrice: number | null; intendedFillPrice: number | null; reasonCode: string; humanReason: string; executionError: string | null; executedTrade: { ledgerEntryId: string; id: string; eventTimestamp: string; simulatedPrice: number; simulatedShares: number; notional: number; feeApplied: number } | null; createdAt: string; updatedAt: string };
 type SortDir = 'asc' | 'desc';
 
 // Formatters
@@ -58,7 +62,122 @@ function SortTh({ label, sk, cur, dir, onSort, left }: { label: string; sk: stri
 
 function SessionSidebar({ sessions, activeId, onSelect }: { sessions: SessionListItem[]; activeId: string; onSelect: (id: string) => void }) { if (!sessions.length) return <p className="px-4 py-8 text-center text-sm text-slate-600">No sessions.</p>; return <div className="space-y-1.5">{sessions.map(s => <button key={s.id} onClick={() => onSelect(s.id)} className={`w-full rounded-xl border px-3.5 py-2.5 text-left transition-all ${s.id === activeId ? 'border-blue-500/30 bg-blue-500/8 ring-1 ring-blue-500/20' : 'border-transparent hover:bg-slate-800/40'}`}><div className="flex items-center justify-between gap-2"><span className="truncate text-sm font-medium text-slate-200">{s.trackedWalletLabel}</span><StatusPill status={s.status} /></div><div className="mt-1.5 flex items-center gap-3 text-xs"><span className="text-slate-500">{fmt$(s.startingCash, 0)}</span><span className={`font-semibold tabular-nums ${pnlColor(s.totalPnl)}`}>{fmtPnl(s.totalPnl)}</span></div></button>)}</div>; }
 
-function HealthBar({ health, walletAddress }: { health: Health | null; walletAddress: string }) { if (!health) return null; return <div className={`flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl border px-4 py-2.5 text-xs ${health.isStale || health.walletLastSyncError ? 'border-amber-500/25 bg-amber-500/5' : 'border-slate-800/60 bg-slate-900/40'}`}><span className="text-slate-500">Wallet: <a href={`https://polymarket.com/portfolio/${walletAddress}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">{shortAddr(walletAddress)}</a></span><span className="text-slate-500">Sync: <span className={health.walletSyncStatus === 'ACTIVE' ? 'text-emerald-400' : 'text-amber-300'}>{health.walletSyncStatus}</span></span><span className="text-slate-500">Lag: <span className={health.isStale ? 'text-rose-400 font-semibold' : 'text-slate-400'}>{health.lagSeconds}s</span></span>{health.walletLastSyncError && <span className="text-rose-400 truncate max-w-xs">⚠ {health.walletLastSyncError}</span>}</div>; }
+function HealthBar({ health, walletAddress }: { health: Health | null; walletAddress: string }) { if (!health) return null; return <div className={`flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl border px-4 py-2.5 text-xs ${health.isStale || health.walletLastSyncError ? 'border-amber-500/25 bg-amber-500/5' : 'border-slate-800/60 bg-slate-900/40'}`}><span className="text-slate-500">Wallet: <a href={`https://polymarket.com/portfolio/${walletAddress}`} target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">{shortAddr(walletAddress)}</a></span><span className="text-slate-500">Sync: <span className={health.walletSyncStatus === 'ACTIVE' ? 'text-emerald-400' : 'text-amber-300'}>{health.walletSyncStatus}</span></span><span className="text-slate-500">Session Lag: <span className={health.isStale ? 'text-rose-400 font-semibold' : 'text-slate-400'}>{health.lagSeconds}s</span></span><span className="text-slate-500">Last Source Event: <span className="text-slate-400">{health.latestSourceEventAt ? fmtAge(health.latestSourceEventAt) : 'none'}</span></span>{health.walletLastSyncError && <span className="text-rose-400 truncate max-w-xs">⚠ {health.walletLastSyncError}</span>}</div>; }
+
+function OpsHealthBar({ ops }: { ops: OpsHealth | null }) {
+    if (!ops) return null;
+    const staleWallets = ops.stale?.staleWalletSyncCount ?? 0;
+    const staleSessions = ops.stale?.staleSessionCount ?? 0;
+    const q = ops.queue ?? { ingestWaiting: 0, decisionWaiting: 0, executionWaiting: 0 };
+    const warn = staleWallets > 0 || staleSessions > 0 || q.ingestWaiting > 200;
+    return <div className={`flex flex-wrap items-center gap-x-5 gap-y-1 rounded-xl border px-4 py-2 text-[11px] ${warn ? 'border-amber-500/25 bg-amber-500/5' : 'border-slate-800/60 bg-slate-900/30'}`}>
+        <span className="text-slate-500">Ops Health</span>
+        <span className={staleWallets > 0 ? 'text-amber-300' : 'text-slate-500'}>Stale Wallets: <span className="font-semibold">{staleWallets}</span></span>
+        <span className={staleSessions > 0 ? 'text-amber-300' : 'text-slate-500'}>Stale Sessions: <span className="font-semibold">{staleSessions}</span></span>
+        <span className="text-slate-500">Queue I/D/E: <span className="text-slate-400 font-mono">{q.ingestWaiting}/{q.decisionWaiting}/{q.executionWaiting}</span></span>
+    </div>;
+}
+
+function GuardrailsPanel({ detail, onSaved, showToast }: { detail: SessionDetail; onSaved: () => Promise<void>; showToast: (msg: string, ok?: boolean) => void }) {
+    const [busy, setBusy] = useState(false);
+    const [minTrades, setMinTrades] = useState<string>(detail.minWalletTrades != null ? String(detail.minWalletTrades) : '');
+    const [minWinRate, setMinWinRate] = useState<string>(detail.minWalletWinRate != null ? String((detail.minWalletWinRate * 100).toFixed(1)) : '');
+    const [minSharpe, setMinSharpe] = useState<string>(detail.minWalletSharpeLike != null ? String(detail.minWalletSharpeLike) : '');
+    const [drawdownLimit, setDrawdownLimit] = useState<string>(detail.dailyDrawdownLimitPct != null ? String(detail.dailyDrawdownLimitPct) : '');
+    const [autoPauseHealth, setAutoPauseHealth] = useState<boolean>(Boolean(detail.autoPauseOnHealthDegradation));
+
+    useEffect(() => {
+        setMinTrades(detail.minWalletTrades != null ? String(detail.minWalletTrades) : '');
+        setMinWinRate(detail.minWalletWinRate != null ? String((detail.minWalletWinRate * 100).toFixed(1)) : '');
+        setMinSharpe(detail.minWalletSharpeLike != null ? String(detail.minWalletSharpeLike) : '');
+        setDrawdownLimit(detail.dailyDrawdownLimitPct != null ? String(detail.dailyDrawdownLimitPct) : '');
+        setAutoPauseHealth(Boolean(detail.autoPauseOnHealthDegradation));
+    }, [detail.id, detail.minWalletTrades, detail.minWalletWinRate, detail.minWalletSharpeLike, detail.dailyDrawdownLimitPct, detail.autoPauseOnHealthDegradation]);
+
+    async function saveGuardrails() {
+        setBusy(true);
+        try {
+            const payload = {
+                minWalletTrades: minTrades.trim() === '' ? null : Math.max(0, Math.floor(Number(minTrades))),
+                minWalletWinRate: minWinRate.trim() === '' ? null : Math.max(0, Math.min(1, Number(minWinRate) / 100)),
+                minWalletSharpeLike: minSharpe.trim() === '' ? null : Number(minSharpe),
+                dailyDrawdownLimitPct: drawdownLimit.trim() === '' ? null : Math.max(0.1, Number(drawdownLimit)),
+                autoPauseOnHealthDegradation: autoPauseHealth,
+            };
+            const res = await fetch(`${API}/paper-copy-sessions/${detail.id}/guardrails`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) {
+                showToast(await res.text(), false);
+                return;
+            }
+            showToast('Guardrails updated.');
+            await onSaved();
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    return <div className="panel p-4 space-y-3">
+        <div className="flex items-center justify-between">
+            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Risk Guardrails</p>
+            <span className="text-[10px] text-slate-600">Applied before copy execution</span>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <label className="text-[11px] text-slate-500">Min trades<input className="input mt-1" type="number" value={minTrades} onChange={(e) => setMinTrades(e.target.value)} placeholder="off" /></label>
+            <label className="text-[11px] text-slate-500">Min win rate (%)<input className="input mt-1" type="number" step="0.1" value={minWinRate} onChange={(e) => setMinWinRate(e.target.value)} placeholder="off" /></label>
+            <label className="text-[11px] text-slate-500">Min sharpe-like<input className="input mt-1" type="number" step="0.01" value={minSharpe} onChange={(e) => setMinSharpe(e.target.value)} placeholder="off" /></label>
+            <label className="text-[11px] text-slate-500">Daily drawdown cap (%)<input className="input mt-1" type="number" step="0.1" value={drawdownLimit} onChange={(e) => setDrawdownLimit(e.target.value)} placeholder="off" /></label>
+        </div>
+        <label className="flex items-center gap-2 text-xs text-slate-400"><input type="checkbox" checked={autoPauseHealth} onChange={(e) => setAutoPauseHealth(e.target.checked)} /> Auto-pause when wallet sync health degrades</label>
+        <div className="flex items-center justify-between">
+            <p className="text-[11px] text-slate-600">Consecutive failures: <span className={detail.consecutiveDecisionFailures && detail.consecutiveDecisionFailures > 0 ? 'text-amber-300 font-semibold' : 'text-slate-500'}>{detail.consecutiveDecisionFailures ?? 0}</span>{detail.lastAutoPausedAt ? ` · last auto-pause ${fmtAge(detail.lastAutoPausedAt)}` : ''}</p>
+            <button onClick={saveGuardrails} disabled={busy} className="btn-muted text-xs">{busy ? 'Saving…' : 'Save Guardrails'}</button>
+        </div>
+    </div>;
+}
+
+function SessionInsightsPanel({ analytics }: { analytics: SessionAnalytics | null }) {
+    if (!analytics) return null;
+    const topReasons = Object.entries(analytics.decisionBreakdown).sort((a, b) => b[1] - a[1]).slice(0, 4);
+    return <div className="grid gap-3 lg:grid-cols-2">
+        <div className="panel p-4">
+            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Decision Diagnostics</p>
+            <div className="mt-3 space-y-1.5 text-xs text-slate-400">
+                {topReasons.length === 0 && <p className="text-slate-600">No decision history yet.</p>}
+                {topReasons.map(([reason, count]) => <p key={reason}><span className="text-slate-300">{reason}</span> <span className="text-slate-500">x{count}</span></p>)}
+            </div>
+        </div>
+        <div className="panel p-4">
+            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Session Analytics</p>
+            <div className="mt-3 space-y-1.5 text-xs text-slate-400">
+                <p>Largest executed: <span className="text-slate-300">{analytics.largestExecutedTrade ? `${fmt$(analytics.largestExecutedTrade.notional)} · ${analytics.largestExecutedTrade.marketQuestion ?? analytics.largestExecutedTrade.marketId}` : '—'}</span></p>
+                <p>Largest skipped: <span className="text-slate-300">{analytics.largestSkippedOpportunity ? `${fmt$(analytics.largestSkippedOpportunity.notional)} · ${analytics.largestSkippedOpportunity.reasonCode}` : '—'}</span></p>
+                <p>Top market PnL: <span className="text-slate-300">{analytics.topMarketPnl[0] ? `${analytics.topMarketPnl[0].market} (${fmtPnl(analytics.topMarketPnl[0].pnl)})` : '—'}</span></p>
+            </div>
+        </div>
+    </div>;
+}
+
+function SessionAlertsPanel({ alerts }: { alerts: SystemAlert[] }) {
+    if (!alerts.length) {
+        return <div className="panel p-4"><p className="text-xs font-semibold uppercase tracking-wider text-slate-500">System Alerts</p><p className="mt-2 text-xs text-slate-600">No open alerts for this session.</p></div>;
+    }
+    return <div className="panel p-4">
+        <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">System Alerts</p>
+        <div className="mt-3 space-y-2">
+            {alerts.slice(0, 6).map((alert) => <div key={alert.id} className="rounded-lg border border-slate-700/50 bg-slate-900/50 px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                    <p className={`text-xs font-semibold ${alert.severity === 'CRITICAL' ? 'text-rose-300' : alert.severity === 'WARN' ? 'text-amber-300' : 'text-slate-300'}`}>{alert.title}</p>
+                    <span className="text-[10px] text-slate-600">{fmtAge(alert.lastSeenAt)} · x{alert.count}</span>
+                </div>
+                <p className="mt-1 text-xs text-slate-400">{alert.message}</p>
+            </div>)}
+        </div>
+    </div>;
+}
 
 function ActionButtons({ detail, actionLoading, act, repairSession, reconcilePositions, closeResolved, repairLoading, onDelete, resolvedCount }: { detail: SessionDetail; actionLoading: string; act: (a: 'start' | 'pause' | 'resume' | 'stop') => void; repairSession: () => void; reconcilePositions: () => void; closeResolved: () => void; repairLoading: boolean; onDelete: () => void; resolvedCount: number }) {
     const [help, setHelp] = useState(false);
@@ -86,7 +205,7 @@ function ActionButtons({ detail, actionLoading, act, repairSession, reconcilePos
 // Activity Timeline
 function ActivityTimeline({ trades }: { trades: Trade[] }) {
     const recent = trades.slice(0, 30);
-    if (!recent.length) return <p className="py-6 text-center text-sm text-slate-600">No activity yet.</p>;
+    if (!recent.length) return <div className="py-8 text-center space-y-2"><p className="text-sm text-slate-500">No copied ledger activity yet.</p><p className="text-xs text-slate-600">When source events are approved and executed, they appear here as canonical ledger entries.</p></div>;
     return <div className="relative space-y-0"><div className="absolute left-4 top-2 bottom-2 w-px bg-slate-800/60" />
         {recent.map(t => {
             const isB = t.action === 'BOOTSTRAP'; const isR = t.action === 'RECONCILE_CLOSE' || t.action === 'FORCE_CLOSE' || t.action === 'AUTO_CLOSE_RESOLVED'; const isBuy = t.side === 'BUY';
@@ -100,7 +219,7 @@ function ActivityTimeline({ trades }: { trades: Trade[] }) {
                     {t.sourceTxUrl && <> · <a href={t.sourceTxUrl} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">tx↗</a></>}
                 </div>}
                 <div className="text-xs">
-                    <span className={`font-semibold ${isBuy ? 'text-emerald-300' : isR ? 'text-amber-300' : 'text-rose-300'}`}>{hasSrc ? '→ We copied: ' : ''}{verb} {t.simulatedShares.toFixed(1)} shares</span> <span className="text-slate-500">of</span> <span className="text-slate-300">{t.outcome}</span> <span className="text-slate-500">@</span> <span className="font-mono text-slate-300">{t.simulatedPrice.toFixed(3)}</span> <span className="text-slate-600">= {fmt$(t.notional)}</span>
+                    <span className={`font-semibold ${isBuy ? 'text-emerald-300' : isR ? 'text-amber-300' : 'text-rose-300'}`}>{hasSrc ? '→ Execution: ' : ''}{verb} {t.simulatedShares.toFixed(1)} shares</span> <span className="text-slate-500">of</span> <span className="text-slate-300">{t.outcome}</span> <span className="text-slate-500">@</span> <span className="font-mono text-slate-300">{t.simulatedPrice.toFixed(3)}</span> <span className="text-slate-600">= {fmt$(t.notional)}</span>
                     {t.feeApplied > 0.001 && <span className="text-amber-500/70"> (fee {fmt$(t.feeApplied)})</span>}
                 </div>
                 <div className="flex items-center gap-3 mt-1 text-[10px] text-slate-600">
@@ -113,7 +232,7 @@ function ActivityTimeline({ trades }: { trades: Trade[] }) {
 }
 
 // Open Positions with force-close per row
-function OpenPositionsTable({ positions, trades, sessionId, onForceClose }: { positions: Position[]; trades: Trade[]; sessionId: string; onForceClose: (posId: string) => void }) {
+function OpenPositionsTable({ positions, trades, sessionId, onForceClose, bootstrapKeys }: { positions: Position[]; trades: Trade[]; sessionId: string; onForceClose: (posId: string) => void; bootstrapKeys: Set<string> }) {
     const [sk, setSk] = useState<string>('unrealizedPnl');
     const [sd, setSd] = useState<SortDir>('desc');
     function toggle(k: string) { if (sk === k) setSd(d => d === 'asc' ? 'desc' : 'asc'); else { setSk(k); setSd('desc'); } }
@@ -139,10 +258,12 @@ function OpenPositionsTable({ positions, trades, sessionId, onForceClose }: { po
                     const val = p.netShares * p.currentMarkPrice;
                     const resolved = isResolved(p.currentMarkPrice);
                     const won = p.currentMarkPrice >= (1 - RESOLVED_TOLERANCE);
+                    const isBootstrapPos = bootstrapKeys.has(`${p.marketId}:${p.outcome.toUpperCase()}`);
                     return <tr key={p.id} className={`transition hover:bg-slate-800/20 ${resolved ? 'bg-amber-500/5' : ''}`}>
                         <td className="max-w-[200px] py-2.5 pr-3">
                             <p className="truncate text-slate-200" title={p.marketQuestion ?? p.marketId}>{p.marketQuestion ?? p.marketId}</p>
                             <p className="text-[10px] text-slate-600">{fmtAge(p.openedAt)}</p>
+                            {isBootstrapPos && <span className="text-[10px] font-semibold text-blue-300">BOOTSTRAP_POSITION</span>}
                             {resolved && <span className={`text-[10px] font-bold ${won ? 'text-emerald-400' : 'text-rose-400'}`}>{won ? '✅ RESOLVED WON' : '❌ RESOLVED LOST'}</span>}
                         </td>
                         <td className="py-2.5 pr-3 text-right"><span className={`rounded-md px-2 py-0.5 text-[10px] font-bold ${p.outcome === 'YES' || p.outcome === 'UP' ? 'bg-emerald-500/12 text-emerald-300' : 'bg-rose-500/12 text-rose-300'}`}>{p.outcome}</span></td>
@@ -162,7 +283,7 @@ function OpenPositionsTable({ positions, trades, sessionId, onForceClose }: { po
 }
 
 // Closed Positions
-function ClosedPositionsTable({ positions, trades }: { positions: Position[]; trades: Trade[] }) {
+function ClosedPositionsTable({ positions, trades, bootstrapKeys }: { positions: Position[]; trades: Trade[]; bootstrapKeys: Set<string> }) {
     const [sk, setSk] = useState<string>('realizedPnl'); const [sd, setSd] = useState<SortDir>('desc');
     function toggle(k: string) { if (sk === k) setSd(d => d === 'asc' ? 'desc' : 'asc'); else { setSk(k); setSd('desc'); } }
     const sorted = useMemo(() => sortedBy(positions, sk, sd), [positions, sk, sd]);
@@ -177,7 +298,7 @@ function ClosedPositionsTable({ positions, trades }: { positions: Position[]; tr
         <th className="py-2 text-right font-semibold">Closed</th>
         <th className="py-2 text-right font-semibold">Link</th>
     </tr></thead><tbody className="divide-y divide-slate-800/25">{sorted.map(p => <tr key={p.id} className="transition hover:bg-slate-800/20">
-        <td className="max-w-[200px] py-2.5 pr-3"><p className="truncate text-slate-200">{p.marketQuestion ?? p.marketId}</p></td>
+        <td className="max-w-[200px] py-2.5 pr-3"><p className="truncate text-slate-200">{p.marketQuestion ?? p.marketId}</p>{bootstrapKeys.has(`${p.marketId}:${p.outcome.toUpperCase()}`) && <p className="text-[10px] text-blue-300">BOOTSTRAP_POSITION</p>}</td>
         <td className="py-2.5 pr-3 text-right"><span className={`rounded-md px-2 py-0.5 text-[10px] font-bold ${p.outcome === 'YES' || p.outcome === 'UP' ? 'bg-emerald-500/12 text-emerald-300' : 'bg-rose-500/12 text-rose-300'}`}>{p.outcome}</span></td>
         <td className="py-2.5 pr-3 text-right font-mono text-slate-400">{p.avgEntryPrice.toFixed(3)}</td>
         <td className="py-2.5 pr-3 text-right font-mono text-slate-400">{p.currentMarkPrice.toFixed(3)}</td>
@@ -194,17 +315,17 @@ function TradeLog({ trades }: { trades: Trade[] }) {
     function toggle(k: string) { if (sk === k) setSd(d => d === 'asc' ? 'desc' : 'asc'); else { setSk(k); setSd('desc'); } }
     const filtered = useMemo(() => { let r = trades; if (fSide !== 'ALL') r = r.filter(t => t.side === fSide); if (fAction !== 'ALL') r = r.filter(t => t.action === fAction); if (search.trim()) { const q = search.toLowerCase(); r = r.filter(t => (t.marketQuestion ?? t.marketId).toLowerCase().includes(q) || t.outcome.toLowerCase().includes(q)); } return sortedBy(r, sk, sd); }, [trades, fSide, fAction, search, sk, sd]);
     const actions = useMemo(() => [...new Set(trades.map(t => t.action))].sort(), [trades]);
-    if (!trades.length) return <p className="py-10 text-center text-sm text-slate-600">No trades.</p>;
+    if (!trades.length) return <div className="py-10 text-center space-y-2"><p className="text-sm text-slate-500">No trades copied during this session.</p><p className="text-xs text-slate-600">Source events may exist, but all may have been skipped or the session has not started.</p></div>;
     return <div className="space-y-3">
         <div className="flex flex-wrap gap-2"><select className="input text-xs w-auto" value={fSide} onChange={e => setFSide(e.target.value as 'ALL' | 'BUY' | 'SELL')}><option value="ALL">All sides</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select><select className="input text-xs w-auto" value={fAction} onChange={e => setFAction(e.target.value)}><option value="ALL">All actions</option>{actions.map(a => <option key={a} value={a}>{a}</option>)}</select><input className="input text-xs flex-1 min-w-[120px]" placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)} /><span className="self-center text-[10px] text-slate-600">{filtered.length}/{trades.length}</span></div>
         <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500">
             <th className="py-2 text-left font-semibold cursor-pointer" onClick={() => toggle('eventTimestamp')}>Time{sk === 'eventTimestamp' ? (sd === 'asc' ? ' ↑' : ' ↓') : ''}</th><th className="py-2 text-left font-semibold">Market</th><th className="py-2 pr-2 text-right font-semibold">Side</th><th className="py-2 pr-2 text-right font-semibold">Action</th>
-            <th className="py-2 pr-2 text-right font-semibold" colSpan={2}>Source wallet</th><th className="py-2 pr-2 text-right font-semibold" colSpan={2}>Our copy</th>
+            <th className="py-2 pr-2 text-right font-semibold" colSpan={2}>Source wallet</th><th className="py-2 pr-2 text-right font-semibold" colSpan={2}>Execution</th>
             <SortTh label="Cost" sk="notional" cur={sk} dir={sd} onSort={toggle} /><SortTh label="Fee" sk="feeApplied" cur={sk} dir={sd} onSort={toggle} /><th className="py-2 text-right font-semibold">Links</th>
         </tr><tr className="text-[9px] text-slate-600 border-b border-slate-800/30"><th /><th /><th /><th /><th className="py-1 pr-2 text-right">Shares</th><th className="py-1 pr-2 text-right">Price</th><th className="py-1 pr-2 text-right">Shares</th><th className="py-1 pr-2 text-right">Price</th><th /><th /><th /></tr></thead>
             <tbody className="divide-y divide-slate-800/20">{filtered.map(t => <tr key={t.id} className={`transition hover:bg-slate-800/20 ${t.action === 'BOOTSTRAP' ? 'opacity-50' : ''}`}>
                 <td className="py-2 pr-2 text-slate-500 whitespace-nowrap">{fmtTime(t.eventTimestamp)}</td>
-                <td className="py-2 pr-2 max-w-[160px]"><p className="truncate text-slate-300">{t.marketQuestion ?? t.marketId}</p><span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${t.outcome === 'YES' || t.outcome === 'UP' ? 'bg-emerald-500/12 text-emerald-300' : 'bg-rose-500/12 text-rose-300'}`}>{t.outcome}</span></td>
+                <td className="py-2 pr-2 max-w-[180px]"><p className="truncate text-slate-300">{t.marketQuestion ?? t.marketId}</p><span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${t.outcome === 'YES' || t.outcome === 'UP' ? 'bg-emerald-500/12 text-emerald-300' : 'bg-rose-500/12 text-rose-300'}`}>{t.outcome}</span><p className="text-[10px] text-slate-600">{t.isBootstrap ? 'BOOTSTRAP_POSITION' : 'COPIED_TRADE'}</p></td>
                 <td className="py-2 pr-2 text-right"><span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${t.side === 'BUY' ? 'bg-emerald-500/12 text-emerald-300' : 'bg-rose-500/12 text-rose-300'}`}>{t.side}</span></td>
                 <td className="py-2 pr-2 text-right text-slate-500">{t.action}</td>
                 <td className="py-2 pr-2 text-right font-mono text-slate-500">{t.sourceShares != null ? t.sourceShares.toFixed(1) : '—'}</td>
@@ -213,9 +334,57 @@ function TradeLog({ trades }: { trades: Trade[] }) {
                 <td className="py-2 pr-2 text-right font-mono text-slate-300">{t.simulatedPrice.toFixed(3)}</td>
                 <td className="py-2 pr-2 text-right font-mono text-slate-400">{fmt$(t.notional)}</td>
                 <td className="py-2 pr-2 text-right font-mono text-amber-500/70">{t.feeApplied > 0.001 ? fmt$(t.feeApplied) : '—'}</td>
-                <td className="py-2 text-right space-x-1">{t.sourceTxUrl && <a href={t.sourceTxUrl} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">tx↗</a>}{t.marketUrl && <a href={t.marketUrl} target="_blank" rel="noreferrer" className="text-slate-500 hover:underline">mkt↗</a>}</td>
+                <td className="py-2 text-right space-x-1">{t.sourceTxUrl && <a href={t.sourceTxUrl} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">tx↗</a>}{t.marketUrl && <a href={t.marketUrl} target="_blank" rel="noreferrer" className="text-slate-500 hover:underline">mkt↗</a>}<span className="ml-2 text-[10px] text-slate-600 font-mono">src:{t.sourceActivityEventId ? t.sourceActivityEventId.slice(0, 8) : '—'} dec:{t.decisionId ? t.decisionId.slice(0, 8) : '—'} led:{t.id.slice(0, 8)}</span></td>
             </tr>)}</tbody></table></div>
     </div>;
+}
+
+function PipelineLog({ decisions }: { decisions: Decision[] }) {
+    if (!decisions.length) {
+        return <div className="py-10 text-center space-y-2"><p className="text-sm text-slate-500">No copy decisions recorded for this session.</p><p className="text-xs text-slate-600">Source events may not have arrived yet, or the session has not started.</p></div>;
+    }
+
+    return <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500">
+        <th className="py-2 text-left font-semibold">Time</th>
+        <th className="py-2 text-left font-semibold">Source Event</th>
+        <th className="py-2 text-left font-semibold">Decision</th>
+        <th className="py-2 text-left font-semibold">Execution</th>
+        <th className="py-2 text-left font-semibold">Portfolio Impact</th>
+        <th className="py-2 text-left font-semibold">Trace IDs</th>
+    </tr></thead><tbody className="divide-y divide-slate-800/20">{decisions.map(d => {
+        const skip = d.status === 'SKIPPED';
+        const failed = d.status === 'FAILED';
+        const executed = d.status === 'EXECUTED';
+        const dt = d.sourceEventTimestamp ?? d.createdAt;
+        const impact = d.executedTrade ? `${d.side === 'BUY' ? '-' : '+'}${fmt$(d.executedTrade.notional)}${d.executedTrade.feeApplied > 0 ? ` (fee ${fmt$(d.executedTrade.feeApplied)})` : ''}` : '—';
+        return <tr key={d.id} className={`transition hover:bg-slate-800/20 ${d.decisionType === 'BOOTSTRAP' ? 'bg-blue-500/5' : ''}`}>
+            <td className="py-2 pr-2 text-slate-500 whitespace-nowrap">{fmtTime(dt)}</td>
+            <td className="py-2 pr-2">
+                <p className="text-slate-300">{d.sourceEventType ?? 'UNKNOWN'} {d.sourceShares != null ? `· ${d.sourceShares.toFixed(2)} sh` : ''}{d.sourcePrice != null ? ` @ ${d.sourcePrice.toFixed(3)}` : ''}</p>
+                <p className="text-[10px] text-slate-600">{d.marketQuestion ?? d.marketId ?? 'No market'}{d.outcome ? ` · ${d.outcome}` : ''}</p>
+            </td>
+            <td className="py-2 pr-2">
+                <p className={`font-semibold ${skip ? 'text-amber-300' : failed ? 'text-rose-300' : 'text-emerald-300'}`}>{d.decisionType}{d.decisionType === 'BOOTSTRAP' ? ' (BOOTSTRAP_POSITION)' : ''}</p>
+                <p className="text-[10px] text-slate-500">{d.reasonCode}</p>
+                <p className="text-[10px] text-slate-600 truncate max-w-[260px]" title={d.humanReason}>{d.humanReason}</p>
+            </td>
+            <td className="py-2 pr-2">
+                <p className={`font-semibold ${executed ? 'text-emerald-300' : failed ? 'text-rose-300' : 'text-amber-300'}`}>{d.status}</p>
+                <p className="text-[10px] text-slate-500">{d.executorType}</p>
+                {d.executionError && <p className="text-[10px] text-rose-400 truncate max-w-[220px]" title={d.executionError}>{d.executionError}</p>}
+            </td>
+            <td className="py-2 pr-2">
+                <p className="text-slate-300">{d.simulatedShares != null ? `${d.simulatedShares.toFixed(2)} sh` : '—'}</p>
+                <p className="text-[10px] text-slate-500">{d.intendedFillPrice != null ? `fill ${d.intendedFillPrice.toFixed(3)}` : 'no fill'}</p>
+                <p className="text-[10px] text-slate-500">{impact}</p>
+            </td>
+            <td className="py-2 pr-2 text-[10px] text-slate-500 font-mono">
+                <p>src:{d.sourceActivityEventId ? d.sourceActivityEventId.slice(0, 10) : '—'}</p>
+                <p>dec:{d.id.slice(0, 10)}</p>
+                <p>led:{d.executedTrade?.ledgerEntryId ? d.executedTrade.ledgerEntryId.slice(0, 10) : '—'}</p>
+            </td>
+        </tr>;
+    })}</tbody></table></div>;
 }
 
 function CreateSessionForm({ wallets, onCreated, showToast }: { wallets: Wallet[]; onCreated: () => void; showToast: (msg: string, ok?: boolean) => void }) {
@@ -244,11 +413,15 @@ export default function SimulationPage() {
     const [activeSessionId, setActiveSessionId] = useState('');
     const [detail, setDetail] = useState<SessionDetail | null>(null);
     const [health, setHealth] = useState<Health | null>(null);
+    const [opsHealth, setOpsHealth] = useState<OpsHealth | null>(null);
+    const [sessionAnalytics, setSessionAnalytics] = useState<SessionAnalytics | null>(null);
+    const [sessionAlerts, setSessionAlerts] = useState<SystemAlert[]>([]);
     const [chartPoints, setChartPoints] = useState<ChartPoint[]>([]);
     const [openPositions, setOpenPositions] = useState<Position[]>([]);
     const [closedPositions, setClosedPositions] = useState<Position[]>([]);
     const [trades, setTrades] = useState<Trade[]>([]);
-    const [activeTab, setActiveTab] = useState<'timeline' | 'open' | 'closed' | 'log'>('timeline');
+    const [decisions, setDecisions] = useState<Decision[]>([]);
+    const [activeTab, setActiveTab] = useState<'timeline' | 'pipeline' | 'open' | 'closed' | 'log'>('timeline');
     const [chartMode, setChartMode] = useState<'pct' | 'abs'>('pct');
     const [actionLoading, setActionLoading] = useState('');
     const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
@@ -267,9 +440,9 @@ export default function SimulationPage() {
     const loadDetail = useCallback(async (sid: string) => {
         if (!sid || fetchInFlight.current) return; fetchInFlight.current = true;
         try {
-            const [dR, hR, oR, cR, tR, mR] = await Promise.all([fetch(`${API}/paper-copy-sessions/${sid}`), fetch(`${API}/paper-copy-sessions/${sid}/health`), fetch(`${API}/paper-copy-sessions/${sid}/positions?status=OPEN&limit=200`), fetch(`${API}/paper-copy-sessions/${sid}/positions?status=CLOSED&limit=200`), fetch(`${API}/paper-copy-sessions/${sid}/trades?limit=200`), fetch(`${API}/paper-copy-sessions/${sid}/metrics?limit=${MAX_CHART_POINTS}`)]);
+            const [dR, hR, oR, cR, tR, mR, pR, opsR, analyticsR, alertsR] = await Promise.all([fetch(`${API}/paper-copy-sessions/${sid}`), fetch(`${API}/paper-copy-sessions/${sid}/health`), fetch(`${API}/paper-copy-sessions/${sid}/positions?status=OPEN&limit=200`), fetch(`${API}/paper-copy-sessions/${sid}/positions?status=CLOSED&limit=200`), fetch(`${API}/paper-copy-sessions/${sid}/trades?limit=200`), fetch(`${API}/paper-copy-sessions/${sid}/metrics?limit=${MAX_CHART_POINTS}`), fetch(`${API}/paper-copy-sessions/${sid}/decisions?limit=300`), fetch(`${API}/health/ops`), fetch(`${API}/paper-copy-sessions/${sid}/analytics`), fetch(`${API}/alerts/system?status=OPEN&limit=20&sessionId=${sid}`)]);
             if (sid !== activeIdRef.current) return;
-            const dd: SessionDetail | null = dR.ok ? await dR.json() : null; setDetail(dd); setHealth(hR.ok ? await hR.json() : null); setOpenPositions(oR.ok ? await oR.json() : []); setClosedPositions(cR.ok ? await cR.json() : []); setTrades(tR.ok ? await tR.json() : []);
+            const dd: SessionDetail | null = dR.ok ? await dR.json() : null; setDetail(dd); setHealth(hR.ok ? await hR.json() : null); setOpenPositions(oR.ok ? await oR.json() : []); setClosedPositions(cR.ok ? await cR.json() : []); setTrades(tR.ok ? await tR.json() : []); setDecisions(pR.ok ? await pR.json() : []); setOpsHealth(opsR.ok ? await opsR.json() : null); setSessionAnalytics(analyticsR.ok ? await analyticsR.json() : null); setSessionAlerts(alertsR.ok ? await alertsR.json() : []);
             const md: Array<{ timestamp: string; totalPnl: number }> = mR.ok ? await mR.json() : [];
             if (dd && md.length) { const sc = dd.startingCash || 1; const pts = md.map(m => ({ ts: new Date(m.timestamp).getTime(), label: new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), pnlPct: (m.totalPnl / sc) * 100, pnlAbs: m.totalPnl })); if (pts.length > MAX_CHART_POINTS) { const step = Math.ceil(pts.length / MAX_CHART_POINTS); setChartPoints(pts.filter((_, i) => i % step === 0 || i === pts.length - 1)); } else setChartPoints(pts); } else setChartPoints([]);
         } finally { fetchInFlight.current = false; }
@@ -311,6 +484,10 @@ export default function SimulationPage() {
     const totalRealPnl = closedPositions.reduce((s, p) => s + p.realizedPnl, 0) + openPositions.reduce((s, p) => s + p.realizedPnl, 0);
     const totalUnrealPnl = openPositions.reduce((s, p) => s + p.unrealizedPnl, 0);
     const resolvedCount = openPositions.filter(p => isResolved(p.currentMarkPrice)).length;
+    const skippedCount = decisions.filter(d => d.status === 'SKIPPED').length;
+    const failedCount = decisions.filter(d => d.status === 'FAILED').length;
+    const executedCount = decisions.filter(d => d.status === 'EXECUTED').length;
+    const bootstrapKeys = useMemo(() => new Set(trades.filter(t => t.action === 'BOOTSTRAP' || t.sourceType === 'BOOTSTRAP').map(t => `${t.marketId}:${t.outcome.toUpperCase()}`)), [trades]);
 
     return <LayoutShell>
         {toast && <div className={`fixed right-5 top-5 z-50 max-w-sm rounded-xl border px-4 py-3 text-sm font-medium shadow-2xl ${toast.ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : 'border-rose-500/30 bg-rose-500/10 text-rose-200'}`}>{toast.msg}</div>}
@@ -319,9 +496,13 @@ export default function SimulationPage() {
 
             <div className="min-w-0 flex-1 space-y-4">
                 <div className="flex gap-2 lg:hidden"><select className="input flex-1" value={activeSessionId} onChange={e => setActiveSessionId(e.target.value)}>{sessions.map(s => <option key={s.id} value={s.id}>{s.trackedWalletLabel}—{s.status}</option>)}</select><button onClick={() => setShowCreate(!showCreate)} className="btn-primary text-xs px-3">+</button></div>
-                {!detail ? <div className="flex h-64 flex-col items-center justify-center text-slate-500">{sessions.length === 0 ? <><p className="text-lg font-medium text-slate-300">No sessions</p><p className="mt-1 text-sm">Create one to start.</p></> : <p className="text-sm">Select a session.</p>}</div> : <>
+                {!detail ? <div className="flex h-64 flex-col items-center justify-center text-slate-500">{sessions.length === 0 ? <><p className="text-lg font-medium text-slate-300">No sessions</p><p className="mt-1 text-sm">Session has not started yet. Create one to begin the source → decision → execution pipeline.</p></> : <p className="text-sm">Select a session.</p>}</div> : <>
                     <div className="panel p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div className="space-y-1"><div className="flex items-center gap-3"><h2 className="text-lg font-bold text-slate-100">Copying {detail.trackedWalletLabel}</h2><StatusPill status={detail.status} isStale={health?.isStale ?? false} /></div><p className="text-xs text-slate-500">{detail.startedAt && `Started ${new Date(detail.startedAt).toLocaleString()}`}{detail.copyRatio != null && ` · Ratio: ${(detail.copyRatio * 100).toFixed(0)}%`} · {trades.length} trades · {openPositions.length} open · {closedPositions.length} closed</p></div><ActionButtons detail={detail} actionLoading={actionLoading} act={act} repairSession={repairSession} reconcilePositions={reconcilePositions} closeResolved={closeResolved} repairLoading={repairLoading} onDelete={() => setDeleteConfirmId(detail.id)} resolvedCount={resolvedCount} /></div><div className={`mt-4 rounded-xl border p-4 ${pnlBg(detail.totalPnl)}`}><p className={`text-base font-semibold ${pnlColor(detail.totalPnl)}`}>{detail.summarySentence}</p></div></div>
                     <HealthBar health={health} walletAddress={detail.trackedWalletAddress} />
+                    <OpsHealthBar ops={opsHealth} />
+                    <GuardrailsPanel detail={detail} onSaved={reload} showToast={showToast} />
+                    <SessionInsightsPanel analytics={sessionAnalytics} />
+                    <SessionAlertsPanel alerts={sessionAlerts} />
                     <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-7">
                         <div className="panel p-3"><KPI label="Portfolio" value={fmt$(detail.netLiquidationValue, 0)} /></div>
                         <div className="panel p-3"><KPI label="Total PnL" value={fmtPnl(detail.totalPnl)} sub={fmtPct(detail.returnPct)} accent={pnlColor(detail.totalPnl)} /></div>
@@ -331,11 +512,17 @@ export default function SimulationPage() {
                         <div className="panel p-3"><KPI label="Open" value={String(openPositions.length)} sub={resolvedCount > 0 ? `${resolvedCount} resolved` : 'positions'} /></div>
                         <div className="panel p-3"><KPI label="Closed" value={String(closedPositions.length)} sub={closedPositions.length === 0 ? 'try Close Resolved' : 'positions'} /></div>
                     </div>
+                    <div className="grid grid-cols-3 gap-3">
+                        <div className="panel p-3"><KPI label="Decisions Executed" value={String(executedCount)} sub="approved + filled" accent="text-emerald-300" /></div>
+                        <div className="panel p-3"><KPI label="Decisions Skipped" value={String(skippedCount)} sub="explicitly ignored" accent={skippedCount > 0 ? 'text-amber-300' : 'text-slate-300'} /></div>
+                        <div className="panel p-3"><KPI label="Decisions Failed" value={String(failedCount)} sub="execution/runtime failures" accent={failedCount > 0 ? 'text-rose-300' : 'text-slate-300'} /></div>
+                    </div>
                     <EquityChart points={chartPoints} mode={chartMode} setMode={setChartMode} isPositive={isPositive} />
-                    <div className="panel overflow-hidden"><div className="flex border-b border-slate-800/50 overflow-x-auto">{([{ key: 'timeline' as const, label: '📋 Activity' }, { key: 'open' as const, label: `Open (${openPositions.length})${resolvedCount > 0 ? ` ⚡${resolvedCount}` : ''}` }, { key: 'closed' as const, label: `Closed (${closedPositions.length})` }, { key: 'log' as const, label: `Trades (${trades.length})` }]).map(t => <button key={t.key} onClick={() => setActiveTab(t.key)} className={`whitespace-nowrap px-5 py-3 text-xs font-semibold transition-all ${activeTab === t.key ? 'border-b-2 border-blue-400 text-blue-300' : 'text-slate-500 hover:text-slate-300'}`}>{t.label}</button>)}</div><div className="p-4">
+                    <div className="panel overflow-hidden"><div className="flex border-b border-slate-800/50 overflow-x-auto">{([{ key: 'timeline' as const, label: '📋 Source vs Copy' }, { key: 'pipeline' as const, label: `🧠 Pipeline (${decisions.length})` }, { key: 'open' as const, label: `Open (${openPositions.length})${resolvedCount > 0 ? ` ⚡${resolvedCount}` : ''}` }, { key: 'closed' as const, label: `Closed (${closedPositions.length})` }, { key: 'log' as const, label: `Ledger (${trades.length})` }]).map(t => <button key={t.key} onClick={() => setActiveTab(t.key)} className={`whitespace-nowrap px-5 py-3 text-xs font-semibold transition-all ${activeTab === t.key ? 'border-b-2 border-blue-400 text-blue-300' : 'text-slate-500 hover:text-slate-300'}`}>{t.label}</button>)}</div><div className="p-4">
                         {activeTab === 'timeline' && <ActivityTimeline trades={trades} />}
-                        {activeTab === 'open' && <OpenPositionsTable positions={openPositions} trades={trades} sessionId={activeSessionId} onForceClose={forceClosePos} />}
-                        {activeTab === 'closed' && <ClosedPositionsTable positions={closedPositions} trades={trades} />}
+                        {activeTab === 'pipeline' && <PipelineLog decisions={decisions} />}
+                        {activeTab === 'open' && <OpenPositionsTable positions={openPositions} trades={trades} sessionId={activeSessionId} onForceClose={forceClosePos} bootstrapKeys={bootstrapKeys} />}
+                        {activeTab === 'closed' && <ClosedPositionsTable positions={closedPositions} trades={trades} bootstrapKeys={bootstrapKeys} />}
                         {activeTab === 'log' && <TradeLog trades={trades} />}
                     </div></div>
                 </>}
