@@ -16,8 +16,11 @@
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import { materializePaperSessionState } from './paper-accounting.js';
+import { createPolymarketDataAdapter } from './polymarket.js';
+import { deriveClosedPositionsFromDb } from './profile-parity-routes.js';
 
 const db = prisma as any;
+const dataAdapter = createPolymarketDataAdapter();
 
 // A mark price within this tolerance of 0 or 1 is considered "resolved"
 const RESOLVED_TOLERANCE = 0.02;
@@ -114,6 +117,168 @@ export async function forceClosePosition(
   return { closed: true, realizedPnl, cashReturned };
 }
 
+function isSellLikeTrade(t: { side: string; action: string }): boolean {
+  const action = String(t.action ?? '').toUpperCase();
+  return (
+    String(t.side ?? '').toUpperCase() === 'SELL' ||
+    action.includes('SELL') ||
+    action.includes('CLOSE') ||
+    action.includes('REDUCE') ||
+    action.includes('REDEEM')
+  );
+}
+
+/**
+ * Force-close a single open lot identified by its BUY trade id.
+ * Uses FIFO replay to compute remaining shares for that exact lot.
+ */
+export async function forceCloseLot(
+  sessionId: string,
+  lotTradeId: string,
+): Promise<{ closed: boolean; realizedPnl: number; cashReturned: number; closedShares: number }> {
+  const lotTrade = await db.paperCopyTrade.findUnique({ where: { id: lotTradeId } });
+  if (!lotTrade || lotTrade.sessionId !== sessionId) {
+    return { closed: false, realizedPnl: 0, cashReturned: 0, closedShares: 0 };
+  }
+
+  if (String(lotTrade.side).toUpperCase() !== 'BUY') {
+    return { closed: false, realizedPnl: 0, cashReturned: 0, closedShares: 0 };
+  }
+
+  const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
+  if (!session) throw new Error('Session not found');
+
+  const allTrades: Array<Record<string, any>> = await db.paperCopyTrade.findMany({
+    where: {
+      sessionId,
+      marketId: lotTrade.marketId,
+      outcome: lotTrade.outcome,
+    },
+    orderBy: [{ eventTimestamp: 'asc' }, { createdAt: 'asc' }],
+    select: {
+      id: true,
+      side: true,
+      action: true,
+      simulatedShares: true,
+    },
+  });
+
+  const lotQueue: Array<{ id: string; remainingShares: number }> = [];
+  for (const t of allTrades) {
+    const shares = Number(t.simulatedShares ?? 0);
+    if (shares <= 0) continue;
+    if (!isSellLikeTrade({ side: String(t.side), action: String(t.action) })) {
+      lotQueue.push({ id: String(t.id), remainingShares: shares });
+      continue;
+    }
+
+    let remainingToClose = shares;
+    for (const lot of lotQueue) {
+      if (remainingToClose <= 0) break;
+      if (lot.remainingShares <= 0) continue;
+      const consume = Math.min(lot.remainingShares, remainingToClose);
+      lot.remainingShares -= consume;
+      remainingToClose -= consume;
+    }
+  }
+
+  const targetLot = lotQueue.find((l) => l.id === lotTradeId);
+  const closeShares = targetLot ? Number(targetLot.remainingShares) : 0;
+  if (closeShares <= 1e-8) {
+    return { closed: false, realizedPnl: 0, cashReturned: 0, closedShares: 0 };
+  }
+
+  const openPosition = await db.paperCopyPosition.findFirst({
+    where: {
+      sessionId,
+      status: 'OPEN',
+      marketId: lotTrade.marketId,
+      outcome: lotTrade.outcome,
+    },
+    select: {
+      id: true,
+      currentMarkPrice: true,
+      netShares: true,
+      avgEntryPrice: true,
+      marketQuestion: true,
+      marketId: true,
+      outcome: true,
+    },
+  });
+
+  if (!openPosition || Number(openPosition.netShares) <= 0) {
+    return { closed: false, realizedPnl: 0, cashReturned: 0, closedShares: 0 };
+  }
+
+  const sharesToClose = Math.min(closeShares, Number(openPosition.netShares));
+  if (sharesToClose <= 1e-8) {
+    return { closed: false, realizedPnl: 0, cashReturned: 0, closedShares: 0 };
+  }
+
+  const rawMark = Number(openPosition.currentMarkPrice);
+  const closePrice = isLikelyResolved(rawMark) ? resolvedClosePrice(rawMark) : rawMark;
+  const entryPrice = Number(lotTrade.simulatedPrice ?? openPosition.avgEntryPrice ?? 0);
+  const realizedPnl = sharesToClose * (closePrice - entryPrice);
+  const notional = sharesToClose * closePrice;
+  const feeApplied = notional * (Number(session.feeBps) / 10_000);
+  const cashReturned = notional - feeApplied;
+  const now = new Date();
+
+  await db.paperCopyTrade.create({
+    data: {
+      sessionId,
+      trackedWalletId: session.trackedWalletId,
+      walletAddress: session.trackedWalletAddress,
+      sourceType: 'MANUAL_FORCE_CLOSE',
+      sourceEventTimestamp: now,
+      sourceTxHash: null,
+      executorType: 'FORCE_CLOSE_TOOLING',
+      isBootstrap: false,
+      sourceActivityEventId: null,
+      marketId: String(openPosition.marketId),
+      marketQuestion: openPosition.marketQuestion ?? null,
+      outcome: String(openPosition.outcome),
+      side: 'SELL',
+      action: 'FORCE_CLOSE_LOT',
+      sourcePrice: closePrice,
+      simulatedPrice: closePrice,
+      sourceShares: sharesToClose,
+      simulatedShares: sharesToClose,
+      notional,
+      feeApplied,
+      slippageApplied: 0,
+      eventTimestamp: now,
+      processedAt: now,
+      reasoning: {
+        type: 'FORCE_CLOSE_LOT',
+        reason: 'Manually force-closed a specific open lot',
+        lotTradeId,
+        entryPrice,
+        markPrice: rawMark,
+        closePrice,
+      },
+    },
+  });
+
+  await materializePaperSessionState(sessionId);
+
+  logger.info(
+    {
+      sessionId,
+      lotTradeId,
+      marketId: openPosition.marketId,
+      outcome: openPosition.outcome,
+      sharesToClose,
+      closePrice,
+      realizedPnl,
+      cashReturned,
+    },
+    'lot force-closed',
+  );
+
+  return { closed: true, realizedPnl, cashReturned, closedShares: sharesToClose };
+}
+
 /**
  * Close all open positions whose mark price indicates the market has resolved
  * (mark ≈ 0 or mark ≈ 1). This catches markets that our poller/reconcile missed.
@@ -135,6 +300,74 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
     where: { sessionId, status: 'OPEN' },
   });
 
+  const sourceResolutionByKey = new Map<string, number>();
+
+  // 1) Source closed positions from REDEEM/CLOSE history are primary ground truth.
+  try {
+    const sourceClosed = await deriveClosedPositionsFromDb(db, session.trackedWalletId);
+    for (const pos of sourceClosed) {
+      const marketId = String(pos.conditionId ?? pos.marketId ?? '').trim();
+      const outcome = String(pos.outcome ?? '')
+        .trim()
+        .toUpperCase();
+      if (!marketId || !outcome) continue;
+
+      const amountWon = Number(pos.valueUsd ?? 0);
+      const totalTraded = Number(pos.totalTraded ?? 0);
+      const currentPrice = Number(pos.currentPrice ?? 0);
+
+      let closePrice = currentPrice;
+      if (amountWon > 0 && totalTraded > 0) {
+        closePrice = 1;
+      } else if (totalTraded > 0 && amountWon <= 0) {
+        closePrice = 0;
+      }
+      if (closePrice >= 0.95) closePrice = 1;
+      if (closePrice <= 0.05) closePrice = 0;
+
+      sourceResolutionByKey.set(`${marketId}:${outcome}`, closePrice);
+    }
+  } catch {
+    // Non-fatal: adapter and DB event fallbacks below provide additional signals.
+  }
+
+  // 2) DB REDEEM/CLOSE wallet events provide additional authoritative resolution.
+  const redeemRows: Array<Record<string, unknown>> = await db.walletActivityEvent.findMany({
+    where: {
+      trackedWalletId: session.trackedWalletId,
+      eventType: { in: ['REDEEM', 'CLOSE'] },
+      ...(session.startedAt ? { eventTimestamp: { gte: session.startedAt } } : {}),
+    },
+    orderBy: { eventTimestamp: 'desc' },
+    select: {
+      marketId: true,
+      conditionId: true,
+      outcome: true,
+      shares: true,
+      notional: true,
+      price: true,
+    },
+  });
+
+  for (const row of redeemRows) {
+    const marketId = String(row.conditionId ?? row.marketId ?? '').trim();
+    const outcome = String(row.outcome ?? '')
+      .trim()
+      .toUpperCase();
+    if (!marketId || !outcome) continue;
+
+    const shares = Math.abs(Number(row.shares ?? 0));
+    const notional = Number(row.notional ?? 0);
+    const rawPrice = Number(row.price ?? 0);
+
+    let closePrice = shares > 0 ? notional / shares : rawPrice;
+    if (!Number.isFinite(closePrice) || closePrice < 0) closePrice = 0;
+    if (closePrice >= 0.95) closePrice = 1;
+    if (closePrice <= 0.05) closePrice = 0;
+
+    sourceResolutionByKey.set(`${marketId}:${outcome}`, closePrice);
+  }
+
   let closed = 0;
   let totalRealizedPnl = 0;
   let totalCashReturned = 0;
@@ -142,14 +375,18 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
   const now = new Date();
 
   for (const pos of openPositions) {
-    const markPrice = Number(pos.currentMarkPrice);
-
-    if (!isLikelyResolved(markPrice)) continue;
+    const key = `${String(pos.marketId)}:${String(pos.outcome).toUpperCase()}`;
+    const resolvedFromSource = sourceResolutionByKey.get(key);
+    const isThresholdResolved = isLikelyResolved(Number(pos.currentMarkPrice));
+    if (resolvedFromSource === undefined && !isThresholdResolved) continue;
 
     const closeShares = Number(pos.netShares);
     if (closeShares <= 0) continue;
 
-    const closePrice = resolvedClosePrice(markPrice);
+    const closePrice =
+      resolvedFromSource !== undefined
+        ? resolvedFromSource
+        : resolvedClosePrice(Number(pos.currentMarkPrice));
     const avgEntry = Number(pos.avgEntryPrice);
     const realizedPnl = closeShares * (closePrice - avgEntry);
     const notional = closeShares * closePrice;
@@ -183,9 +420,14 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
         processedAt: now,
         reasoning: {
           type: 'AUTO_CLOSE_RESOLVED',
-          reason: `Market resolved — mark price ${markPrice.toFixed(4)} ≈ ${closePrice === 1 ? 'WON' : 'LOST'}`,
-          markPrice,
+          reason:
+            resolvedFromSource !== undefined
+              ? `Market resolved using source wallet redemption ground truth (${closePrice === 1 ? 'WON' : 'LOST'})`
+              : `Fallback threshold resolution used (mark≈${Number(pos.currentMarkPrice).toFixed(3)})`,
+          markPrice: Number(pos.currentMarkPrice),
           closePrice,
+          sourceGroundTruth:
+            resolvedFromSource !== undefined ? 'wallet_redemption' : 'mark_threshold_fallback',
         },
       },
     });
@@ -204,7 +446,7 @@ export async function closeResolvedPositions(sessionId: string): Promise<{
         closeShares,
         realizedPnl,
       },
-      'position auto-closed — market resolved (mark ≈ 0 or 1)',
+      'position auto-closed from source redemption ground truth',
     );
   }
 

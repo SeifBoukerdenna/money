@@ -87,6 +87,14 @@ function asNumber(value: unknown): number | null {
   return null;
 }
 
+function pickFirstPositiveNumber(...values: unknown[]): number | null {
+  for (const v of values) {
+    const n = asNumber(v);
+    if (n !== null && n > 0) return n;
+  }
+  return null;
+}
+
 function skipDecision(input: {
   marketId?: string | null;
   marketQuestion?: string | null;
@@ -233,8 +241,54 @@ export function evaluatePaperEventDecision(input: {
     };
   }
 
-  const sourceShares = asNumber(event.shares);
-  const sourcePrice = asNumber(event.price);
+  const raw =
+    event.rawPayloadJson && typeof event.rawPayloadJson === 'object'
+      ? (event.rawPayloadJson as Record<string, unknown>)
+      : null;
+
+  const sourceNotional = pickFirstPositiveNumber(
+    event.notional,
+    raw?.notional,
+    raw?.amount,
+    raw?.amountUsd,
+    raw?.totalTraded,
+    raw?.usdValue,
+  );
+
+  let sourceShares = pickFirstPositiveNumber(event.shares, raw?.shares, raw?.size, raw?.quantity);
+  let sourcePrice = pickFirstPositiveNumber(
+    event.price,
+    raw?.price,
+    raw?.avgPrice,
+    raw?.executionPrice,
+    raw?.fillPrice,
+  );
+
+  if ((!sourceShares || sourceShares <= 0) && sourceNotional && sourcePrice && sourcePrice > 0) {
+    sourceShares = sourceNotional / sourcePrice;
+  }
+
+  if ((!sourcePrice || sourcePrice <= 0) && sourceNotional && sourceShares && sourceShares > 0) {
+    sourcePrice = sourceNotional / sourceShares;
+  }
+
+  // Mirror-first behavior for sell/reduce events: if source doesn't provide
+  // explicit size, use current copied exposure instead of skipping.
+  if (effectiveSide === 'SELL' && position && position.netShares > 0) {
+    if (!sourceShares || sourceShares <= 0) {
+      sourceShares = position.netShares;
+    }
+    if (!sourcePrice || sourcePrice <= 0) {
+      sourcePrice = pickFirstPositiveNumber(event.price, raw?.price, position.avgEntryPrice, 0.5);
+    }
+  }
+
+  // Last resort for BUY events with only notional present.
+  if (effectiveSide === 'BUY' && sourceNotional && sourceNotional > 0) {
+    if (!sourcePrice || sourcePrice <= 0) sourcePrice = 0.5;
+    if (!sourceShares || sourceShares <= 0) sourceShares = sourceNotional / sourcePrice;
+  }
+
   if (!sourceShares || !sourcePrice || sourceShares <= 0 || sourcePrice <= 0) {
     return skipDecision({
       marketId,
@@ -245,8 +299,14 @@ export function evaluatePaperEventDecision(input: {
       sourcePrice,
       copyRatio,
       reasonCode: PAPER_REASON_CODES.SKIP_INVALID_SOURCE_SIZE,
-      humanReason: 'Source event is missing a valid positive price and shares payload.',
-      sizingInputsJson: { eventType },
+      humanReason:
+        'Source event is missing a valid positive price/shares payload after normalization.',
+      sizingInputsJson: {
+        eventType,
+        sourceNotional,
+        rawPrice: raw?.price ?? null,
+        rawShares: raw?.shares ?? raw?.size ?? null,
+      },
     });
   }
 

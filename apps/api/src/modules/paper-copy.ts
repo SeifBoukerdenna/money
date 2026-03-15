@@ -9,6 +9,8 @@ import {
 } from './paper-decisioning.js';
 import { resolvePaperExecutor } from './paper-executor.js';
 import { raiseSystemAlert } from './system-alerts.js';
+import { closeResolvedPositions } from './force-close.js';
+import { processWalletPoll } from './ingestion.js';
 
 const adapter = createPolymarketDataAdapter();
 const db = prisma as unknown as Record<string, any>;
@@ -50,6 +52,7 @@ const _lastSnapshotAt = new Map<string, number>();
 export async function createPaperCopySession(input: {
   trackedWalletId: string;
   startingCash?: number;
+  copyRatio?: number;
   maxAllocationPerMarket?: number;
   maxTotalExposure?: number;
   minNotionalThreshold?: number;
@@ -76,8 +79,10 @@ export async function createPaperCopySession(input: {
       status: 'PAUSED',
       startingCash,
       currentCash: startingCash,
-      maxAllocationPerMarket: input.maxAllocationPerMarket ?? startingCash * 0.05,
-      maxTotalExposure: input.maxTotalExposure ?? startingCash * 0.8,
+      copyRatio: input.copyRatio ?? 1,
+      // Mirror-first defaults: use full cash unless user explicitly tightens limits.
+      maxAllocationPerMarket: input.maxAllocationPerMarket ?? startingCash,
+      maxTotalExposure: input.maxTotalExposure ?? startingCash,
       minNotionalThreshold: input.minNotionalThreshold ?? 2,
       minWalletTrades: input.minWalletTrades ?? null,
       minWalletWinRate: input.minWalletWinRate ?? null,
@@ -97,25 +102,23 @@ export async function createPaperCopySession(input: {
 export async function startPaperCopySession(sessionId: string) {
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error('Session not found');
-  if (session.status === 'RUNNING') return; // idempotent
+  if (session.status === 'RUNNING') return;
 
-  const startedAt: Date = session.startedAt ?? new Date();
-
-  const bootstrapped = await _bootstrapFromOpenPositions(sessionId, session.trackedWalletAddress);
+  const startedAt = new Date();
 
   await db.paperCopySession.update({
     where: { id: sessionId },
     data: {
       status: 'RUNNING',
       startedAt,
-      estimatedSourceExposure: bootstrapped.estimatedSourceExposure,
-      copyRatio: bootstrapped.copyRatio,
+      copyRatio: session.copyRatio ?? 1,
+      estimatedSourceExposure: null,
     },
   });
 
   await materializePaperSessionState(sessionId);
 
-  // Immediately catch up on any events that came in during bootstrap
+  // Immediately run a tick to catch events that arrived during startup.
   await _runTick(sessionId);
 }
 
@@ -559,6 +562,12 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session || session.status !== 'RUNNING') return;
 
+  // Pull fresh source activity through the same ingestion pipeline used by Wallet Tracker
+  // so paper sessions always consume the latest normalized activity feed.
+  await processWalletPoll(session.trackedWalletId, session.trackedWalletAddress).catch((err) =>
+    logger.warn({ sessionId, err }, 'wallet poll from paper tick failed (non-fatal)'),
+  );
+
   const wallet = await db.watchedWallet.findUnique({
     where: { id: session.trackedWalletId },
     select: { id: true, syncStatus: true, lastSyncAt: true },
@@ -596,6 +605,8 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   }
 
   const startedAt: Date = session.startedAt ?? session.createdAt;
+  const lastWatermark = session.lastProcessedEventAt ?? startedAt;
+  const overlapStart = new Date(lastWatermark.getTime() - 2 * 60_000);
 
   // Fetch activity events after the last watermark.
   // CRITICAL: Do NOT filter on `side`, `price`, or `shares` here.
@@ -608,7 +619,9 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   const newEvents: Array<Record<string, any>> = await db.walletActivityEvent.findMany({
     where: {
       trackedWalletId: session.trackedWalletId,
-      eventTimestamp: { gt: session.lastProcessedEventAt ?? startedAt },
+      // Small overlap window allows retrying recently skipped events after guardrail/config changes.
+      // Dedupe safety is guaranteed by per-event decision upsert keyed by sourceActivityEventId.
+      eventTimestamp: { gte: overlapStart },
     },
     orderBy: { eventTimestamp: 'asc' },
     take: MAX_EVENTS_PER_TICK,
@@ -617,6 +630,9 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   if (newEvents.length === 0) {
     await materializePaperSessionState(sessionId);
     await _writeSnapshot(sessionId);
+    await closeResolvedPositions(sessionId).catch((err) =>
+      logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)'),
+    );
     return;
   }
 
@@ -731,12 +747,26 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
           sourceActivityEventId: event.id,
         },
       },
-      select: { id: true, status: true },
+      select: { id: true, status: true, reasonCode: true },
     });
-    if (
-      alreadyProcessedDecision?.status === 'EXECUTED' ||
-      alreadyProcessedDecision?.status === 'SKIPPED'
-    ) {
+
+    const retriableReasonCodes = new Set<string>([
+      PAPER_REASON_CODES.SKIP_INVALID_SOURCE_SIZE,
+      PAPER_REASON_CODES.SKIP_BELOW_MIN_NOTIONAL,
+      PAPER_REASON_CODES.SKIP_NO_AVAILABLE_CASH,
+      PAPER_REASON_CODES.SKIP_OVER_MARKET_CAP,
+    ]);
+
+    const canRetrySkippedDecision =
+      alreadyProcessedDecision?.status === 'SKIPPED' &&
+      retriableReasonCodes.has(String(alreadyProcessedDecision.reasonCode ?? ''));
+
+    if (alreadyProcessedDecision?.status === 'EXECUTED') {
+      lastEventTs = event.eventTimestamp;
+      continue;
+    }
+
+    if (alreadyProcessedDecision?.status === 'SKIPPED' && !canRetrySkippedDecision) {
       lastEventTs = event.eventTimestamp;
       continue;
     }
@@ -1052,6 +1082,9 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
 
   await materializePaperSessionState(sessionId);
   await _writeSnapshot(sessionId);
+  await closeResolvedPositions(sessionId).catch((err) =>
+    logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)'),
+  );
 }
 
 // ---------------------------------------------------------------------------

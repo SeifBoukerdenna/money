@@ -44,6 +44,22 @@ import {
 } from './profile-parity.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type PnlSummaryResponse = {
+  walletId: string;
+  range: '1D' | '7D' | '30D' | 'ALL';
+  since: string | null;
+  from: string | null;
+  to: string | null;
+  netPnl: number;
+  totalWon: number;
+  totalLost: number;
+  totalVolumeTraded: number;
+  tradeCount: number;
+  winCount: number;
+  lossCount: number;
+  winRate: number;
+};
+
 export function registerProfileParityRoutes(
   app: any,
   deps: {
@@ -294,237 +310,18 @@ export function registerProfileParityRoutes(
   // ───────────────────────────────────────────────────────────────────────────
   app.get('/wallets/:id/pnl-summary', async (req: any) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
-    const { range } = z
+    const query = z
       .object({
         range: z.enum(['1D', '7D', '30D', 'ALL']).default('1D'),
+        from: z.string().datetime().optional(),
+        to: z.string().datetime().optional(),
       })
       .parse(req.query ?? {});
-
-    const wallet = await prisma.watchedWallet.findUnique({ where: { id }, select: { id: true } });
-    if (!wallet) throw app.httpErrors.notFound('Wallet not found');
-
-    const now = Date.now();
-    const HOUR = 3600_000;
-    const sinceMs: number | null =
-      range === '1D'
-        ? now - 24 * HOUR
-        : range === '7D'
-          ? now - 7 * 24 * HOUR
-          : range === '30D'
-            ? now - 30 * 24 * HOUR
-            : null;
-
-    // Fetch all exit events in range
-    const exitRows: Array<{
-      eventType: string;
-      outcome: string | null;
-      side: string | null;
-      price: unknown;
-      shares: unknown;
-      notional: unknown;
-      marketId: string;
-      conditionId: string | null;
-      eventTimestamp: Date;
-    }> = await prisma.walletActivityEvent.findMany({
-      where: {
-        trackedWalletId: id,
-        eventType: { in: ['SELL', 'REDEEM', 'CLOSE', 'TRADE'] },
-        ...(sinceMs ? { eventTimestamp: { gte: new Date(sinceMs) } } : {}),
-      },
-      select: {
-        eventType: true,
-        outcome: true,
-        side: true,
-        price: true,
-        shares: true,
-        notional: true,
-        marketId: true,
-        conditionId: true,
-        eventTimestamp: true,
-      },
-      orderBy: { eventTimestamp: 'asc' },
+    return calculateWalletPnlSummary(prisma, id, {
+      range: query.range,
+      ...(query.from ? { from: query.from } : {}),
+      ...(query.to ? { to: query.to } : {}),
     });
-
-    // Filter to actual sell-side events
-    const sells = exitRows.filter((r) => {
-      const et = r.eventType.toUpperCase();
-      const sd = (r.side ?? '').toUpperCase();
-      return (
-        et === 'REDEEM' || et === 'CLOSE' || et === 'SELL' || (et === 'TRADE' && sd === 'SELL')
-      );
-    });
-
-    // Load ALL BUY events for the relevant markets (not range-filtered — need full history for WACP)
-    const marketIds = [...new Set(sells.map((s) => s.conditionId ?? s.marketId).filter(Boolean))];
-
-    const avgPriceMap = new Map<string, { size: number; avgPrice: number }>();
-
-    if (marketIds.length > 0) {
-      const buys: Array<{
-        marketId: string;
-        conditionId: string | null;
-        outcome: string | null;
-        side: string | null;
-        eventType: string;
-        shares: unknown;
-        price: unknown;
-      }> = await prisma.walletActivityEvent.findMany({
-        where: {
-          trackedWalletId: id,
-          eventType: { in: ['BUY', 'TRADE'] },
-          side: 'BUY',
-          OR: [{ conditionId: { in: marketIds } }, { marketId: { in: marketIds } }],
-        },
-        select: {
-          marketId: true,
-          conditionId: true,
-          outcome: true,
-          side: true,
-          eventType: true,
-          shares: true,
-          price: true,
-        },
-        orderBy: { eventTimestamp: 'asc' } as any,
-      });
-
-      function addToAvgMap(key: string, sz: number, px: number): void {
-        const cur = avgPriceMap.get(key) ?? { size: 0, avgPrice: 0 };
-        const newSize = cur.size + sz;
-        if (newSize > 0) {
-          avgPriceMap.set(key, {
-            size: newSize,
-            avgPrice: (cur.size * cur.avgPrice + sz * px) / newSize,
-          });
-        }
-      }
-
-      for (const b of buys) {
-        const condId = (b.conditionId || b.marketId || '').trim();
-        const mktId = (b.marketId || '').trim();
-        const oc = (b.outcome ?? '').toUpperCase().trim();
-        const sz = Math.abs(Number(b.shares ?? 0));
-        const px = Number(b.price ?? 0);
-        if (sz <= 0 || px <= 0) continue;
-
-        if (condId && oc) addToAvgMap(`${condId}:${oc}`, sz, px);
-        if (condId) addToAvgMap(`${condId}:*`, sz, px);
-        if (mktId !== condId) {
-          if (oc) addToAvgMap(`${mktId}:${oc}`, sz, px);
-          addToAvgMap(`${mktId}:*`, sz, px);
-        }
-      }
-    }
-
-    let totalWon = 0;
-    let totalLost = 0;
-    let totalVolumeTraded = 0; // sum of all buy-side notional in range
-    let tradeCount = 0;
-    let winCount = 0;
-    let lossCount = 0;
-
-    for (const sell of sells) {
-      const et = sell.eventType.toUpperCase();
-      const condId = (sell.conditionId || sell.marketId || '').trim();
-      const mktId = (sell.marketId || '').trim();
-      const outcome = (sell.outcome ?? '').toUpperCase().trim();
-      const sz = Math.abs(Number(sell.shares ?? 0));
-      const px = Number(sell.price ?? 0);
-      const notional = Math.abs(Number(sell.notional ?? 0));
-
-      if (et === 'REDEEM' || et === 'CLOSE') {
-        // REDEEM = direct payout. notional is the USD received.
-        // If notional is missing, use shares × price (for winning REDEEMs price ≈ 1.0)
-        const payout = notional > 0 ? notional : sz > 0 && px > 0 ? sz * px : sz > 0 ? sz : 0;
-        if (payout > 0) {
-          totalWon += payout;
-          winCount++;
-          tradeCount++;
-        }
-        // Losing REDEEMs have payout=0 — count as a loss
-        else if (sz > 0 || notional === 0) {
-          // position resolved worthless
-          const cost = (() => {
-            const entry =
-              avgPriceMap.get(`${condId}:${outcome}`) ??
-              avgPriceMap.get(`${condId}:*`) ??
-              avgPriceMap.get(`${mktId}:${outcome}`) ??
-              avgPriceMap.get(`${mktId}:*`);
-            const buyShares = entry?.size ?? sz;
-            const buyAvg = entry?.avgPrice ?? 0;
-            return buyShares * buyAvg;
-          })();
-          if (cost > 0) {
-            totalLost += cost;
-            lossCount++;
-            tradeCount++;
-          }
-        }
-        continue;
-      }
-
-      // SELL or TRADE+SELL: P&L = (sellPrice - wacpAtSell) × closeShares
-      if (sz <= 0) continue;
-
-      const entry =
-        avgPriceMap.get(`${condId}:${outcome}`) ??
-        avgPriceMap.get(`${condId}:*`) ??
-        avgPriceMap.get(`${mktId}:${outcome}`) ??
-        avgPriceMap.get(`${mktId}:*`);
-
-      const avgBuyPrice = entry?.avgPrice ?? 0;
-
-      let pnl: number;
-      if (avgBuyPrice > 0) {
-        pnl = (px - avgBuyPrice) * sz;
-      } else {
-        // No buy data — use notional as proxy (imprecise but better than 0)
-        pnl = notional > 0 ? notional - 0 : sz * px;
-      }
-
-      tradeCount++;
-      if (pnl >= 0) {
-        totalWon += pnl;
-        winCount++;
-      } else {
-        totalLost += Math.abs(pnl);
-        lossCount++;
-      }
-    }
-
-    // Fetch ALL BUY events in the same time range to compute totalVolumeTraded
-    const buyVolumeRows: Array<{ notional: unknown; shares: unknown; price: unknown }> =
-      await prisma.walletActivityEvent.findMany({
-        where: {
-          trackedWalletId: id,
-          eventType: { in: ['BUY', 'TRADE'] },
-          side: 'BUY',
-          ...(sinceMs ? { eventTimestamp: { gte: new Date(sinceMs) } } : {}),
-        },
-        select: { notional: true, shares: true, price: true },
-      });
-
-    for (const b of buyVolumeRows) {
-      const notional = Math.abs(Number(b.notional ?? 0));
-      const sz = Math.abs(Number(b.shares ?? 0));
-      const px = Number(b.price ?? 0);
-      const effNotional = notional > 0 ? notional : sz > 0 && px > 0 ? sz * px : 0;
-      totalVolumeTraded += effNotional;
-    }
-
-    const netPnl = totalWon - totalLost;
-    return {
-      walletId: id,
-      range,
-      since: sinceMs ? new Date(sinceMs).toISOString() : null,
-      netPnl: Math.round(netPnl * 100) / 100,
-      totalWon: Math.round(totalWon * 100) / 100,
-      totalLost: Math.round(totalLost * 100) / 100,
-      totalVolumeTraded: Math.round(totalVolumeTraded * 100) / 100,
-      tradeCount,
-      winCount,
-      lossCount,
-      winRate: tradeCount > 0 ? Math.round((winCount / tradeCount) * 10000) / 100 : 0,
-    };
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -744,7 +541,7 @@ async function fetchAndMergeActivity(
  *   3. marketId:OUTCOME    (fallback when conditionId ≠ marketId in DB)
  *   4. marketId:*          (fully agnostic fallback)
  */
-async function buildCostBasisMaps(
+export async function buildCostBasisMaps(
   prisma: any,
   walletId: string,
   conditionIds: string[],
@@ -846,7 +643,7 @@ function lookupCostBasis(
 // DB fallback: derive CLOSED positions from ingested REDEEM/CLOSE events
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function deriveClosedPositionsFromDb(
+export async function deriveClosedPositionsFromDb(
   prisma: any,
   walletId: string,
 ): Promise<NormalizedPosition[]> {
@@ -981,6 +778,222 @@ async function deriveClosedPositionsFromDb(
   }
 
   return positions;
+}
+
+export async function calculateWalletPnlSummary(
+  prisma: any,
+  walletId: string,
+  opts?: {
+    range?: '1D' | '7D' | '30D' | 'ALL';
+    from?: string;
+    to?: string;
+  },
+): Promise<PnlSummaryResponse> {
+  const range = opts?.range ?? '1D';
+  const wallet = await prisma.watchedWallet.findUnique({
+    where: { id: walletId },
+    select: { id: true },
+  });
+  if (!wallet) throw new Error('Wallet not found');
+
+  const now = Date.now();
+  const HOUR = 3600_000;
+  const sinceMs: number | null =
+    range === '1D'
+      ? now - 24 * HOUR
+      : range === '7D'
+        ? now - 7 * 24 * HOUR
+        : range === '30D'
+          ? now - 30 * 24 * HOUR
+          : null;
+
+  const fromDate = opts?.from ? new Date(opts.from) : sinceMs ? new Date(sinceMs) : null;
+  const toDate = opts?.to ? new Date(opts.to) : null;
+  const window =
+    fromDate || toDate
+      ? {
+          ...(fromDate ? { gte: fromDate } : {}),
+          ...(toDate ? { lte: toDate } : {}),
+        }
+      : null;
+
+  const exitRows: Array<{
+    eventType: string;
+    outcome: string | null;
+    side: string | null;
+    price: unknown;
+    shares: unknown;
+    notional: unknown;
+    marketId: string;
+    conditionId: string | null;
+  }> = await prisma.walletActivityEvent.findMany({
+    where: {
+      trackedWalletId: walletId,
+      eventType: { in: ['SELL', 'REDEEM', 'CLOSE', 'TRADE'] },
+      ...(window ? { eventTimestamp: window } : {}),
+    },
+    select: {
+      eventType: true,
+      outcome: true,
+      side: true,
+      price: true,
+      shares: true,
+      notional: true,
+      marketId: true,
+      conditionId: true,
+    },
+    orderBy: { eventTimestamp: 'asc' },
+  });
+
+  const sells = exitRows.filter((r) => {
+    const et = r.eventType.toUpperCase();
+    const sd = (r.side ?? '').toUpperCase();
+    return et === 'REDEEM' || et === 'CLOSE' || et === 'SELL' || (et === 'TRADE' && sd === 'SELL');
+  });
+
+  const marketIds = [...new Set(sells.map((s) => s.conditionId ?? s.marketId).filter(Boolean))];
+  const avgPriceMap = new Map<string, { size: number; avgPrice: number }>();
+
+  if (marketIds.length > 0) {
+    const buys: Array<{
+      marketId: string;
+      conditionId: string | null;
+      outcome: string | null;
+      shares: unknown;
+      price: unknown;
+    }> = await prisma.walletActivityEvent.findMany({
+      where: {
+        trackedWalletId: walletId,
+        eventType: { in: ['BUY', 'TRADE'] },
+        side: 'BUY',
+        OR: [{ conditionId: { in: marketIds } }, { marketId: { in: marketIds } }],
+      },
+      select: {
+        marketId: true,
+        conditionId: true,
+        outcome: true,
+        shares: true,
+        price: true,
+      },
+      orderBy: { eventTimestamp: 'asc' },
+    });
+
+    for (const b of buys) {
+      const condId = (b.conditionId || b.marketId || '').trim();
+      const mktId = (b.marketId || '').trim();
+      const oc = (b.outcome ?? '').toUpperCase().trim();
+      const sz = Math.abs(Number(b.shares ?? 0));
+      const px = Number(b.price ?? 0);
+      if (sz <= 0 || px <= 0) continue;
+      const keys = [
+        ...(condId && oc ? [`${condId}:${oc}`] : []),
+        ...(condId ? [`${condId}:*`] : []),
+        ...(mktId && mktId !== condId && oc ? [`${mktId}:${oc}`] : []),
+        ...(mktId && mktId !== condId ? [`${mktId}:*`] : []),
+      ];
+      for (const key of keys) {
+        const cur = avgPriceMap.get(key) ?? { size: 0, avgPrice: 0 };
+        const newSize = cur.size + sz;
+        if (newSize > 0) {
+          avgPriceMap.set(key, {
+            size: newSize,
+            avgPrice: (cur.size * cur.avgPrice + sz * px) / newSize,
+          });
+        }
+      }
+    }
+  }
+
+  let totalWon = 0;
+  let totalLost = 0;
+  let tradeCount = 0;
+  let winCount = 0;
+  let lossCount = 0;
+
+  for (const sell of sells) {
+    const et = sell.eventType.toUpperCase();
+    const condId = (sell.conditionId || sell.marketId || '').trim();
+    const mktId = (sell.marketId || '').trim();
+    const outcome = (sell.outcome ?? '').toUpperCase().trim();
+    const sz = Math.abs(Number(sell.shares ?? 0));
+    const px = Number(sell.price ?? 0);
+    const notional = Math.abs(Number(sell.notional ?? 0));
+
+    if (et === 'REDEEM' || et === 'CLOSE') {
+      const payout = notional > 0 ? notional : sz > 0 && px > 0 ? sz * px : sz > 0 ? sz : 0;
+      if (payout > 0) {
+        totalWon += payout;
+        winCount += 1;
+        tradeCount += 1;
+      } else if (sz > 0 || notional === 0) {
+        const entry =
+          avgPriceMap.get(`${condId}:${outcome}`) ??
+          avgPriceMap.get(`${condId}:*`) ??
+          avgPriceMap.get(`${mktId}:${outcome}`) ??
+          avgPriceMap.get(`${mktId}:*`);
+        const cost = (entry?.size ?? sz) * (entry?.avgPrice ?? 0);
+        if (cost > 0) {
+          totalLost += cost;
+          lossCount += 1;
+          tradeCount += 1;
+        }
+      }
+      continue;
+    }
+
+    if (sz <= 0) continue;
+    const entry =
+      avgPriceMap.get(`${condId}:${outcome}`) ??
+      avgPriceMap.get(`${condId}:*`) ??
+      avgPriceMap.get(`${mktId}:${outcome}`) ??
+      avgPriceMap.get(`${mktId}:*`);
+    const avgBuyPrice = entry?.avgPrice ?? 0;
+    const pnl = avgBuyPrice > 0 ? (px - avgBuyPrice) * sz : notional > 0 ? notional : sz * px;
+    tradeCount += 1;
+    if (pnl >= 0) {
+      totalWon += pnl;
+      winCount += 1;
+    } else {
+      totalLost += Math.abs(pnl);
+      lossCount += 1;
+    }
+  }
+
+  let totalVolumeTraded = 0;
+  const buyVolumeRows: Array<{ notional: unknown; shares: unknown; price: unknown }> =
+    await prisma.walletActivityEvent.findMany({
+      where: {
+        trackedWalletId: walletId,
+        eventType: { in: ['BUY', 'TRADE'] },
+        side: 'BUY',
+        ...(window ? { eventTimestamp: window } : {}),
+      },
+      select: { notional: true, shares: true, price: true },
+    });
+
+  for (const b of buyVolumeRows) {
+    const notional = Math.abs(Number(b.notional ?? 0));
+    const sz = Math.abs(Number(b.shares ?? 0));
+    const px = Number(b.price ?? 0);
+    totalVolumeTraded += notional > 0 ? notional : sz > 0 && px > 0 ? sz * px : 0;
+  }
+
+  const netPnl = totalWon - totalLost;
+  return {
+    walletId,
+    range,
+    since: sinceMs ? new Date(sinceMs).toISOString() : null,
+    from: fromDate ? fromDate.toISOString() : null,
+    to: toDate ? toDate.toISOString() : null,
+    netPnl: Math.round(netPnl * 100) / 100,
+    totalWon: Math.round(totalWon * 100) / 100,
+    totalLost: Math.round(totalLost * 100) / 100,
+    totalVolumeTraded: Math.round(totalVolumeTraded * 100) / 100,
+    tradeCount,
+    winCount,
+    lossCount,
+    winRate: tradeCount > 0 ? Math.round((winCount / tradeCount) * 10000) / 100 : 0,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

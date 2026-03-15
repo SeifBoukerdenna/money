@@ -26,12 +26,19 @@ import {
   stopPaperCopySession,
   updatePaperCopySessionGuardrails,
 } from './modules/paper-copy.js';
+import { resolvePaperExecutor } from './modules/paper-executor.js';
+import { materializePaperSessionState } from './modules/paper-accounting.js';
 import { reconcileWalletExposure } from './modules/reconciliation.js';
 import { resolveWalletAddress, shortenAddress } from './modules/wallet-input.js';
 import { getWalletLeaderboard } from './modules/wallet-analytics.js';
 import { registerForceCloseRoutes } from './modules/force-close-routes.js';
 import { listSystemAlerts, raiseSystemAlert } from './modules/system-alerts.js';
-import { registerProfileParityRoutes } from './modules/profile-parity-routes.js';
+import {
+  calculateWalletPnlSummary,
+  deriveClosedPositionsFromDb,
+  registerProfileParityRoutes,
+} from './modules/profile-parity-routes.js';
+import { buildProfileSummary } from './modules/profile-parity.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -69,6 +76,34 @@ const smartConfigSchema = z.object({
 });
 
 const dataAdapter = createPolymarketDataAdapter();
+
+type RiskTier = 'LOW' | 'MEDIUM' | 'HIGH' | 'UNKNOWN';
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function computeSimulationRiskTier(input: {
+  winRatePct: number;
+  netPnl: number;
+  tradeCount: number;
+}): RiskTier {
+  if (input.winRatePct > 60 && input.netPnl > 0 && input.tradeCount > 50) return 'LOW';
+  if (input.winRatePct > 45 && input.netPnl > 0) return 'MEDIUM';
+  if (input.winRatePct < 40 || input.netPnl < 0) return 'HIGH';
+  return 'UNKNOWN';
+}
+
+function formatRelativeTime(input: Date): string {
+  const diffSec = Math.max(0, Math.floor((Date.now() - input.getTime()) / 1000));
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return `${diffHour}h ago`;
+  const diffDay = Math.floor(diffHour / 24);
+  return `${diffDay}d ago`;
+}
 
 async function getLatestIngestionDiagnostic(walletId: string) {
   const row = await prisma.auditLog.findFirst({
@@ -811,6 +846,65 @@ export async function registerRoutes(app: any): Promise<void> {
     return snapshot;
   });
 
+  app.get('/wallets/:id/simulation-intelligence', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const wallet = await prisma.watchedWallet.findUnique({
+      where: { id: params.id },
+      select: { id: true, address: true },
+    });
+    if (!wallet) throw app.httpErrors.notFound('Wallet not found');
+
+    let livePositionsValueUsd = 0;
+    try {
+      const livePositions: Array<Record<string, unknown>> = await dataAdapter.getWalletPositions(
+        wallet.address,
+        'OPEN',
+        500,
+      );
+      for (const p of livePositions) {
+        livePositionsValueUsd +=
+          Number(p.size ?? 0) * Number(p.currentPrice ?? p.curPrice ?? p.price ?? 0);
+      }
+    } catch {
+      livePositionsValueUsd = 0;
+    }
+
+    const [summary, pnlAll, pnl30d] = await Promise.all([
+      buildProfileSummary(wallet.id, livePositionsValueUsd),
+      calculateWalletPnlSummary(prisma, wallet.id, { range: 'ALL' }),
+      calculateWalletPnlSummary(prisma, wallet.id, { range: '30D' }),
+    ]);
+
+    const riskTier = computeSimulationRiskTier({
+      winRatePct: pnlAll.winRate,
+      netPnl: pnlAll.netPnl,
+      tradeCount: pnlAll.tradeCount,
+    });
+
+    const suggestedCopyRatio =
+      riskTier === 'LOW' ? 1 : riskTier === 'MEDIUM' ? 0.5 : riskTier === 'HIGH' ? 0.25 : 0.5;
+    const suggestedStartingCash = clamp(summary.positionsValueUsd * suggestedCopyRatio, 500, 50000);
+
+    const suggestionReason =
+      riskTier === 'LOW'
+        ? 'Strong historical edge and sample size support full 1.0x copy sizing.'
+        : riskTier === 'MEDIUM'
+          ? 'Positive performance with moderate confidence; sizing reduced to 0.5x.'
+          : riskTier === 'HIGH'
+            ? 'Weak/negative performance risk detected; sizing reduced to 0.25x.'
+            : 'Uncertain profile; using neutral 0.5x sizing.';
+
+    return {
+      summary,
+      pnlAll,
+      pnl30d,
+      suggestedCopyRatio,
+      suggestedStartingCash: Math.round(suggestedStartingCash * 100) / 100,
+      suggestionReason,
+      riskTier,
+    };
+  });
+
   // ---------------------------------------------------------------------------
   // Trades
   // ---------------------------------------------------------------------------
@@ -1273,9 +1367,10 @@ export async function registerRoutes(app: any): Promise<void> {
       .object({
         trackedWalletId: z.string().uuid(),
         startingCash: z.number().positive().optional(),
+        copyRatio: z.number().positive().max(2).optional(),
         maxAllocationPerMarket: z.number().positive().optional(),
         maxTotalExposure: z.number().positive().optional(),
-        minNotionalThreshold: z.number().positive().optional(),
+        minNotionalThreshold: z.number().nonnegative().optional(),
         minWalletTrades: z.number().int().min(0).max(100000).optional(),
         minWalletWinRate: z.number().min(0).max(1).optional(),
         minWalletSharpeLike: z.number().min(-5).max(10).optional(),
@@ -1289,6 +1384,7 @@ export async function registerRoutes(app: any): Promise<void> {
     return createPaperCopySession({
       trackedWalletId: body.trackedWalletId,
       ...(body.startingCash !== undefined ? { startingCash: body.startingCash } : {}),
+      ...(body.copyRatio !== undefined ? { copyRatio: body.copyRatio } : {}),
       ...(body.maxAllocationPerMarket !== undefined
         ? { maxAllocationPerMarket: body.maxAllocationPerMarket }
         : {}),
@@ -1480,6 +1576,661 @@ export async function registerRoutes(app: any): Promise<void> {
     return result;
   });
 
+  app.post('/paper-copy-sessions/:id/replicate-missed-trades', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const body = z
+      .object({
+        decisionIds: z.array(z.string().uuid()).optional(),
+      })
+      .parse(req.body ?? {});
+
+    const session = await db.paperCopySession.findUnique({ where: { id: params.id } });
+    if (!session) throw app.httpErrors.notFound('Session not found');
+
+    const skipWhere: Record<string, unknown> = {
+      sessionId: params.id,
+      status: 'SKIPPED',
+      decisionType: 'SKIP',
+    };
+    if (body.decisionIds && body.decisionIds.length > 0) {
+      skipWhere.id = { in: body.decisionIds };
+    }
+
+    const skipped = await db.paperCopyDecision.findMany({
+      where: skipWhere,
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    });
+
+    const executor = resolvePaperExecutor('PAPER');
+    const ratio = session.copyRatio !== null ? Number(session.copyRatio) : 1;
+
+    let attempted = 0;
+    let executed = 0;
+    let failed = 0;
+    let skippedInvalid = 0;
+
+    for (const src of skipped) {
+      const sourceShares = src.sourceShares !== null ? Number(src.sourceShares) : 0;
+      const sourcePrice = src.sourcePrice !== null ? Number(src.sourcePrice) : 0;
+      const marketId = src.marketId;
+      const outcome = src.outcome;
+      const side = src.side;
+
+      if (!marketId || !outcome || !side || sourceShares <= 0 || sourcePrice <= 0) {
+        skippedInvalid += 1;
+        continue;
+      }
+
+      const simulatedShares = sourceShares * ratio;
+      if (simulatedShares <= 0) {
+        skippedInvalid += 1;
+        continue;
+      }
+
+      attempted += 1;
+
+      const decision = await db.paperCopyDecision.create({
+        data: {
+          sessionId: session.id,
+          trackedWalletId: session.trackedWalletId,
+          walletAddress: session.trackedWalletAddress,
+          sourceActivityEventId: null,
+          sourceEventTimestamp: src.sourceEventTimestamp ?? src.createdAt,
+          sourceTxHash: src.sourceTxHash,
+          decisionType: 'COPY',
+          status: 'PENDING',
+          executorType: 'PAPER',
+          marketId,
+          marketQuestion: src.marketQuestion,
+          outcome,
+          side,
+          sourceShares,
+          simulatedShares,
+          sourcePrice,
+          intendedFillPrice: sourcePrice,
+          copyRatio: ratio,
+          sizingInputsJson: {
+            replicatedFromDecisionId: src.id,
+            sourceDecisionType: src.decisionType,
+          },
+          reasonCode: 'MANUAL_REPLICATE_MISSED',
+          humanReason: 'User requested replication of a previously skipped source trade.',
+          riskChecksJson: {},
+          notes: `REPLICATE_MISSED:${src.id}`,
+        },
+      });
+
+      const result = await executor.execute({
+        session: {
+          id: session.id,
+          trackedWalletId: session.trackedWalletId,
+          trackedWalletAddress: session.trackedWalletAddress,
+          feeBps: session.feeBps,
+          slippageBps: session.slippageBps,
+        },
+        decision,
+      });
+
+      await db.paperCopyDecision.update({
+        where: { id: decision.id },
+        data: {
+          status: result.status,
+          reasonCode: result.reasonCode,
+          humanReason: result.humanReason,
+          executionError: result.errorMessage,
+        },
+      });
+
+      if (result.status === 'EXECUTED') {
+        executed += 1;
+      } else {
+        failed += 1;
+      }
+    }
+
+    if (executed > 0) {
+      await materializePaperSessionState(session.id);
+    }
+
+    return {
+      attempted,
+      executed,
+      failed,
+      skippedInvalid,
+      totalCandidates: skipped.length,
+    };
+  });
+
+  app.post('/paper-copy-sessions/:id/bootstrap-missing', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const body = z
+      .object({
+        positions: z
+          .array(
+            z.object({
+              marketId: z.string().min(1),
+              outcome: z.string().min(1),
+              marketQuestion: z.string().optional(),
+              sourceShares: z.number().positive(),
+              sourceCurrent: z.number().nonnegative(),
+            }),
+          )
+          .max(500)
+          .default([]),
+      })
+      .parse(req.body ?? {});
+
+    const session = await db.paperCopySession.findUnique({ where: { id: params.id } });
+    if (!session) throw app.httpErrors.notFound('Session not found');
+
+    const executor = resolvePaperExecutor('PAPER');
+    const ratio = session.copyRatio !== null ? Number(session.copyRatio) : 1;
+    const now = new Date();
+
+    let attempted = 0;
+    let executed = 0;
+
+    for (const pos of body.positions) {
+      const existing = await db.paperCopyPosition.findFirst({
+        where: {
+          sessionId: params.id,
+          status: 'OPEN',
+          marketId: pos.marketId,
+          outcome: pos.outcome.toUpperCase(),
+        },
+        select: { id: true },
+      });
+      if (existing) continue;
+
+      const shares = pos.sourceShares * ratio;
+      const price = pos.sourceCurrent;
+      if (shares <= 0 || price <= 0) continue;
+
+      attempted += 1;
+      const decision = await db.paperCopyDecision.create({
+        data: {
+          sessionId: session.id,
+          trackedWalletId: session.trackedWalletId,
+          walletAddress: session.trackedWalletAddress,
+          sourceActivityEventId: null,
+          sourceEventTimestamp: now,
+          sourceTxHash: null,
+          decisionType: 'BOOTSTRAP',
+          status: 'PENDING',
+          executorType: 'PAPER',
+          marketId: pos.marketId,
+          marketQuestion: pos.marketQuestion ?? null,
+          outcome: pos.outcome.toUpperCase(),
+          side: 'BUY',
+          sourceShares: pos.sourceShares,
+          simulatedShares: shares,
+          sourcePrice: price,
+          intendedFillPrice: price,
+          copyRatio: ratio,
+          sizingInputsJson: { source: 'bootstrap_missing' },
+          reasonCode: 'BOOTSTRAP_EXISTING_POSITION',
+          humanReason: 'Bootstrapping missing source position into paper session.',
+          riskChecksJson: {},
+          notes: 'BOOTSTRAP_MISSING_POSITION',
+        },
+      });
+
+      const result = await executor.execute({
+        session: {
+          id: session.id,
+          trackedWalletId: session.trackedWalletId,
+          trackedWalletAddress: session.trackedWalletAddress,
+          feeBps: session.feeBps,
+          slippageBps: session.slippageBps,
+        },
+        decision,
+      });
+
+      await db.paperCopyDecision.update({
+        where: { id: decision.id },
+        data: {
+          status: result.status,
+          reasonCode: result.reasonCode,
+          humanReason: result.humanReason,
+          executionError: result.errorMessage,
+        },
+      });
+
+      if (result.status === 'EXECUTED') executed += 1;
+    }
+
+    if (executed > 0) {
+      await materializePaperSessionState(session.id);
+    }
+
+    return { attempted, executed };
+  });
+
+  app.get('/paper-copy-sessions/comparison', async () => {
+    const sessions = await db.paperCopySession.findMany({
+      include: {
+        trackedWallet: { select: { id: true, label: true, address: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const rows = await Promise.all(
+      sessions.map(async (s: Record<string, unknown>) => {
+        const sessionId = String(s.id);
+        const walletId = String(s.trackedWalletId);
+        const startedAt = s.startedAt instanceof Date ? s.startedAt : null;
+
+        const [latestSnapshot, openCount, sourcePnlAll, sourcePnlWindow, latestWalletSnap] =
+          await Promise.all([
+            db.paperPortfolioSnapshot.findFirst({
+              where: { sessionId },
+              orderBy: { timestamp: 'desc' },
+              select: {
+                netLiquidationValue: true,
+                totalPnl: true,
+                returnPct: true,
+                realizedPnl: true,
+              },
+            }),
+            db.paperCopyPosition.count({ where: { sessionId, status: 'OPEN' } }),
+            calculateWalletPnlSummary(prisma, walletId, { range: 'ALL' }),
+            startedAt
+              ? calculateWalletPnlSummary(prisma, walletId, {
+                  range: 'ALL',
+                  from: startedAt.toISOString(),
+                  to: new Date().toISOString(),
+                })
+              : null,
+            prisma.walletAnalyticsSnapshot.findFirst({
+              where: { walletId },
+              orderBy: { createdAt: 'desc' },
+              select: { winRate: true, realizedPnl: true },
+            }),
+          ]);
+
+        const sourceNetPnl = sourcePnlWindow?.netPnl ?? sourcePnlAll.netPnl;
+        const totalPnl = latestSnapshot ? Number(latestSnapshot.totalPnl) : 0;
+        const trackingEfficiencyPct = sourceNetPnl !== 0 ? (totalPnl / sourceNetPnl) * 100 : null;
+
+        const trackedWallet = s.trackedWallet as { id: string; label: string; address: string };
+        return {
+          id: sessionId,
+          walletId,
+          walletLabel: trackedWallet.label,
+          walletAddress: trackedWallet.address,
+          status: String(s.status),
+          startingCash: Number(s.startingCash),
+          copyRatio: s.copyRatio !== null ? Number(s.copyRatio) : 0,
+          currentNlv: latestSnapshot
+            ? Number(latestSnapshot.netLiquidationValue)
+            : Number(s.currentCash),
+          totalPnl,
+          returnPct: latestSnapshot ? Number(latestSnapshot.returnPct) : 0,
+          realizedPnl: latestSnapshot ? Number(latestSnapshot.realizedPnl) : 0,
+          openPositionsCount: openCount,
+          lastActivity: s.lastProcessedEventAt
+            ? (s.lastProcessedEventAt as Date).toISOString()
+            : null,
+          sourceWinRate:
+            latestWalletSnap?.winRate != null ? Number(latestWalletSnap.winRate) : null,
+          sourceNetPnl:
+            latestWalletSnap?.realizedPnl != null ? Number(latestWalletSnap.realizedPnl) : null,
+          trackingEfficiencyPct,
+        };
+      }),
+    );
+
+    rows.sort((a, b) => b.returnPct - a.returnPct);
+    return { sessions: rows };
+  });
+
+  app.get('/paper-copy-sessions/:id/live-feed', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(100).default(50),
+      })
+      .parse(req.query ?? {});
+
+    const session = await db.paperCopySession.findUnique({ where: { id: params.id } });
+    if (!session) throw app.httpErrors.notFound('Session not found');
+
+    const sessionStart = (session.startedAt as Date | null) ?? (session.createdAt as Date);
+
+    const sourceEvents: Array<Record<string, unknown>> = await db.walletActivityEvent.findMany({
+      where: {
+        trackedWalletId: session.trackedWalletId,
+        eventTimestamp: { gte: sessionStart },
+      },
+      orderBy: { eventTimestamp: 'desc' },
+      take: 100,
+      select: {
+        id: true,
+        externalEventId: true,
+        eventType: true,
+        marketId: true,
+        marketQuestion: true,
+        outcome: true,
+        shares: true,
+        price: true,
+        notional: true,
+        txHash: true,
+        eventTimestamp: true,
+      },
+    });
+
+    const sourceEventIds = sourceEvents.map((e) => String(e.id));
+
+    const [decisions, openPositions, closedPositions] = await Promise.all([
+      sourceEventIds.length > 0
+        ? db.paperCopyDecision.findMany({
+            where: {
+              sessionId: params.id,
+              sourceActivityEventId: { in: sourceEventIds },
+            },
+            include: {
+              trades: {
+                orderBy: { eventTimestamp: 'desc' },
+                take: 1,
+              },
+            },
+          })
+        : Promise.resolve([]),
+      db.paperCopyPosition.findMany({
+        where: { sessionId: params.id, status: 'OPEN' },
+        select: { marketId: true, outcome: true, netShares: true },
+      }),
+      db.paperCopyPosition.findMany({
+        where: { sessionId: params.id, status: 'CLOSED' },
+        select: { marketId: true, outcome: true, realizedPnl: true },
+      }),
+    ]);
+
+    const decisionBySourceId = new Map<string, Record<string, unknown>>();
+    for (const d of decisions as Array<Record<string, unknown>>) {
+      const sourceId = d.sourceActivityEventId ? String(d.sourceActivityEventId) : null;
+      if (!sourceId) continue;
+      decisionBySourceId.set(sourceId, d);
+    }
+
+    const openByKey = new Map<string, { netShares: number }>();
+    for (const p of openPositions as Array<Record<string, unknown>>) {
+      openByKey.set(`${String(p.marketId)}:${String(p.outcome).toUpperCase()}`, {
+        netShares: Number(p.netShares ?? 0),
+      });
+    }
+
+    const closedByKey = new Map<string, { realizedPnl: number }>();
+    for (const p of closedPositions as Array<Record<string, unknown>>) {
+      closedByKey.set(`${String(p.marketId)}:${String(p.outcome).toUpperCase()}`, {
+        realizedPnl: Number(p.realizedPnl ?? 0),
+      });
+    }
+
+    const items = sourceEvents
+      .map((event) => {
+        const eventTs = event.eventTimestamp as Date;
+        const marketId = String(event.marketId ?? '');
+        const outcome = event.outcome ? String(event.outcome).toUpperCase() : null;
+        const key = outcome ? `${marketId}:${outcome}` : null;
+        const decision = decisionBySourceId.get(String(event.id));
+        const decisionStatus = decision?.status ? String(decision.status) : null;
+        const decisionType = decision?.decisionType ? String(decision.decisionType) : null;
+        const decisionTrades =
+          (decision?.trades as Array<Record<string, unknown>> | undefined) ?? [];
+        const latestTrade = decisionTrades[0];
+        const tradeAction = latestTrade?.action ? String(latestTrade.action) : '';
+
+        let ourAction: 'COPIED' | 'SKIPPED' | 'AUTO_CLOSED' | 'OPEN' | null = null;
+        if (decisionStatus === 'SKIPPED') {
+          ourAction = 'SKIPPED';
+        } else if (decisionStatus === 'EXECUTED') {
+          if (
+            decisionType === 'CLOSE' ||
+            decisionType === 'REDUCE' ||
+            tradeAction.includes('CLOSE') ||
+            tradeAction.includes('REDEEM')
+          ) {
+            ourAction = 'AUTO_CLOSED';
+          } else {
+            ourAction = 'COPIED';
+          }
+        } else if (key && openByKey.has(key)) {
+          ourAction = 'OPEN';
+        }
+
+        const fallbackAmount =
+          Number(event.notional ?? 0) > 0
+            ? Number(event.notional)
+            : Number(event.shares ?? 0) * Number(event.price ?? 0);
+
+        return {
+          id: String(event.id),
+          sourceEventId: event.externalEventId ? String(event.externalEventId) : null,
+          eventType: String(event.eventType ?? 'UNKNOWN').toUpperCase(),
+          market: String(event.marketQuestion ?? event.marketId ?? 'Unknown market'),
+          outcome,
+          shares: event.shares !== null ? Number(event.shares ?? 0) : null,
+          price: event.price !== null ? Number(event.price ?? 0) : null,
+          amountUsd: Number.isFinite(fallbackAmount) ? fallbackAmount : null,
+          relativeTime: formatRelativeTime(eventTs),
+          eventTimestamp: eventTs.toISOString(),
+          ourAction,
+          ourPnl:
+            ourAction === 'AUTO_CLOSED' && key ? (closedByKey.get(key)?.realizedPnl ?? null) : null,
+          ourAmountUsd:
+            latestTrade?.notional != null && Number.isFinite(Number(latestTrade.notional))
+              ? Number(latestTrade.notional)
+              : null,
+          ourShares:
+            decision?.simulatedShares != null
+              ? Number(decision.simulatedShares)
+              : latestTrade?.simulatedShares != null
+                ? Number(latestTrade.simulatedShares)
+                : null,
+          skipReason:
+            ourAction === 'SKIPPED'
+              ? decision?.humanReason
+                ? String(decision.humanReason)
+                : String(decision?.reasonCode ?? 'SKIPPED')
+              : null,
+          txHash: event.txHash ? String(event.txHash) : null,
+        };
+      })
+      .sort((a, b) => new Date(b.eventTimestamp).getTime() - new Date(a.eventTimestamp).getTime())
+      .slice(0, query.limit);
+
+    return { items };
+  });
+
+  app.get('/paper-copy-sessions/:id/position-coverage', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const session = await db.paperCopySession.findUnique({ where: { id: params.id } });
+    if (!session) throw app.httpErrors.notFound('Session not found');
+
+    const [sourceRaw, paperOpen] = await Promise.all([
+      dataAdapter.getWalletPositions(session.trackedWalletAddress, 'OPEN', 500),
+      db.paperCopyPosition.findMany({ where: { sessionId: params.id, status: 'OPEN' } }),
+    ]);
+
+    const paperByKey = new Map<
+      string,
+      { netShares: number; avgEntryPrice: number; currentMarkPrice: number }
+    >();
+    for (const p of paperOpen as Array<Record<string, unknown>>) {
+      const key = `${String(p.marketId)}:${String(p.outcome).toUpperCase()}`;
+      paperByKey.set(key, {
+        netShares: Number(p.netShares),
+        avgEntryPrice: Number(p.avgEntryPrice),
+        currentMarkPrice: Number(p.currentMarkPrice),
+      });
+    }
+
+    const positions = (sourceRaw as Array<Record<string, unknown>>).map((s) => {
+      const marketId = String(s.conditionId ?? s.marketId ?? '');
+      const outcome = String(s.outcome ?? 'UNKNOWN').toUpperCase();
+      const sourceShares = Number(s.size ?? 0);
+      const sourceCurrent = Number(s.currentPrice ?? s.curPrice ?? s.price ?? 0);
+      const sourceAvg = Number(s.avgPrice ?? s.price ?? 0);
+      const sourceValue = sourceShares * sourceCurrent;
+      const sourcePnlPct = sourceAvg > 0 ? ((sourceCurrent - sourceAvg) / sourceAvg) * 100 : 0;
+      const paper = paperByKey.get(`${marketId}:${outcome}`) ?? null;
+      const coverageRatio = paper && sourceShares > 0 ? paper.netShares / sourceShares : null;
+      const status =
+        coverageRatio == null
+          ? 'MISSING'
+          : coverageRatio >= 0.8
+            ? 'MATCHED'
+            : coverageRatio > 0
+              ? 'PARTIAL'
+              : 'MISSING';
+      return {
+        marketId,
+        marketQuestion: String(s.title ?? s.marketQuestion ?? marketId),
+        outcome,
+        sourceShares,
+        sourceCurrent,
+        sourceValue,
+        sourcePnlPct,
+        paperShares: paper ? paper.netShares : null,
+        paperAvgPrice: paper ? paper.avgEntryPrice : null,
+        paperValue: paper ? paper.netShares * paper.currentMarkPrice : 0,
+        coverageRatio,
+        status,
+      };
+    });
+
+    const totalSourceValueUsd = positions.reduce((sum, p) => sum + p.sourceValue, 0);
+    const coveredValueUsd = positions.reduce((sum, p) => {
+      if (p.status === 'MISSING') return sum;
+      return sum + Math.min(p.sourceValue, p.paperValue);
+    }, 0);
+    const coveragePct = totalSourceValueUsd > 0 ? (coveredValueUsd / totalSourceValueUsd) * 100 : 0;
+
+    return {
+      coveragePct,
+      totalSourceValueUsd,
+      coveredValueUsd,
+      positions,
+    };
+  });
+
+  app.get('/paper-copy-sessions/:id/enriched-timeline', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const session = await db.paperCopySession.findUnique({ where: { id: params.id } });
+    if (!session) throw app.httpErrors.notFound('Session not found');
+
+    const [decisions, closedSource, openSource, paperPositions] = await Promise.all([
+      db.paperCopyDecision.findMany({
+        where: { sessionId: params.id },
+        include: {
+          sourceActivityEvent: true,
+          trades: {
+            orderBy: { eventTimestamp: 'desc' },
+            take: 1,
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      deriveClosedPositionsFromDb(prisma, session.trackedWalletId),
+      dataAdapter.getWalletPositions(session.trackedWalletAddress, 'OPEN', 500),
+      db.paperCopyPosition.findMany({ where: { sessionId: params.id } }),
+    ]);
+
+    const closedByKey = new Map<
+      string,
+      { resolution: string | null; valueUsd: number; totalTraded: number; pnlUsd: number }
+    >();
+    for (const c of closedSource) {
+      closedByKey.set(`${c.conditionId}:${c.outcome.toUpperCase()}`, {
+        resolution: c.resolution,
+        valueUsd: c.valueUsd,
+        totalTraded: c.totalTraded,
+        pnlUsd: c.pnlUsd,
+      });
+    }
+    const openByKey = new Map<string, number>();
+    for (const o of openSource as Array<Record<string, unknown>>) {
+      openByKey.set(
+        `${String(o.conditionId ?? o.marketId ?? '')}:${String(o.outcome ?? '').toUpperCase()}`,
+        Number(o.currentPrice ?? o.curPrice ?? o.price ?? 0),
+      );
+    }
+    const paperByKey = new Map<string, { realizedPnl: number; unrealizedPnl: number }>();
+    for (const p of paperPositions as Array<Record<string, unknown>>) {
+      paperByKey.set(`${String(p.marketId)}:${String(p.outcome).toUpperCase()}`, {
+        realizedPnl: Number(p.realizedPnl ?? 0),
+        unrealizedPnl: Number(p.unrealizedPnl ?? 0),
+      });
+    }
+
+    const rows = decisions.map((d: Record<string, unknown>) => {
+      const marketId = d.marketId ? String(d.marketId) : null;
+      const outcome = d.outcome ? String(d.outcome).toUpperCase() : null;
+      const key = marketId && outcome ? `${marketId}:${outcome}` : null;
+      const closed = key ? (closedByKey.get(key) ?? null) : null;
+      const openPrice = key ? (openByKey.get(key) ?? null) : null;
+      const sourcePrice = d.sourcePrice != null ? Number(d.sourcePrice) : null;
+      const shares = d.sourceShares != null ? Number(d.sourceShares) : null;
+      const side = d.side ? String(d.side) : null;
+
+      const currentPrice = closed
+        ? closed.resolution === 'WON'
+          ? 1
+          : closed.resolution === 'LOST'
+            ? 0
+            : null
+        : openPrice;
+
+      let sourcePnl: number | null = null;
+      if (closed) {
+        sourcePnl = closed.pnlUsd;
+      } else if (currentPrice != null && sourcePrice != null && shares != null && side) {
+        const dir = side === 'SELL' ? -1 : 1;
+        sourcePnl = dir * shares * (currentPrice - sourcePrice);
+      }
+
+      const paper = key ? (paperByKey.get(key) ?? null) : null;
+      const status = String(d.status) as 'EXECUTED' | 'SKIPPED' | 'FAILED';
+      return {
+        id: String(d.id),
+        decisionType: String(d.decisionType),
+        status,
+        marketId,
+        marketQuestion: d.marketQuestion ? String(d.marketQuestion) : null,
+        outcome,
+        sourceOutcome: {
+          status: closed
+            ? closed.resolution === 'WON'
+              ? 'WON'
+              : closed.resolution === 'LOST'
+                ? 'LOST'
+                : 'UNKNOWN'
+            : currentPrice != null
+              ? 'OPEN'
+              : 'UNKNOWN',
+          currentPrice,
+          pnlUsd: sourcePnl,
+          totalTraded: closed ? closed.totalTraded : null,
+          amountWon: closed ? closed.valueUsd : null,
+        },
+        paperOutcome: {
+          realizedPnl: paper ? paper.realizedPnl : null,
+          unrealizedPnl: paper ? paper.unrealizedPnl : null,
+          status,
+        },
+        counterfactualPnl: String(d.decisionType) === 'SKIP' ? sourcePnl : null,
+        createdAt: d.createdAt,
+      };
+    });
+
+    rows.sort(
+      (a, b) => Math.abs(b.sourceOutcome.pnlUsd ?? 0) - Math.abs(a.sourceOutcome.pnlUsd ?? 0),
+    );
+    return { items: rows };
+  });
+
   app.get('/paper-copy-sessions', async () => {
     const rows = await db.paperCopySession.findMany({
       orderBy: { createdAt: 'desc' },
@@ -1492,11 +2243,24 @@ export async function registerRoutes(app: any): Promise<void> {
     // Attach latest PnL from snapshot to the list view
     return Promise.all(
       rows.map(async (row: any) => {
-        const latestSnapshot = await db.paperPortfolioSnapshot.findFirst({
-          where: { sessionId: row.id },
-          orderBy: { timestamp: 'desc' },
-          select: { totalPnl: true, returnPct: true, netLiquidationValue: true },
-        });
+        const [latestSnapshot, closedRows] = await Promise.all([
+          db.paperPortfolioSnapshot.findFirst({
+            where: { sessionId: row.id },
+            orderBy: { timestamp: 'desc' },
+            select: { totalPnl: true, returnPct: true, netLiquidationValue: true },
+          }),
+          db.paperCopyPosition.findMany({
+            where: { sessionId: row.id, status: 'CLOSED' },
+            select: { realizedPnl: true },
+          }),
+        ]);
+
+        const winCount = (closedRows as Array<Record<string, unknown>>).filter(
+          (p) => Number(p.realizedPnl ?? 0) > 0,
+        ).length;
+        const lossCount = closedRows.length - winCount;
+        const winRatePct = winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0;
+
         return {
           id: row.id,
           trackedWalletId: row.trackedWalletId,
@@ -1509,6 +2273,9 @@ export async function registerRoutes(app: any): Promise<void> {
           endedAt: row.endedAt,
           createdAt: row.createdAt,
           lastProcessedEventAt: row.lastProcessedEventAt,
+          estimatedSourceExposure:
+            row.estimatedSourceExposure !== null ? Number(row.estimatedSourceExposure) : null,
+          copyRatio: row.copyRatio !== null ? Number(row.copyRatio) : null,
           minWalletTrades: row.minWalletTrades,
           minWalletWinRate: row.minWalletWinRate !== null ? Number(row.minWalletWinRate) : null,
           minWalletSharpeLike:
@@ -1523,6 +2290,7 @@ export async function registerRoutes(app: any): Promise<void> {
           netLiquidationValue: latestSnapshot
             ? Number(latestSnapshot.netLiquidationValue)
             : Number(row.currentCash),
+          winRatePct,
           tradesCount: row._count.trades,
           positionsCount: row._count.positions,
         };
@@ -1538,12 +2306,16 @@ export async function registerRoutes(app: any): Promise<void> {
     });
     if (!row) throw app.httpErrors.notFound('Session not found');
 
-    const [latestSnapshot, openCount] = await Promise.all([
+    const [latestSnapshot, openCount, closedRows] = await Promise.all([
       db.paperPortfolioSnapshot.findFirst({
         where: { sessionId: row.id },
         orderBy: { timestamp: 'desc' },
       }),
       db.paperCopyPosition.count({ where: { sessionId: row.id, status: 'OPEN' } }),
+      db.paperCopyPosition.findMany({
+        where: { sessionId: row.id, status: 'CLOSED' },
+        select: { realizedPnl: true },
+      }),
     ]);
 
     const nlv = latestSnapshot
@@ -1551,6 +2323,11 @@ export async function registerRoutes(app: any): Promise<void> {
       : Number(row.currentCash);
     const totalPnl = latestSnapshot ? Number(latestSnapshot.totalPnl) : 0;
     const returnPct = latestSnapshot ? Number(latestSnapshot.returnPct) : 0;
+    const winCount = (closedRows as Array<Record<string, unknown>>).filter(
+      (p) => Number(p.realizedPnl ?? 0) > 0,
+    ).length;
+    const lossCount = closedRows.length - winCount;
+    const winRatePct = winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0;
 
     return {
       id: row.id,
@@ -1579,6 +2356,9 @@ export async function registerRoutes(app: any): Promise<void> {
       netLiquidationValue: nlv,
       totalPnl,
       returnPct,
+      winCount,
+      lossCount,
+      winRatePct,
       summarySentence:
         totalPnl >= 0
           ? `Hypothetically, copying this wallet since session start would have made $${totalPnl.toFixed(2)} (+${returnPct.toFixed(2)}%).`
@@ -1609,9 +2389,52 @@ export async function registerRoutes(app: any): Promise<void> {
 
   app.get('/paper-copy-sessions/:id/analytics', async (req: any) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
-    const result = await getPaperCopySessionAnalytics(params.id);
-    if (!result) throw app.httpErrors.notFound('Session not found');
-    return result;
+    const [result, session, closedPositions] = await Promise.all([
+      getPaperCopySessionAnalytics(params.id),
+      db.paperCopySession.findUnique({ where: { id: params.id } }),
+      db.paperCopyPosition.findMany({ where: { sessionId: params.id, status: 'CLOSED' } }),
+    ]);
+    if (!result || !session) throw app.httpErrors.notFound('Session not found');
+
+    const startedAt = session.startedAt ? (session.startedAt as Date).toISOString() : null;
+    const sourceWindow = startedAt
+      ? await calculateWalletPnlSummary(prisma, session.trackedWalletId, {
+          range: 'ALL',
+          from: startedAt,
+          to: new Date().toISOString(),
+        })
+      : await calculateWalletPnlSummary(prisma, session.trackedWalletId, { range: 'ALL' });
+
+    const paperWins = (closedPositions as Array<Record<string, unknown>>).filter(
+      (p) => Number(p.currentMarkPrice ?? 0) >= 0.95,
+    ).length;
+    const paperWinRate =
+      closedPositions.length > 0 ? (paperWins / closedPositions.length) * 100 : 0;
+    const paperRealizedPnl = (closedPositions as Array<Record<string, unknown>>).reduce(
+      (sum, p) => sum + Number(p.realizedPnl ?? 0),
+      0,
+    );
+    const trackingEfficiencyPct =
+      sourceWindow.netPnl !== 0 ? (paperRealizedPnl / sourceWindow.netPnl) * 100 : 0;
+
+    return {
+      ...result,
+      sourceComparison: {
+        sourceWinRate: sourceWindow.winRate,
+        paperWinRate,
+        sourceRealizedPnl: sourceWindow.netPnl,
+        paperRealizedPnl,
+        trackingEfficiencyPct,
+        sessionStartDate: startedAt ?? new Date(session.createdAt as Date).toISOString(),
+        periodLabel: `Since ${new Date(
+          startedAt ?? (session.createdAt as Date).toISOString(),
+        ).toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        })}`,
+      },
+    };
   });
 
   app.get('/paper-copy-sessions/:id/positions', async (req: any) => {

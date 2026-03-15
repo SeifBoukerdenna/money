@@ -27,6 +27,7 @@ import { incrementDuplicatePollSkip } from './runtime-ops.js';
 const dataAdapter = createPolymarketDataAdapter();
 const SOURCE_NAME = 'POLYMARKET_DATA_API';
 const SOURCE_TYPE = 'HTTP_API';
+const NON_MARKET_TYPES = new Set(['MERGE', 'SPLIT', 'DEPOSIT', 'WITHDRAW', 'CONVERT', 'TRANSFER']);
 
 const MAX_MONITOR_CONCURRENCY = 30;
 const hexWalletRegex = /^0x[a-fA-F0-9]{40}$/;
@@ -125,6 +126,17 @@ function safeObservedAtIso(value: string | null | undefined): string {
 
 function computeRawPayloadHash(payload: Prisma.InputJsonValue): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function sanitizeForPg(v: unknown): unknown {
+  if (typeof v === 'string') return v.replace(/\u0000/g, '');
+  if (Array.isArray(v)) return v.map(sanitizeForPg);
+  if (v !== null && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, sanitizeForPg(val)]),
+    );
+  }
+  return v;
 }
 
 async function getOrCreateCursor(walletId: string): Promise<CursorState> {
@@ -500,11 +512,10 @@ export async function processWalletPoll(walletId: string, address: string): Prom
         continue;
       }
       if (!event.marketId || event.marketId.trim().length === 0) {
-        summary.parseErrors += 1;
-        logger.warn(
-          { walletId, externalEventId: event.externalEventId ?? null },
-          'skipping event with missing marketId',
-        );
+        if (!NON_MARKET_TYPES.has(event.eventType.toUpperCase())) {
+          summary.parseErrors += 1;
+          logger.warn({ walletId, eventType: event.eventType }, 'trade event missing marketId');
+        }
         continue;
       }
       const dedupeKey = buildActivityDedupeKey(event);
@@ -514,7 +525,7 @@ export async function processWalletPoll(walletId: string, address: string): Prom
 
       let activityRow: { id: string } | null = null;
       try {
-        const rawPayloadJson = event.rawPayload as Prisma.InputJsonValue;
+        const rawPayloadJson = sanitizeForPg(event.rawPayload) as Prisma.InputJsonValue;
         const rawPayloadHash = computeRawPayloadHash(rawPayloadJson);
 
         activityRow = await prisma.walletActivityEvent.create({
@@ -593,7 +604,9 @@ export async function processWalletPoll(walletId: string, address: string): Prom
             sourceEventId: sourceEventIdForTradeEvent(event, dedupeKey),
             sourceWalletAddress: event.walletAddress,
             marketId: event.marketId,
-            marketQuestion: event.marketQuestion,
+            marketQuestion: event.marketQuestion
+              ? (sanitizeForPg(event.marketQuestion) as string)
+              : null,
             outcome: event.outcome ?? 'UNKNOWN',
             side: event.side!,
             size: event.shares!,
@@ -696,7 +709,7 @@ export async function processWalletPoll(walletId: string, address: string): Prom
     }
 
     const nextInterval = computeNextPollIntervalMs(activeTier === 'ACTIVE');
-    const hasHardFailures = summary.dbInsertErrors > 0 || summary.parseErrors > 0;
+    const hasHardFailures = summary.dbInsertErrors > 0;
     const hasWarnings = summary.decisionEnqueueErrors > 0;
     summary.warnings = hasWarnings ? 1 : 0;
     const outcome: 'SUCCESS' | 'PARTIAL' = hasHardFailures || hasWarnings ? 'PARTIAL' : 'SUCCESS';
@@ -714,7 +727,9 @@ export async function processWalletPoll(walletId: string, address: string): Prom
       lastSyncError:
         outcome === 'SUCCESS'
           ? null
-          : `[${hasHardFailures ? 'DB_INSERT_ERROR|PARSE_NORMALIZATION_ERROR' : 'QUEUE_WARNING'}] Poll completed with warnings/errors. Check ingestion diagnostics.`,
+          : hasHardFailures
+            ? `[DB_INSERT_ERROR] ${summary.dbInsertErrors} insert failure(s). Check ingestion diagnostics.`
+            : '[QUEUE_WARNING] Decision queue warnings during poll.',
     };
     if (latestSeenActivityAt) {
       walletUpdateData.lastActivitySyncedAt = latestSeenActivityAt;

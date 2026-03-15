@@ -1,6 +1,9 @@
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import type { Prisma } from '@prisma/client';
+import { createPolymarketDataAdapter } from './polymarket.js';
+
+const dataAdapter = createPolymarketDataAdapter();
 
 type LedgerRow = {
   id: string;
@@ -156,7 +159,30 @@ function applyLedgerRow(
   return closeShares * price - fee;
 }
 
-async function buildMarkMap(trackedWalletId: string): Promise<Map<string, number>> {
+async function buildMarkMap(
+  trackedWalletId: string,
+  trackedWalletAddress: string,
+): Promise<Map<string, number>> {
+  const markMap = new Map<string, number>();
+
+  // Primary source for marks: live open positions from Polymarket for the tracked wallet.
+  // This keeps marks moving even when no new trade events are ingested.
+  try {
+    const openPositions = await dataAdapter.getWalletPositions(trackedWalletAddress, 'OPEN', 500);
+    for (const p of openPositions as Array<Record<string, unknown>>) {
+      const marketId = String(p.conditionId ?? p.marketId ?? '').trim();
+      const outcome = String(p.outcome ?? '')
+        .trim()
+        .toUpperCase();
+      const currentPrice = Number(p.currentPrice ?? p.price ?? p.avgPrice ?? 0);
+      if (!marketId || !outcome || !Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+      markMap.set(keyFor(marketId, outcome), currentPrice);
+    }
+  } catch (err) {
+    logger.warn({ trackedWalletId, err }, 'failed to fetch live wallet marks, using DB fallback');
+  }
+
+  // Fallback/coverage source: most recent ingested activity prices.
   const rows = await prisma.walletActivityEvent.findMany({
     where: {
       trackedWalletId,
@@ -171,7 +197,6 @@ async function buildMarkMap(trackedWalletId: string): Promise<Map<string, number
     },
   });
 
-  const markMap = new Map<string, number>();
   for (const row of rows) {
     const price = row.price !== null ? Number(row.price) : NaN;
     if (!Number.isFinite(price)) {
@@ -191,6 +216,7 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     select: {
       id: true,
       trackedWalletId: true,
+      trackedWalletAddress: true,
       startingCash: true,
     },
   });
@@ -230,7 +256,7 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     cash += cashDelta;
   }
 
-  const markMap = await buildMarkMap(session.trackedWalletId);
+  const markMap = await buildMarkMap(session.trackedWalletId, session.trackedWalletAddress);
 
   let realizedPnl = 0;
   let unrealizedPnl = 0;
