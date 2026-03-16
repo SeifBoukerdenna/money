@@ -123,14 +123,17 @@ async function evaluateSourceStartReadiness(trackedWalletId: string): Promise<{
     hasTruncatedHistory,
   });
 
+  const blocked = reduced.confidenceModel.confidence === 'LOW';
   const reasons: string[] = [];
-  if (reduced.canonical.canonicalKnownNetPnl === null) reasons.push('canonical-net-unavailable');
-  if (reduced.confidenceModel.confidence === 'LOW') reasons.push('low-confidence');
-  if (reduced.confidenceModel.hasMissingFees) reasons.push('missing-fees');
-  if (reduced.confidenceModel.hasUnknownCostBasis) reasons.push('unknown-cost-basis');
+  if (blocked) {
+    reasons.push('low-confidence');
+    if (reduced.canonical.canonicalKnownNetPnl === null) {
+      reasons.push('canonical-net-unavailable');
+    }
+  }
 
   return {
-    blocked: reasons.length > 0,
+    blocked,
     reasons,
   };
 }

@@ -128,6 +128,19 @@ export type TrackedWalletConfidenceModel = {
   warnings: string[];
 };
 
+type TrackedWalletConfidenceModelInput = {
+  hasTruncatedHistory: boolean;
+  hasUnsupportedEvents: boolean;
+  hasUnknownCostBasis: boolean;
+  hasEstimatedMarks: boolean;
+  hasMissingFees: boolean;
+  feeCoveragePct: number;
+  unsupportedEventCount: number;
+  totalEventCount: number;
+  openPositionCount: number;
+  warnings: string[];
+};
+
 export type TrackedWalletCanonicalMetrics = {
   canonicalKnownNetPnl: number | null;
   canonicalRealizedPnl: number;
@@ -360,20 +373,28 @@ function pushLedgerEvent(
   state.summary.eventCountsByType[type] += 1;
 }
 
-function buildConfidenceModel(input: {
-  hasTruncatedHistory: boolean;
-  hasUnsupportedEvents: boolean;
-  hasUnknownCostBasis: boolean;
-  hasEstimatedMarks: boolean;
-  hasMissingFees: boolean;
-  warnings: string[];
-}): TrackedWalletConfidenceModel {
-  const severe =
-    input.hasUnknownCostBasis ||
-    input.hasMissingFees ||
-    input.hasTruncatedHistory ||
-    input.hasUnsupportedEvents;
-  const moderate = input.hasEstimatedMarks;
+function buildConfidenceModel(
+  input: TrackedWalletConfidenceModelInput,
+): TrackedWalletConfidenceModel {
+  const unsupportedFraction = input.unsupportedEventCount / Math.max(1, input.totalEventCount);
+
+  // Missing fee rows are common in fresh/incremental ingestion. Keep severe only
+  // when fee coverage is genuinely poor; otherwise treat as usable but partial.
+  const feeCoverageSevere = input.feeCoveragePct < 50;
+  const feeCoveragePartial = input.hasMissingFees && input.feeCoveragePct >= 50;
+
+  // Unsupported events are expected (transfers, unknown rows). Only degrade to
+  // PARTIAL when they are a large share of the observed activity stream.
+  const unsupportedPartial = unsupportedFraction > 0.25;
+
+  // Truncation is severe only when there are active open positions with unknown
+  // cost basis. Truncation with no open positions is a historical-accuracy issue.
+  const truncatedWithOpenPositions = input.hasTruncatedHistory && input.openPositionCount > 0;
+  const truncatedHistoryPartial = input.hasTruncatedHistory && input.openPositionCount === 0;
+
+  const severe = input.hasUnknownCostBasis || feeCoverageSevere || truncatedWithOpenPositions;
+  const moderate =
+    input.hasEstimatedMarks || feeCoveragePartial || unsupportedPartial || truncatedHistoryPartial;
 
   const confidence: TrackedWalletConfidence = severe ? 'LOW' : moderate ? 'PARTIAL' : 'HIGH';
   return {
@@ -1134,6 +1155,7 @@ export function reduceTrackedWalletEvents(input: {
           state.summary.tradeLikeEventCount) *
         100
       : 100;
+  state.summary.feeCoveragePct = normalizeMoney(feeCoveragePct);
 
   const positions = Array.from(state.positionsByKey.values())
     .map(
@@ -1176,6 +1198,7 @@ export function reduceTrackedWalletEvents(input: {
   const hasUnknownCostBasis = unknownCostBasisPositions.length > 0;
   const hasUnsupportedEvents = state.summary.unsupportedEventCount > 0;
   const hasEstimatedMarks = state.estimatedMarkCount > 0 || state.missingMarkCount > 0;
+  const openPositionCount = positions.filter((position) => position.status === 'OPEN').length;
 
   let canonicalKnownNetPnl: number | null = null;
   if (!hasMissingFees && !hasUnknownCostBasis) {
@@ -1222,6 +1245,10 @@ export function reduceTrackedWalletEvents(input: {
     hasUnknownCostBasis,
     hasEstimatedMarks,
     hasMissingFees,
+    feeCoveragePct,
+    unsupportedEventCount: state.summary.unsupportedEventCount,
+    totalEventCount: state.summary.eventCount,
+    openPositionCount,
     warnings: confidenceWarnings,
   });
 

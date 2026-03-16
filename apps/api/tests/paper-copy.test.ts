@@ -1253,6 +1253,225 @@ describe('paper copy engine (mocked)', () => {
     expect(updated?.status).toBe('RUNNING');
   });
 
+  it('does not block session start when fee coverage is partial but above low threshold', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const baseTs = new Date('2026-03-16T00:00:00.000Z');
+    state.activityEvents.push(
+      {
+        id: 'src-pf-buy-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.4,
+        shares: 10,
+        notional: 4,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 0 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 0 * 60_000),
+      },
+      {
+        id: 'src-pf-sell-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.5,
+        shares: 10,
+        notional: 5,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 1 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 1 * 60_000),
+      },
+      {
+        id: 'src-pf-buy-2',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm2',
+        conditionId: 'm2',
+        marketQuestion: 'Q',
+        outcome: 'NO',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.45,
+        shares: 8,
+        notional: 3.6,
+        fee: null,
+        eventTimestamp: new Date(baseTs.getTime() + 2 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 2 * 60_000),
+      },
+      {
+        id: 'src-pf-sell-2',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm2',
+        conditionId: 'm2',
+        marketQuestion: 'Q',
+        outcome: 'NO',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.55,
+        shares: 8,
+        notional: 4.4,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 3 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 3 * 60_000),
+      },
+      {
+        id: 'src-pf-buy-3',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm3',
+        conditionId: 'm3',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.38,
+        shares: 12,
+        notional: 4.56,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 4 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 4 * 60_000),
+      },
+      {
+        id: 'src-pf-sell-3',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm3',
+        conditionId: 'm3',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.42,
+        shares: 12,
+        notional: 5.04,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 5 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 5 * 60_000),
+      },
+      {
+        id: 'src-pf-buy-4',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm4',
+        conditionId: 'm4',
+        marketQuestion: 'Q',
+        outcome: 'NO',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.52,
+        shares: 6,
+        notional: 3.12,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 6 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 6 * 60_000),
+      },
+      {
+        id: 'src-pf-sell-4',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm4',
+        conditionId: 'm4',
+        marketQuestion: 'Q',
+        outcome: 'NO',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.57,
+        shares: 6,
+        notional: 3.42,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 7 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 7 * 60_000),
+      },
+    );
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+
+    await expect(paperCopy.startPaperCopySession(session.id)).resolves.toBeUndefined();
+
+    const updated = state.sessions.find((s) => s.id === session.id);
+    expect(updated?.status).toBe('RUNNING');
+  });
+
+  it('does not block session start when unsupported events are present with valid trades', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const baseTs = new Date('2026-03-16T01:00:00.000Z');
+    state.activityEvents.push(
+      {
+        id: 'src-us-buy-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.4,
+        shares: 10,
+        notional: 4,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 0 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 0 * 60_000),
+      },
+      {
+        id: 'src-us-transfer-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: null,
+        effectiveSide: null,
+        eventType: 'TRANSFER',
+        price: null,
+        shares: null,
+        notional: null,
+        fee: null,
+        eventTimestamp: new Date(baseTs.getTime() + 1 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 1 * 60_000),
+      },
+      {
+        id: 'src-us-sell-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.6,
+        shares: 10,
+        notional: 6,
+        fee: 0.01,
+        eventTimestamp: new Date(baseTs.getTime() + 2 * 60_000),
+        createdAt: new Date(baseTs.getTime() + 2 * 60_000),
+      },
+    );
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+
+    await expect(paperCopy.startPaperCopySession(session.id)).resolves.toBeUndefined();
+
+    const updated = state.sessions.find((s) => s.id === session.id);
+    expect(updated?.status).toBe('RUNNING');
+  });
+
   it('snapshot equity uses cash + open mark-to-market value (no double-count)', async () => {
     const { state, paperCopy } = await setup();
 
