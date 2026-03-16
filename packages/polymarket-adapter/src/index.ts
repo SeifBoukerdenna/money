@@ -153,6 +153,7 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
     ];
 
     let payload: Array<Record<string, unknown>> | null = null;
+    let offsetExceeded = false;
     for (const candidate of candidates) {
       try {
         const body = await this.fetchJson(candidate);
@@ -164,9 +165,19 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
           payload = (body as { data: Array<Record<string, unknown>> }).data;
           break;
         }
-      } catch {
+      } catch (err: any) {
+        if (err.message && err.message.includes(' 400 ') && err.message.includes('offset=')) {
+          offsetExceeded = true;
+        }
         continue;
       }
+    }
+
+    // When Polymarket hits its max historical offset (e.g., offset=3000), it returns a 400.
+    // We should return an empty array to gracefully end pagination rather than throwing an error,
+    // which would crash the ingestion and prevent the `walletSyncCursor` from ever being created.
+    if (!payload && offsetExceeded) {
+      return [];
     }
 
     if (!payload) {

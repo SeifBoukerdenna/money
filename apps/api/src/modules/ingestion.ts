@@ -65,7 +65,12 @@ type CursorState = {
 };
 
 function isUniqueConstraintError(error: unknown): boolean {
-  return error instanceof PrismaClientKnownRequestError && error.code === 'P2002';
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as any).code === 'P2002'
+  );
 }
 
 function classifyFetchError(error: unknown): IngestionErrorClass {
@@ -458,10 +463,16 @@ export async function processWalletPoll(walletId: string, address: string): Prom
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown ingestion fetch error';
       const errorClass = classifyFetchError(error);
+
+      // TRANSIENT errors (rate limits, network blips) should NOT mark the wallet as ERROR —
+      // that would permanently stop scheduleWalletPolls from retrying it.
+      // Only PARSE_NORMALIZATION_ERROR (bad address, 400/404) is a permanent failure.
+      const isPermanentError = errorClass === 'PARSE_NORMALIZATION_ERROR';
+
       await prisma.watchedWallet.update({
         where: { id: walletId },
         data: {
-          syncStatus: 'ERROR',
+          syncStatus: isPermanentError ? 'ERROR' : 'SYNCING',
           lastSyncError: `[${errorClass}] ${message}`,
           lastPolledAt: new Date(),
           nextPollAt: new Date(Date.now() + config.INGEST_POLL_MAX_INTERVAL_MS),
@@ -472,7 +483,7 @@ export async function processWalletPoll(walletId: string, address: string): Prom
         data: {
           lastFailureAt: new Date(),
           lastErrorClass: errorClass,
-          status: 'ERROR',
+          status: isPermanentError ? 'ERROR' : 'ACTIVE',
         },
       });
       await recordIngestionDiagnostic({
@@ -522,6 +533,14 @@ export async function processWalletPoll(walletId: string, address: string): Prom
       const detectedMs = Math.max(0, Date.now() - eventTs.getTime());
       detectionLatency.observe(detectedMs);
       tradeDetectionLatency.observe(detectedMs);
+
+      // CRITICAL FIX: Update the watermark BEFORE attempting the insert.
+      // If the insert throws a duplicate constraint error (P2002) and we `continue`,
+      // we STILL need the watermark to advance so we don't fetch the same batch forever.
+      if (!latestSeenActivityAt || eventTs > latestSeenActivityAt) {
+        latestSeenActivityAt = eventTs;
+        latestSeenCursor = event.sourceCursor ?? event.externalEventId ?? latestSeenCursor;
+      }
 
       let activityRow: { id: string } | null = null;
       try {
@@ -586,11 +605,6 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           'failed to insert wallet activity event',
         );
         continue;
-      }
-
-      if (!latestSeenActivityAt || eventTs > latestSeenActivityAt) {
-        latestSeenActivityAt = eventTs;
-        latestSeenCursor = event.sourceCursor ?? event.externalEventId ?? latestSeenCursor;
       }
 
       if (!isTradeLikeActivity(event)) {
