@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { LayoutShell } from '../components/layout-shell';
 import { MarketHistoryView } from '../components/position-history';
 import { TrendLine } from '../components/trend-line';
+import { CompareCurves } from '../components/compare-curves';
 
 const API = process.env.NEXT_PUBLIC_WEB_API_URL ?? 'http://localhost:4000';
 
@@ -101,6 +102,58 @@ type MetricPoint = {
     unrealizedPnl: number;
     netLiquidationValue: number;
     openPositionsCount: number;
+    fees?: number;
+};
+
+type TrackedPerformance = {
+    walletId: string;
+    totals: {
+        realizedPnlGross: number;
+        unrealizedPnl: number;
+        fees: number;
+        netPnl: number;
+        reconstructedAccountValue: number;
+    };
+    knowability: {
+        startingCashKnown: boolean;
+        accountValueMode: string;
+        feeCoveragePct: number;
+    };
+};
+
+type SourceSessionComparison = {
+    sessionId: string;
+    sessionStatus: string;
+    window: { start: string; end: string; mode: string };
+    source: { realizedPnlGross: number; unrealizedPnl: number; fees: number; netPnl: number };
+    session: { realizedPnlGross: number; unrealizedPnl: number; fees: number; netPnl: number };
+    gaps: {
+        netPnlGap: number;
+        feeGap: number;
+        frictionDrag: number;
+        executionDrag: number;
+        percentGap: number | null;
+    };
+    curves: {
+        sourceNetPnl: Array<{ timestamp: string; value: number }>;
+        sessionNetPnl: Array<{ timestamp: string; value: number }>;
+        gap: Array<{ timestamp: string; value: number }>;
+    };
+    diagnosis: { dominantDriver: string; summary: string };
+};
+
+type SourceVsSessionsResponse = {
+    walletId: string;
+    alignment: 'SESSION_WINDOW' | 'SHARED_WINDOW';
+    sourceKnowability?: {
+        strictKnownOnly?: boolean;
+        feeCoveragePct?: number;
+    };
+    compute?: {
+        cacheHit?: boolean;
+        curveBucket?: 'RAW' | '5M' | '15M' | '1H';
+    };
+    sessions: SourceSessionComparison[];
 };
 
 type LiveFeedItem = {
@@ -242,6 +295,11 @@ export default function SimulationPage() {
 
     const [sourceSummary, setSourceSummary] = useState<SourceSummary | null>(null);
     const [sourcePnl, setSourcePnl] = useState<SourcePnlSummary | null>(null);
+    const [sourceTracked, setSourceTracked] = useState<TrackedPerformance | null>(null);
+    const [sourceComparisons, setSourceComparisons] = useState<SourceVsSessionsResponse | null>(null);
+    const [comparisonAlignment, setComparisonAlignment] = useState<'SESSION_WINDOW' | 'SHARED_WINDOW'>('SESSION_WINDOW');
+    const [comparisonStrictKnownOnly, setComparisonStrictKnownOnly] = useState(false);
+    const [comparisonCurveBucket, setComparisonCurveBucket] = useState<'RAW' | '5M' | '15M' | '1H'>('5M');
 
     const [activeSessionId, setActiveSessionId] = useState('');
     const [detail, setDetail] = useState<SessionDetail | null>(null);
@@ -295,15 +353,44 @@ export default function SimulationPage() {
         if (!wid) {
             setSourceSummary(null);
             setSourcePnl(null);
+            setSourceTracked(null);
+            setSourceComparisons(null);
             return;
         }
-        const [a, b] = await Promise.all([
+        const [a, b, c] = await Promise.all([
             fetch(`${API}/wallets/${wid}/profile-summary`).catch(() => null),
             fetch(`${API}/wallets/${wid}/pnl-summary?range=ALL`).catch(() => null),
+            fetch(`${API}/wallets/${wid}/tracked-performance?bucket=5M&strictKnownOnly=${comparisonStrictKnownOnly ? 'true' : 'false'}`).catch(() => null),
         ]);
         setSourceSummary(a?.ok ? ((await a.json()) as SourceSummary) : null);
         setSourcePnl(b?.ok ? ((await b.json()) as SourcePnlSummary) : null);
-    }, []);
+        setSourceTracked(c?.ok ? ((await c.json()) as TrackedPerformance) : null);
+    }, [comparisonStrictKnownOnly]);
+
+    const loadSourceComparisons = useCallback(async (
+        wid: string,
+        opts?: {
+            alignment?: 'SESSION_WINDOW' | 'SHARED_WINDOW';
+            strictKnownOnly?: boolean;
+            curveBucket?: 'RAW' | '5M' | '15M' | '1H';
+        },
+    ) => {
+        if (!wid) {
+            setSourceComparisons(null);
+            return;
+        }
+        const alignment = opts?.alignment ?? comparisonAlignment;
+        const strictKnownOnly = opts?.strictKnownOnly ?? comparisonStrictKnownOnly;
+        const curveBucket = opts?.curveBucket ?? comparisonCurveBucket;
+        const qs = new URLSearchParams({
+            alignment,
+            strictKnownOnly: strictKnownOnly ? 'true' : 'false',
+            curveBucket,
+        });
+        const r = await fetch(`${API}/wallets/${wid}/source-vs-sessions?${qs.toString()}`).catch(() => null);
+        if (!r?.ok) return;
+        setSourceComparisons((await r.json()) as SourceVsSessionsResponse);
+    }, [comparisonAlignment, comparisonStrictKnownOnly, comparisonCurveBucket]);
 
     const loadDetail = useCallback(async (sid: string) => {
         if (!sid) return;
@@ -383,7 +470,12 @@ export default function SimulationPage() {
 
     useEffect(() => {
         loadSourceStrip(walletId);
-    }, [walletId, loadSourceStrip]);
+        loadSourceComparisons(walletId, {
+            alignment: comparisonAlignment,
+            strictKnownOnly: comparisonStrictKnownOnly,
+            curveBucket: comparisonCurveBucket,
+        });
+    }, [walletId, loadSourceStrip, loadSourceComparisons]);
 
     useEffect(() => {
         const timer = setInterval(() => setNowMs(Date.now()), 1000);
@@ -418,9 +510,43 @@ export default function SimulationPage() {
             loadDetail(activeSessionId);
             loadAnalytics(activeSessionId);
             loadMetrics(activeSessionId);
+            loadSourceComparisons(walletId, {
+                alignment: comparisonAlignment,
+                strictKnownOnly: comparisonStrictKnownOnly,
+                curveBucket: comparisonCurveBucket,
+            });
         }, 60_000);
         return () => clearInterval(timer);
-    }, [activeSessionId, loadDetail, loadAnalytics, loadMetrics]);
+    }, [
+        activeSessionId,
+        loadDetail,
+        loadAnalytics,
+        loadMetrics,
+        loadSourceComparisons,
+        walletId,
+        comparisonAlignment,
+        comparisonStrictKnownOnly,
+        comparisonCurveBucket,
+    ]);
+
+    useEffect(() => {
+        if (!walletId || !activeSessionId) return;
+        const timer = setInterval(() => {
+            loadSourceComparisons(walletId, {
+                alignment: comparisonAlignment,
+                strictKnownOnly: comparisonStrictKnownOnly,
+                curveBucket: comparisonCurveBucket,
+            });
+        }, 90_000);
+        return () => clearInterval(timer);
+    }, [
+        walletId,
+        activeSessionId,
+        loadSourceComparisons,
+        comparisonAlignment,
+        comparisonStrictKnownOnly,
+        comparisonCurveBucket,
+    ]);
 
     useEffect(() => {
         if (!activeSessionId) return;
@@ -664,6 +790,10 @@ export default function SimulationPage() {
     };
 
     const selected = sessions.find((s) => s.id === activeSessionId) ?? null;
+    const activeComparison = useMemo(
+        () => sourceComparisons?.sessions.find((row) => row.sessionId === activeSessionId) ?? null,
+        [sourceComparisons, activeSessionId],
+    );
     const lastUpdatedSeconds = lastUpdatedAt
         ? Math.max(0, Math.floor((nowMs - lastUpdatedAt) / 1000))
         : null;
@@ -754,8 +884,8 @@ export default function SimulationPage() {
                         <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Latency Profile</p>
                         <span
                             className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold ${latencyProfile?.profile === 'TURBO'
-                                    ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
-                                    : 'border-slate-700 bg-slate-800/60 text-slate-300'
+                                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                                : 'border-slate-700 bg-slate-800/60 text-slate-300'
                                 }`}
                         >
                             {latencyProfile?.profile ?? 'UNKNOWN'}
@@ -868,11 +998,13 @@ export default function SimulationPage() {
                     {err && <p className="mt-3 text-sm text-rose-400 font-medium">{err}</p>}
 
                     {walletId && sourceSummary && sourcePnl && (
-                        <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                        <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-6">
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Positions Value</p><p className="text-sm font-semibold text-slate-200">{fmtUsd(sourceSummary.positionsValueUsd, 0)}</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Net PnL (All Time)</p><p className={`text-sm font-semibold ${pnlClass(sourcePnl.netPnl)}`}>{fmtPnl(sourcePnl.netPnl)}</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Win Rate</p><p className="text-sm font-semibold text-slate-200">{sourcePnl.winRate.toFixed(1)}%</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Trades</p><p className="text-sm font-semibold text-slate-200">{sourcePnl.tradeCount}</p></div>
+                            <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Source Realized (Gross)</p><p className={`text-sm font-semibold ${pnlClass(sourceTracked?.totals.realizedPnlGross ?? 0)}`}>{fmtPnl(sourceTracked?.totals.realizedPnlGross ?? 0)}</p></div>
+                            <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Source Fee Coverage</p><p className="text-sm font-semibold text-slate-200">{(sourceTracked?.knowability.feeCoveragePct ?? 0).toFixed(1)}%</p></div>
                         </div>
                     )}
                 </div>
@@ -1001,6 +1133,129 @@ export default function SimulationPage() {
                             </div>
                             <p className="mt-2 text-[11px] text-slate-500">Last updated: {lastUpdatedSeconds != null ? `${lastUpdatedSeconds}s ago` : '-'}</p>
                         </div>
+
+                        {activeComparison && (
+                            <div className="panel p-4">
+                                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                                    <div>
+                                        <p className="text-sm font-semibold text-slate-100">Source Wallet vs Session</p>
+                                        <p className="text-xs text-slate-400">
+                                            Window {shortDateTime(activeComparison.window.start)} to {shortDateTime(activeComparison.window.end)}
+                                        </p>
+                                    </div>
+                                    <span className="rounded border border-slate-700/60 bg-slate-900/50 px-2 py-1 text-[10px] text-slate-300">
+                                        {activeComparison.window.mode}
+                                    </span>
+                                </div>
+
+                                <div className="mb-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/35 p-2">
+                                        <label className="text-[10px] uppercase tracking-wider text-slate-500">Alignment</label>
+                                        <select
+                                            className="input mt-1 h-8 text-xs"
+                                            value={comparisonAlignment}
+                                            onChange={(e) => setComparisonAlignment(e.target.value as 'SESSION_WINDOW' | 'SHARED_WINDOW')}
+                                        >
+                                            <option value="SESSION_WINDOW">Per Session Window</option>
+                                            <option value="SHARED_WINDOW">Shared Overlap Window</option>
+                                        </select>
+                                    </div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/35 p-2">
+                                        <label className="text-[10px] uppercase tracking-wider text-slate-500">Curve Bucket</label>
+                                        <select
+                                            className="input mt-1 h-8 text-xs"
+                                            value={comparisonCurveBucket}
+                                            onChange={(e) => setComparisonCurveBucket(e.target.value as 'RAW' | '5M' | '15M' | '1H')}
+                                        >
+                                            <option value="RAW">Raw Events</option>
+                                            <option value="5M">5m</option>
+                                            <option value="15M">15m</option>
+                                            <option value="1H">1h</option>
+                                        </select>
+                                    </div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/35 p-2">
+                                        <label className="text-[10px] uppercase tracking-wider text-slate-500">Source Confidence</label>
+                                        <select
+                                            className="input mt-1 h-8 text-xs"
+                                            value={comparisonStrictKnownOnly ? 'STRICT' : 'INFERRED'}
+                                            onChange={(e) => setComparisonStrictKnownOnly(e.target.value === 'STRICT')}
+                                        >
+                                            <option value="INFERRED">Include inferred close events</option>
+                                            <option value="STRICT">Strict known-only events</option>
+                                        </select>
+                                    </div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/35 p-2 text-xs text-slate-300">
+                                        <p className="text-[10px] uppercase tracking-wider text-slate-500">Backend Compute</p>
+                                        <p className="mt-1">Cache: {sourceComparisons?.compute?.cacheHit ? 'HIT' : 'MISS'}</p>
+                                        <p>Fee Coverage: {(sourceComparisons?.sourceKnowability?.feeCoveragePct ?? sourceTracked?.knowability.feeCoveragePct ?? 0).toFixed(1)}%</p>
+                                    </div>
+                                </div>
+
+                                <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6 mb-3">
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Source Net: <span className={`font-semibold ${pnlClass(activeComparison.source.netPnl)}`}>{fmtPnl(activeComparison.source.netPnl)}</span></div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Session Net: <span className={`font-semibold ${pnlClass(activeComparison.session.netPnl)}`}>{fmtPnl(activeComparison.session.netPnl)}</span></div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Gap: <span className={`font-semibold ${pnlClass(activeComparison.gaps.netPnlGap)}`}>{fmtPnl(activeComparison.gaps.netPnlGap)}</span></div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Fee Gap: <span className={`font-semibold ${pnlClass(-activeComparison.gaps.feeGap)}`}>{fmtPnl(-activeComparison.gaps.feeGap)}</span></div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Friction Drag: <span className="font-semibold text-amber-300">{fmtUsd(activeComparison.gaps.frictionDrag)}</span></div>
+                                    <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Gap %: <span className="font-semibold text-slate-100">{activeComparison.gaps.percentGap == null ? '-' : `${activeComparison.gaps.percentGap.toFixed(2)}%`}</span></div>
+                                </div>
+
+                                <CompareCurves
+                                    curves={[
+                                        {
+                                            name: 'Source Net PnL',
+                                            color: '#22c55e',
+                                            points: activeComparison.curves.sourceNetPnl,
+                                        },
+                                        {
+                                            name: 'Session Net PnL',
+                                            color: '#38bdf8',
+                                            points: activeComparison.curves.sessionNetPnl,
+                                        },
+                                        {
+                                            name: 'Gap (Source - Session)',
+                                            color: '#f97316',
+                                            points: activeComparison.curves.gap,
+                                        },
+                                    ]}
+                                />
+
+                                <div className="mt-3 rounded border border-slate-700/60 bg-slate-900/35 p-3 text-xs text-slate-300">
+                                    <p className="mb-1 text-[10px] uppercase tracking-wider text-slate-500">Underperformance Diagnosis</p>
+                                    <p className="font-semibold text-slate-100">{activeComparison.diagnosis.dominantDriver}</p>
+                                    <p className="mt-1 text-slate-300">{activeComparison.diagnosis.summary}</p>
+                                </div>
+
+                                {sourceComparisons && sourceComparisons.sessions.length > 1 && (
+                                    <div className="mt-3 overflow-x-auto">
+                                        <table className="w-full text-xs">
+                                            <thead>
+                                                <tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500">
+                                                    <th className="py-2 text-left">Session</th>
+                                                    <th className="py-2 text-right">Source Net</th>
+                                                    <th className="py-2 text-right">Session Net</th>
+                                                    <th className="py-2 text-right">Gap</th>
+                                                    <th className="py-2 text-right">Friction Drag</th>
+                                                    <th className="py-2 text-right">Driver</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-slate-800/25">
+                                                {sourceComparisons.sessions.map((row) => (
+                                                    <tr key={row.sessionId} className={row.sessionId === activeSessionId ? 'bg-slate-800/20' : ''}>
+                                                        <td className="py-2 text-slate-200">{row.sessionId.slice(0, 8)}</td>
+                                                        <td className={`py-2 text-right font-semibold ${pnlClass(row.source.netPnl)}`}>{fmtPnl(row.source.netPnl)}</td>
+                                                        <td className={`py-2 text-right font-semibold ${pnlClass(row.session.netPnl)}`}>{fmtPnl(row.session.netPnl)}</td>
+                                                        <td className={`py-2 text-right font-semibold ${pnlClass(row.gaps.netPnlGap)}`}>{fmtPnl(row.gaps.netPnlGap)}</td>
+                                                        <td className="py-2 text-right text-amber-300">{fmtUsd(row.gaps.frictionDrag)}</td>
+                                                        <td className="py-2 text-right text-slate-300">{row.diagnosis.dominantDriver}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                )}
+                            </div>
+                        )}
 
                         <div className="panel overflow-hidden">
                             <div className="flex border-b border-slate-800/50">

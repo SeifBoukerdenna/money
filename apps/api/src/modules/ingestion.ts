@@ -218,6 +218,53 @@ function sourceEventIdForTradeEvent(event: WalletActivityFeedEvent, dedupeKey: s
   return dedupeKey;
 }
 
+function activityCursorForEvent(event: WalletActivityFeedEvent): string | null {
+  return event.sourceCursor ?? event.externalEventId ?? null;
+}
+
+function shouldAdvanceWatermark(input: {
+  currentTimestamp: Date | null;
+  currentCursor: string | null;
+  candidateTimestamp: Date;
+  candidateCursor: string | null;
+}): boolean {
+  if (!input.currentTimestamp) return true;
+
+  const currentTs = input.currentTimestamp.getTime();
+  const candidateTs = input.candidateTimestamp.getTime();
+  if (candidateTs > currentTs) return true;
+  if (candidateTs < currentTs) return false;
+
+  const currentCursor = input.currentCursor ?? '';
+  const candidateCursor = input.candidateCursor ?? '';
+  return candidateCursor > currentCursor;
+}
+
+function orderEventsForSafeIngestion(events: WalletActivityFeedEvent[]): WalletActivityFeedEvent[] {
+  return [...events].sort((a, b) => {
+    const aTs = new Date(a.eventTimestamp).getTime();
+    const bTs = new Date(b.eventTimestamp).getTime();
+
+    const aSafeTs = Number.isFinite(aTs) ? aTs : Number.MAX_SAFE_INTEGER;
+    const bSafeTs = Number.isFinite(bTs) ? bTs : Number.MAX_SAFE_INTEGER;
+    if (aSafeTs !== bSafeTs) return aSafeTs - bSafeTs;
+
+    const aCursor = activityCursorForEvent(a) ?? '';
+    const bCursor = activityCursorForEvent(b) ?? '';
+    if (aCursor !== bCursor) return aCursor.localeCompare(bCursor);
+
+    const aTx = String(a.txHash ?? '');
+    const bTx = String(b.txHash ?? '');
+    if (aTx !== bTx) return aTx.localeCompare(bTx);
+
+    const aLog = Number.isInteger(a.logIndex) ? Number(a.logIndex) : Number.MAX_SAFE_INTEGER;
+    const bLog = Number.isInteger(b.logIndex) ? Number(b.logIndex) : Number.MAX_SAFE_INTEGER;
+    if (aLog !== bLog) return aLog - bLog;
+
+    return String(a.orderId ?? '').localeCompare(String(b.orderId ?? ''));
+  });
+}
+
 async function recordIngestionDiagnostic(input: {
   walletId: string;
   address: string;
@@ -523,10 +570,16 @@ export async function processWalletPoll(walletId: string, address: string): Prom
 
     const activeTier = isRecentlyActive(cursor.highWatermarkTimestamp) ? 'ACTIVE' : 'INACTIVE';
 
-    let latestSeenActivityAt: Date | null = null;
-    let latestSeenCursor: string | null = cursorState.highWatermarkCursor;
+    let latestSafeActivityAt: Date | null = cursorState.highWatermarkTimestamp;
+    let latestSafeCursor: string | null = cursorState.highWatermarkCursor;
+    let firstNonDuplicateInsertFailure: {
+      dedupeKey: string;
+      externalEventId: string | null;
+      eventTimestamp: string;
+      message: string;
+    } | null = null;
 
-    for (const event of events) {
+    for (const event of orderEventsForSafeIngestion(events)) {
       const eventTs = new Date(event.eventTimestamp);
       if (!Number.isFinite(eventTs.getTime())) {
         summary.parseErrors += 1;
@@ -551,14 +604,6 @@ export async function processWalletPoll(walletId: string, address: string): Prom
       const detectedMs = Math.max(0, Date.now() - eventTs.getTime());
       detectionLatency.observe(detectedMs);
       tradeDetectionLatency.observe(detectedMs);
-
-      // CRITICAL FIX: Update the watermark BEFORE attempting the insert.
-      // If the insert throws a duplicate constraint error (P2002) and we `continue`,
-      // we STILL need the watermark to advance so we don't fetch the same batch forever.
-      if (!latestSeenActivityAt || eventTs > latestSeenActivityAt) {
-        latestSeenActivityAt = eventTs;
-        latestSeenCursor = event.sourceCursor ?? event.externalEventId ?? latestSeenCursor;
-      }
 
       let activityRow: { id: string } | null = null;
       try {
@@ -603,9 +648,36 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           },
         });
         summary.insertedActivityEvents += 1;
+
+        const candidateCursor = activityCursorForEvent(event);
+        if (
+          shouldAdvanceWatermark({
+            currentTimestamp: latestSafeActivityAt,
+            currentCursor: latestSafeCursor,
+            candidateTimestamp: eventTs,
+            candidateCursor,
+          })
+        ) {
+          latestSafeActivityAt = eventTs;
+          latestSafeCursor = candidateCursor;
+        }
       } catch (error) {
         if (isUniqueConstraintError(error)) {
           summary.duplicateEvents += 1;
+
+          const candidateCursor = activityCursorForEvent(event);
+          if (
+            shouldAdvanceWatermark({
+              currentTimestamp: latestSafeActivityAt,
+              currentCursor: latestSafeCursor,
+              candidateTimestamp: eventTs,
+              candidateCursor,
+            })
+          ) {
+            latestSafeActivityAt = eventTs;
+            latestSafeCursor = candidateCursor;
+          }
+
           logger.debug(
             { walletId, dedupeKey, externalEventId: event.externalEventId ?? null },
             'skipping duplicate wallet activity event',
@@ -613,16 +685,23 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           continue;
         }
         summary.dbInsertErrors += 1;
+        firstNonDuplicateInsertFailure = {
+          dedupeKey,
+          externalEventId: event.externalEventId ?? null,
+          eventTimestamp: event.eventTimestamp,
+          message: error instanceof Error ? error.message : String(error),
+        };
         logger.warn(
           {
             walletId,
             dedupeKey,
             externalEventId: event.externalEventId ?? null,
+            eventTimestamp: event.eventTimestamp,
             error,
           },
-          'failed to insert wallet activity event',
+          'failed to insert wallet activity event; halting batch to preserve cursor retryability',
         );
-        continue;
+        break;
       }
 
       if (!isTradeLikeActivity(event)) {
@@ -749,8 +828,8 @@ export async function processWalletPoll(walletId: string, address: string): Prom
     summary.warnings = hasWarnings ? 1 : 0;
     const outcome: 'SUCCESS' | 'PARTIAL' = hasHardFailures || hasWarnings ? 'PARTIAL' : 'SUCCESS';
 
-    if (latestSeenActivityAt) {
-      summary.nextHighWatermark = latestSeenActivityAt.toISOString();
+    if (latestSafeActivityAt) {
+      summary.nextHighWatermark = latestSafeActivityAt.toISOString();
     }
 
     const walletUpdateData: Record<string, unknown> = {
@@ -763,16 +842,20 @@ export async function processWalletPoll(walletId: string, address: string): Prom
         outcome === 'SUCCESS'
           ? null
           : hasHardFailures
-            ? `[DB_INSERT_ERROR] ${summary.dbInsertErrors} insert failure(s). Check ingestion diagnostics.`
+            ? `[DB_INSERT_ERROR] ${summary.dbInsertErrors} insert failure(s). Cursor held at last safe event.${
+                firstNonDuplicateInsertFailure
+                  ? ` First failure at ${firstNonDuplicateInsertFailure.eventTimestamp} (${firstNonDuplicateInsertFailure.dedupeKey}).`
+                  : ''
+              } Check ingestion diagnostics.`
             : '[QUEUE_WARNING] Decision queue warnings during poll.',
     };
-    if (latestSeenActivityAt) {
-      walletUpdateData.lastActivitySyncedAt = latestSeenActivityAt;
+    if (latestSafeActivityAt) {
+      walletUpdateData.lastActivitySyncedAt = latestSafeActivityAt;
     }
 
     try {
-      const lagSec = latestSeenActivityAt
-        ? Math.max(0, Math.floor((Date.now() - latestSeenActivityAt.getTime()) / 1000))
+      const lagSec = latestSafeActivityAt
+        ? Math.max(0, Math.floor((Date.now() - latestSafeActivityAt.getTime()) / 1000))
         : null;
 
       await prisma.$transaction([
@@ -783,8 +866,8 @@ export async function processWalletPoll(walletId: string, address: string): Prom
         prisma.walletSyncCursor.update({
           where: { id: cursor.id },
           data: {
-            highWatermarkTimestamp: latestSeenActivityAt ?? cursor.highWatermarkTimestamp,
-            highWatermarkCursor: latestSeenCursor,
+            highWatermarkTimestamp: latestSafeActivityAt ?? cursor.highWatermarkTimestamp,
+            highWatermarkCursor: latestSafeCursor,
             overlapWindowSec: cursor.overlapWindowSec,
             lastSuccessAt: new Date(),
             lastErrorClass: null,
@@ -832,7 +915,9 @@ export async function processWalletPoll(walletId: string, address: string): Prom
       message:
         outcome === 'SUCCESS'
           ? 'Wallet poll completed successfully'
-          : 'Wallet poll completed with partial failures/warnings',
+          : firstNonDuplicateInsertFailure
+            ? `Wallet poll completed with partial failures/warnings. Cursor held at last safe event after insert failure at ${firstNonDuplicateInsertFailure.eventTimestamp} (${firstNonDuplicateInsertFailure.dedupeKey}).`
+            : 'Wallet poll completed with partial failures/warnings',
       summary,
       startedAt: runStartedAt,
       durationMs: Date.now() - start,

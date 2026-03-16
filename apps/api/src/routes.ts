@@ -46,6 +46,113 @@ import {
   resolveAttributionPositionKey,
   toNullableNumber,
 } from './modules/paper-api-mappers.js';
+import {
+  bucketTrackedWalletTimeline,
+  compareSourceVsSession,
+  reduceTrackedWalletEvents,
+  type TimelineBucket,
+  type TrackedWalletTimelinePoint,
+} from './modules/tracked-wallet-performance.js';
+
+const TRACKED_WALLET_CACHE_TTL_MS = 20_000;
+const TRACKED_WALLET_MAX_EVENTS = 25_000;
+
+type TrackedWalletEventRow = {
+  id: string;
+  marketId: string;
+  conditionId: string | null;
+  marketQuestion: string | null;
+  outcome: string | null;
+  side: 'BUY' | 'SELL' | null;
+  effectiveSide: 'BUY' | 'SELL' | null;
+  eventType: string;
+  price: unknown;
+  shares: unknown;
+  notional: unknown;
+  fee: unknown;
+  eventTimestamp: Date;
+  createdAt: Date;
+};
+
+type CachedTrackedWalletEvent = {
+  id: string;
+  marketId: string;
+  conditionId: string | null;
+  marketQuestion: string | null;
+  outcome: string | null;
+  side: 'BUY' | 'SELL' | null;
+  effectiveSide: 'BUY' | 'SELL' | null;
+  eventType: string;
+  price: number | null;
+  shares: number | null;
+  notional: number | null;
+  fee: number | null;
+  eventTimestamp: Date;
+  createdAt: Date;
+};
+
+type TrackedWalletCacheCursor = {
+  eventTimestamp: Date;
+  createdAt: Date;
+  id: string;
+};
+
+function normalizeTrackedEventRow(row: TrackedWalletEventRow): CachedTrackedWalletEvent {
+  return {
+    id: row.id,
+    marketId: row.marketId,
+    conditionId: row.conditionId,
+    marketQuestion: row.marketQuestion,
+    outcome: row.outcome,
+    side: row.side,
+    effectiveSide: row.effectiveSide,
+    eventType: row.eventType,
+    price: row.price !== null ? Number(row.price) : null,
+    shares: row.shares !== null ? Number(row.shares) : null,
+    notional: row.notional !== null ? Number(row.notional) : null,
+    fee: row.fee !== null ? Number(row.fee) : null,
+    eventTimestamp: row.eventTimestamp,
+    createdAt: row.createdAt,
+  };
+}
+
+function toTrackedWalletCursor(
+  event: CachedTrackedWalletEvent | undefined,
+): TrackedWalletCacheCursor | null {
+  if (!event) return null;
+  return {
+    eventTimestamp: event.eventTimestamp,
+    createdAt: event.createdAt,
+    id: event.id,
+  };
+}
+
+function isEventAfterCursor(
+  event: CachedTrackedWalletEvent,
+  cursor: TrackedWalletCacheCursor,
+): boolean {
+  const eventTs = event.eventTimestamp.getTime();
+  const cursorTs = cursor.eventTimestamp.getTime();
+  if (eventTs !== cursorTs) return eventTs > cursorTs;
+
+  const eventCreated = event.createdAt.getTime();
+  const cursorCreated = cursor.createdAt.getTime();
+  if (eventCreated !== cursorCreated) return eventCreated > cursorCreated;
+
+  return event.id > cursor.id;
+}
+
+const trackedWalletReductionCache = new Map<
+  string,
+  {
+    computedAt: number;
+    wallet: { id: string; address: string; label: string };
+    events: CachedTrackedWalletEvent[];
+    lastCursor: TrackedWalletCacheCursor | null;
+    hasTruncatedHistory: boolean;
+    reduced: ReturnType<typeof reduceTrackedWalletEvents>;
+  }
+>();
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -116,6 +223,150 @@ function formatRelativeTime(input: Date): string {
   return `${diffDay}d ago`;
 }
 
+function sampleTimelineValueAtOrBefore(
+  points: Array<{ timestamp: string; value: number }>,
+  timestamp: string,
+): number {
+  if (points.length === 0) return 0;
+  const targetMs = new Date(timestamp).getTime();
+  if (!Number.isFinite(targetMs)) return points.at(-1)?.value ?? 0;
+
+  let lo = 0;
+  let hi = points.length - 1;
+  let best = -1;
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const pointMs = new Date(points[mid]?.timestamp ?? '').getTime();
+    if (pointMs <= targetMs) {
+      best = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  if (best < 0) return 0;
+  return points[best]?.value ?? 0;
+}
+
+function reduceTimelineWindowDelta(
+  timeline: TrackedWalletTimelinePoint[],
+  windowStart: string,
+  windowEnd: string,
+) {
+  const startMs = new Date(windowStart).getTime();
+  const baselineTimestamp = Number.isFinite(startMs)
+    ? new Date(startMs - 1).toISOString()
+    : windowStart;
+
+  const realizedSeries = timeline.map((row) => ({
+    timestamp: row.eventTimestamp,
+    value: row.realizedPnlGross,
+  }));
+  const feeSeries = timeline.map((row) => ({ timestamp: row.eventTimestamp, value: row.fees }));
+  const unrealizedSeries = timeline.map((row) => ({
+    timestamp: row.eventTimestamp,
+    value: row.unrealizedPnl,
+  }));
+  const netSeries = timeline.map((row) => ({ timestamp: row.eventTimestamp, value: row.netPnl }));
+
+  const startRealized = sampleTimelineValueAtOrBefore(realizedSeries, baselineTimestamp);
+  const endRealized = sampleTimelineValueAtOrBefore(realizedSeries, windowEnd);
+  const startFees = sampleTimelineValueAtOrBefore(feeSeries, baselineTimestamp);
+  const endFees = sampleTimelineValueAtOrBefore(feeSeries, windowEnd);
+  const startUnrealized = sampleTimelineValueAtOrBefore(unrealizedSeries, baselineTimestamp);
+  const endUnrealized = sampleTimelineValueAtOrBefore(unrealizedSeries, windowEnd);
+  const startNet = sampleTimelineValueAtOrBefore(netSeries, baselineTimestamp);
+  const endNet = sampleTimelineValueAtOrBefore(netSeries, windowEnd);
+
+  return {
+    realizedPnlGross: endRealized - startRealized,
+    fees: endFees - startFees,
+    unrealizedPnl: endUnrealized - startUnrealized,
+    netPnl: endNet - startNet,
+  };
+}
+
+function bucketCurvePoints(
+  points: Array<{ timestamp: string; value: number }>,
+  bucket: TimelineBucket,
+): Array<{ timestamp: string; value: number }> {
+  if (bucket === 'RAW' || points.length === 0) return points;
+
+  const sizeMs = bucket === '5M' ? 5 * 60_000 : bucket === '15M' ? 15 * 60_000 : 60 * 60_000;
+  const byBucket = new Map<number, { timestamp: string; value: number }>();
+  for (const point of points) {
+    const ts = new Date(point.timestamp).getTime();
+    if (!Number.isFinite(ts)) continue;
+    const b = Math.floor(ts / sizeMs) * sizeMs;
+    const existing = byBucket.get(b);
+    if (
+      !existing ||
+      new Date(point.timestamp).getTime() >= new Date(existing.timestamp).getTime()
+    ) {
+      byBucket.set(b, point);
+    }
+  }
+  return Array.from(byBucket.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, point]) => point);
+}
+
+async function buildTrackedWalletMarkMap(input: {
+  trackedWalletId: string;
+  walletAddress: string;
+}) {
+  const markMap = new Map<string, number>();
+
+  try {
+    const livePositions = await dataAdapter.getWalletPositions(input.walletAddress, 'OPEN', 500);
+    for (const row of livePositions as Array<Record<string, unknown>>) {
+      const marketKey = String(row.conditionId ?? row.marketId ?? '').trim();
+      const outcome = String(row.outcome ?? '')
+        .trim()
+        .toUpperCase();
+      const price = Number(row.currentPrice ?? row.curPrice ?? row.price ?? row.avgPrice ?? 0);
+      if (!marketKey || !outcome || !Number.isFinite(price)) continue;
+      const clamped = Math.max(0, Math.min(1, price));
+      markMap.set(`${marketKey}:${outcome}`, clamped);
+    }
+  } catch {
+    // Non-fatal. We still build marks from recent event prices below.
+  }
+
+  const fallbackPrices = await prisma.walletActivityEvent.findMany({
+    where: {
+      trackedWalletId: input.trackedWalletId,
+      price: { not: null },
+      outcome: { not: null },
+    },
+    orderBy: [{ eventTimestamp: 'desc' }, { createdAt: 'desc' }],
+    take: 4000,
+    select: {
+      marketId: true,
+      conditionId: true,
+      outcome: true,
+      price: true,
+    },
+  });
+
+  for (const row of fallbackPrices) {
+    const marketKey = String(row.conditionId ?? row.marketId ?? '').trim();
+    const outcome = String(row.outcome ?? '')
+      .trim()
+      .toUpperCase();
+    const price = row.price !== null ? Number(row.price) : NaN;
+    if (!marketKey || !outcome || !Number.isFinite(price)) continue;
+    const key = `${marketKey}:${outcome}`;
+    if (!markMap.has(key)) {
+      markMap.set(key, Math.max(0, Math.min(1, price)));
+    }
+  }
+
+  return markMap;
+}
+
 async function getLatestIngestionDiagnostic(walletId: string) {
   const row = await prisma.auditLog.findFirst({
     where: { category: 'INGESTION', entityId: walletId },
@@ -144,6 +395,161 @@ async function getLatestIngestionDiagnostic(walletId: string) {
           decisionEnqueueErrors: Number(summary.decisionEnqueueErrors ?? 0),
         }
       : null,
+  };
+}
+
+async function computeTrackedWalletPerformance(input: {
+  walletId: string;
+  strictKnownOnly?: boolean;
+}) {
+  const strictKnownOnly = input.strictKnownOnly ?? false;
+  const cacheKey = `${input.walletId}:${strictKnownOnly ? 'STRICT' : 'INFER'}`;
+  const now = Date.now();
+  const cached = trackedWalletReductionCache.get(cacheKey);
+  if (cached && now - cached.computedAt <= TRACKED_WALLET_CACHE_TTL_MS) {
+    return {
+      wallet: cached.wallet,
+      reduced: cached.reduced,
+      fromCache: true,
+      incrementalRefresh: false,
+      hasTruncatedHistory: cached.hasTruncatedHistory,
+      scannedEventCount: cached.events.length,
+      maxEventCap: TRACKED_WALLET_MAX_EVENTS,
+    };
+  }
+
+  const wallet = await prisma.watchedWallet.findUnique({
+    where: { id: input.walletId },
+    select: { id: true, address: true, label: true },
+  });
+  if (!wallet) {
+    throw new Error('Wallet not found');
+  }
+
+  const eventSelect = {
+    id: true,
+    marketId: true,
+    conditionId: true,
+    marketQuestion: true,
+    outcome: true,
+    side: true,
+    effectiveSide: true,
+    eventType: true,
+    price: true,
+    shares: true,
+    notional: true,
+    fee: true,
+    eventTimestamp: true,
+    createdAt: true,
+  } as const;
+
+  let eventsForReduction: CachedTrackedWalletEvent[] = [];
+  let incrementalRefresh = false;
+  let hasTruncatedHistory = false;
+
+  if (cached) {
+    const cursor = cached.lastCursor;
+    const incrementalRowsRawDesc = await prisma.walletActivityEvent.findMany({
+      where: {
+        trackedWalletId: input.walletId,
+        ...(cursor
+          ? {
+              OR: [
+                { eventTimestamp: { gt: cursor.eventTimestamp } },
+                {
+                  eventTimestamp: cursor.eventTimestamp,
+                  createdAt: { gt: cursor.createdAt },
+                },
+                {
+                  eventTimestamp: cursor.eventTimestamp,
+                  createdAt: cursor.createdAt,
+                  id: { gt: cursor.id },
+                },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ eventTimestamp: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      take: TRACKED_WALLET_MAX_EVENTS + 1,
+      select: eventSelect,
+    });
+
+    if (incrementalRowsRawDesc.length > 0) {
+      const incrementalOverflow = incrementalRowsRawDesc.length > TRACKED_WALLET_MAX_EVENTS;
+      const incrementalRows = incrementalRowsRawDesc
+        .slice(0, TRACKED_WALLET_MAX_EVENTS)
+        .reverse()
+        .map((row) => normalizeTrackedEventRow(row as unknown as TrackedWalletEventRow));
+      eventsForReduction = [...cached.events, ...incrementalRows];
+      if (eventsForReduction.length > TRACKED_WALLET_MAX_EVENTS) {
+        eventsForReduction = eventsForReduction.slice(-TRACKED_WALLET_MAX_EVENTS);
+        hasTruncatedHistory = true;
+      } else {
+        hasTruncatedHistory = cached.hasTruncatedHistory || incrementalOverflow;
+      }
+      incrementalRefresh = true;
+    } else {
+      eventsForReduction = cached.events;
+      hasTruncatedHistory = cached.hasTruncatedHistory;
+    }
+  } else {
+    const latestRowsRaw = await prisma.walletActivityEvent.findMany({
+      where: { trackedWalletId: input.walletId },
+      orderBy: [{ eventTimestamp: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      take: TRACKED_WALLET_MAX_EVENTS + 1,
+      select: eventSelect,
+    });
+
+    hasTruncatedHistory = latestRowsRaw.length > TRACKED_WALLET_MAX_EVENTS;
+    eventsForReduction = latestRowsRaw
+      .slice(0, TRACKED_WALLET_MAX_EVENTS)
+      .reverse()
+      .map((row) => normalizeTrackedEventRow(row as unknown as TrackedWalletEventRow));
+  }
+
+  const marks = await buildTrackedWalletMarkMap({
+    trackedWalletId: wallet.id,
+    walletAddress: wallet.address,
+  });
+
+  const reduced = reduceTrackedWalletEvents({
+    events: eventsForReduction.map((row) => ({
+      id: row.id,
+      marketId: row.marketId,
+      conditionId: row.conditionId,
+      marketQuestion: row.marketQuestion,
+      outcome: row.outcome,
+      side: row.side,
+      effectiveSide: row.effectiveSide,
+      eventType: row.eventType,
+      price: row.price !== null ? Number(row.price) : null,
+      shares: row.shares !== null ? Number(row.shares) : null,
+      notional: row.notional !== null ? Number(row.notional) : null,
+      fee: row.fee !== null ? Number(row.fee) : null,
+      eventTimestamp: row.eventTimestamp,
+      createdAt: row.createdAt,
+    })),
+    markPriceByKey: marks,
+    inferMissingFields: !strictKnownOnly,
+  });
+
+  trackedWalletReductionCache.set(cacheKey, {
+    computedAt: now,
+    wallet,
+    events: eventsForReduction,
+    lastCursor: toTrackedWalletCursor(eventsForReduction.at(-1)),
+    hasTruncatedHistory,
+    reduced,
+  });
+
+  return {
+    wallet,
+    reduced,
+    fromCache: false,
+    incrementalRefresh,
+    hasTruncatedHistory,
+    scannedEventCount: eventsForReduction.length,
+    maxEventCap: TRACKED_WALLET_MAX_EVENTS,
   };
 }
 
@@ -864,6 +1270,315 @@ export async function registerRoutes(app: any): Promise<void> {
     });
     if (!snapshot) throw app.httpErrors.notFound('No analytics snapshot yet');
     return snapshot;
+  });
+
+  app.get('/wallets/:id/tracked-performance', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const query = z
+      .object({
+        from: z.string().datetime().optional(),
+        to: z.string().datetime().optional(),
+        limit: z.coerce.number().int().min(1).max(10000).default(1500),
+        bucket: z.enum(['RAW', '5M', '15M', '1H']).default('RAW'),
+        strictKnownOnly: z.coerce.boolean().default(false),
+      })
+      .parse(req.query ?? {});
+
+    const {
+      wallet,
+      reduced,
+      fromCache,
+      incrementalRefresh,
+      hasTruncatedHistory,
+      scannedEventCount,
+      maxEventCap,
+    } = await computeTrackedWalletPerformance({
+      walletId: params.id,
+      strictKnownOnly: query.strictKnownOnly,
+    });
+    const startWindow = query.from ?? reduced.timeline[0]?.eventTimestamp ?? null;
+    const endWindow = query.to ?? reduced.timeline.at(-1)?.eventTimestamp ?? null;
+
+    const bucketedTimeline = bucketTrackedWalletTimeline(
+      reduced.timeline,
+      query.bucket as TimelineBucket,
+    );
+
+    const filteredTimeline = bucketedTimeline
+      .filter((point) => {
+        if (query.from) {
+          const fromMs = new Date(query.from).getTime();
+          if (new Date(point.eventTimestamp).getTime() < fromMs) return false;
+        }
+        if (query.to) {
+          const toMs = new Date(query.to).getTime();
+          if (new Date(point.eventTimestamp).getTime() > toMs) return false;
+        }
+        return true;
+      })
+      .slice(-query.limit);
+
+    const windowSummary =
+      startWindow && endWindow
+        ? reduceTimelineWindowDelta(reduced.timeline, startWindow, endWindow)
+        : {
+            realizedPnlGross: reduced.realizedPnlGross,
+            unrealizedPnl: reduced.unrealizedPnl,
+            fees: reduced.fees,
+            netPnl: reduced.netPnl,
+          };
+
+    return {
+      walletId: wallet.id,
+      walletAddress: wallet.address,
+      walletLabel: wallet.label,
+      knowability: {
+        startingCashKnown: false,
+        accountValueMode: 'RECONSTRUCTED_RELATIVE',
+        accountValueDescription:
+          'Reconstructed account value is relative to baseline because true wallet cash is not directly observable from activity events alone.',
+        feeCoveragePct: reduced.summary.feeCoveragePct,
+        inferredShareEvents: reduced.summary.inferredShareEvents,
+        inferredPriceEvents: reduced.summary.inferredPriceEvents,
+        strictKnownOnly: query.strictKnownOnly,
+      },
+      totals: {
+        realizedPnlGross: reduced.realizedPnlGross,
+        unrealizedPnl: reduced.unrealizedPnl,
+        fees: reduced.fees,
+        netPnl: reduced.netPnl,
+        cashDelta: reduced.cashDelta,
+        openMarketValue: reduced.openMarketValue,
+        reconstructedAccountValue: reduced.reconstructedAccountValue,
+      },
+      window: {
+        from: startWindow,
+        to: endWindow,
+        ...windowSummary,
+      },
+      invariants: {
+        netDecompositionDrift:
+          reduced.netPnl - (reduced.realizedPnlGross + reduced.unrealizedPnl - reduced.fees),
+      },
+      summary: reduced.summary,
+      compute: {
+        cacheHit: fromCache,
+        incrementalRefresh,
+        scannedEventCount,
+        maxEventCap,
+        historyTruncatedByCap: hasTruncatedHistory,
+        bucket: query.bucket,
+      },
+      warnings: reduced.warnings,
+      timeline: filteredTimeline,
+      positions: reduced.positions,
+    };
+  });
+
+  app.get('/wallets/:id/source-vs-sessions', async (req: any) => {
+    const params = z.object({ id: z.string().uuid() }).parse(req.params);
+    const query = z
+      .object({
+        sessionIds: z.string().optional(),
+        alignment: z.enum(['SESSION_WINDOW', 'SHARED_WINDOW']).default('SESSION_WINDOW'),
+        strictKnownOnly: z.coerce.boolean().default(false),
+        curveBucket: z.enum(['RAW', '5M', '15M', '1H']).default('RAW'),
+      })
+      .parse(req.query ?? {});
+
+    const {
+      wallet,
+      reduced,
+      fromCache,
+      incrementalRefresh,
+      hasTruncatedHistory,
+      scannedEventCount,
+      maxEventCap,
+    } = await computeTrackedWalletPerformance({
+      walletId: params.id,
+      strictKnownOnly: query.strictKnownOnly,
+    });
+
+    const requestedSessionIds = query.sessionIds
+      ? query.sessionIds
+          .split(',')
+          .map((v) => v.trim())
+          .filter((v) => v.length > 0)
+      : null;
+
+    const sessions = await prisma.paperCopySession.findMany({
+      where: {
+        trackedWalletId: params.id,
+        ...(requestedSessionIds ? { id: { in: requestedSessionIds } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        status: true,
+        startedAt: true,
+        endedAt: true,
+        createdAt: true,
+      },
+    });
+
+    if (sessions.length === 0) {
+      return {
+        walletId: wallet.id,
+        walletAddress: wallet.address,
+        alignment: query.alignment,
+        sessions: [],
+      };
+    }
+
+    const windows = sessions.map((session) => {
+      const start = (session.startedAt ?? session.createdAt).toISOString();
+      const end = (session.endedAt ?? new Date()).toISOString();
+      return { sessionId: session.id, start, end };
+    });
+
+    let sharedWindow: { start: string; end: string } | null = null;
+    if (query.alignment === 'SHARED_WINDOW') {
+      const sharedStartMs = Math.max(...windows.map((w) => new Date(w.start).getTime()));
+      const sharedEndMs = Math.min(...windows.map((w) => new Date(w.end).getTime()));
+      if (
+        Number.isFinite(sharedStartMs) &&
+        Number.isFinite(sharedEndMs) &&
+        sharedStartMs <= sharedEndMs
+      ) {
+        sharedWindow = {
+          start: new Date(sharedStartMs).toISOString(),
+          end: new Date(sharedEndMs).toISOString(),
+        };
+      }
+    }
+
+    const comparisons = await Promise.all(
+      sessions.map(async (session) => {
+        const ownWindow = windows.find((w) => w.sessionId === session.id)!;
+        const windowStart = sharedWindow?.start ?? ownWindow.start;
+        const windowEnd = sharedWindow?.end ?? ownWindow.end;
+
+        const sessionTimelineRows = await prisma.paperSessionMetricPoint.findMany({
+          where: {
+            sessionId: session.id,
+            timestamp: {
+              gte: new Date(windowStart),
+              lte: new Date(windowEnd),
+            },
+          },
+          orderBy: { timestamp: 'asc' },
+          select: {
+            timestamp: true,
+            totalPnl: true,
+            realizedPnl: true,
+            unrealizedPnl: true,
+            fees: true,
+          },
+        });
+
+        let sessionTimeline = sessionTimelineRows.map((row) => ({
+          timestamp: row.timestamp.toISOString(),
+          totalPnl: Number(row.totalPnl),
+          realizedPnl: Number(row.realizedPnl),
+          unrealizedPnl: Number(row.unrealizedPnl),
+          fees: Number(row.fees ?? 0),
+        }));
+
+        if (sessionTimeline.length === 0) {
+          const fallback = await prisma.paperPortfolioSnapshot.findFirst({
+            where: {
+              sessionId: session.id,
+              timestamp: {
+                lte: new Date(windowEnd),
+              },
+            },
+            orderBy: { timestamp: 'desc' },
+            select: {
+              timestamp: true,
+              totalPnl: true,
+              realizedPnl: true,
+              unrealizedPnl: true,
+              fees: true,
+            },
+          });
+
+          sessionTimeline = [
+            {
+              timestamp: windowStart,
+              totalPnl: 0,
+              realizedPnl: 0,
+              unrealizedPnl: 0,
+              fees: 0,
+            },
+            {
+              timestamp: windowEnd,
+              totalPnl: fallback ? Number(fallback.totalPnl) : 0,
+              realizedPnl: fallback ? Number(fallback.realizedPnl) : 0,
+              unrealizedPnl: fallback ? Number(fallback.unrealizedPnl) : 0,
+              fees: fallback ? Number(fallback.fees) : 0,
+            },
+          ];
+        }
+
+        const comparison = compareSourceVsSession({
+          sourceTimeline: reduced.timeline,
+          sessionTimeline,
+          windowStart,
+          windowEnd,
+        });
+
+        const sourceCurve = bucketCurvePoints(
+          comparison.curves.sourceNetPnl,
+          query.curveBucket as TimelineBucket,
+        );
+        const sessionCurve = bucketCurvePoints(
+          comparison.curves.sessionNetPnl,
+          query.curveBucket as TimelineBucket,
+        );
+        const gapCurve = bucketCurvePoints(
+          comparison.curves.gap,
+          query.curveBucket as TimelineBucket,
+        );
+
+        return {
+          sessionId: session.id,
+          sessionStatus: session.status,
+          window: {
+            start: windowStart,
+            end: windowEnd,
+            mode: sharedWindow ? 'SHARED_WINDOW' : 'SESSION_WINDOW',
+          },
+          ...comparison,
+          curves: {
+            sourceNetPnl: sourceCurve,
+            sessionNetPnl: sessionCurve,
+            gap: gapCurve,
+          },
+        };
+      }),
+    );
+
+    return {
+      walletId: wallet.id,
+      walletAddress: wallet.address,
+      walletLabel: wallet.label,
+      alignment: query.alignment,
+      sourceKnowability: {
+        startingCashKnown: false,
+        accountValueMode: 'RECONSTRUCTED_RELATIVE',
+        feeCoveragePct: reduced.summary.feeCoveragePct,
+        strictKnownOnly: query.strictKnownOnly,
+      },
+      compute: {
+        cacheHit: fromCache,
+        incrementalRefresh,
+        scannedEventCount,
+        maxEventCap,
+        historyTruncatedByCap: hasTruncatedHistory,
+        curveBucket: query.curveBucket,
+      },
+      sessions: comparisons,
+    };
   });
 
   app.get('/wallets/:id/simulation-intelligence', async (req: any) => {
@@ -2477,6 +3192,7 @@ export async function registerRoutes(app: any): Promise<void> {
       unrealizedPnl: Number(row.unrealizedPnl),
       netLiquidationValue: Number(row.netLiquidationValue),
       openPositionsCount: row.openPositionsCount,
+      fees: Number(row.fees ?? 0),
     }));
   });
 
