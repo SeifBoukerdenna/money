@@ -50,6 +50,8 @@ import {
   toNullableNumber,
 } from './modules/paper-api-mappers.js';
 import {
+  buildFeeInferenceRisk,
+  buildTruncationRisk,
   bucketTrackedWalletTimeline,
   compareSourceVsSession,
   reduceTrackedWalletEvents,
@@ -1369,6 +1371,19 @@ export async function registerRoutes(app: any): Promise<void> {
             netPnl: reduced.netPnl,
           };
 
+    const openPositions = reduced.positions.filter((position) => position.status === 'OPEN').length;
+    const truncationRisk = buildTruncationRisk({
+      eventsScanned: scannedEventCount,
+      eventCap: maxEventCap,
+      affectedOpenPositions: reduced.debugReport.unknownCostBasisPositions.length,
+      totalOpenPositions: openPositions,
+    });
+    const feeInferenceRisk = buildFeeInferenceRisk({
+      tradeLikeEventCount: reduced.summary.tradeLikeEventCount,
+      inferredFeeEvents: reduced.summary.inferredFeeEvents,
+      inferredFeeTotalUsd: reduced.summary.inferredFeeTotalUsd,
+    });
+
     return {
       walletId: wallet.id,
       walletAddress: wallet.address,
@@ -1382,12 +1397,14 @@ export async function registerRoutes(app: any): Promise<void> {
       },
       confidence: reduced.confidenceModel.confidence,
       confidenceModel: reduced.confidenceModel,
+      truncationRisk,
       knowability: {
         startingCashKnown: false,
         accountValueMode: 'RECONSTRUCTED_RELATIVE',
         accountValueDescription:
           'Reconstructed account value is relative to baseline because true wallet cash is not directly observable from activity events alone.',
         feeCoveragePct: reduced.summary.feeCoveragePct,
+        inferredFeeRatePct: feeInferenceRisk.inferredFeeRatePct,
         inferredShareEvents: reduced.summary.inferredShareEvents,
         inferredPriceEvents: reduced.summary.inferredPriceEvents,
         strictKnownOnly: query.strictKnownOnly,
@@ -1451,6 +1468,16 @@ export async function registerRoutes(app: any): Promise<void> {
       },
       warnings: [
         ...reduced.warnings,
+        ...(truncationRisk.utilizationPct >= 80
+          ? [
+              {
+                code: 'EVENT_CAP_UTILIZATION_HIGH',
+                eventId: 'SYSTEM',
+                message:
+                  'Source event scan is nearing the configured cap. If utilization reaches 100%, older events may be dropped and open-position cost basis can become unknown.',
+              },
+            ]
+          : []),
         ...(hasTruncatedHistory
           ? [
               {
@@ -1507,6 +1534,7 @@ export async function registerRoutes(app: any): Promise<void> {
       select: {
         id: true,
         status: true,
+        startingCash: true,
         startedAt: true,
         endedAt: true,
         createdAt: true,
@@ -1617,6 +1645,12 @@ export async function registerRoutes(app: any): Promise<void> {
           sessionTimeline,
           windowStart,
           windowEnd,
+          sessionStartingCash: Number(session.startingCash),
+          sourceFeeStats: {
+            tradeLikeEventCount: reduced.summary.tradeLikeEventCount,
+            inferredFeeEvents: reduced.summary.inferredFeeEvents,
+            inferredFeeTotalUsd: reduced.summary.inferredFeeTotalUsd,
+          },
         });
 
         const conservativeSourceNet = reduced.canonical.canonicalKnownNetPnl;
@@ -1672,15 +1706,30 @@ export async function registerRoutes(app: any): Promise<void> {
       }),
     );
 
+    const openPositions = reduced.positions.filter((position) => position.status === 'OPEN').length;
+    const truncationRisk = buildTruncationRisk({
+      eventsScanned: scannedEventCount,
+      eventCap: maxEventCap,
+      affectedOpenPositions: reduced.debugReport.unknownCostBasisPositions.length,
+      totalOpenPositions: openPositions,
+    });
+    const feeInferenceRisk = buildFeeInferenceRisk({
+      tradeLikeEventCount: reduced.summary.tradeLikeEventCount,
+      inferredFeeEvents: reduced.summary.inferredFeeEvents,
+      inferredFeeTotalUsd: reduced.summary.inferredFeeTotalUsd,
+    });
+
     return {
       walletId: wallet.id,
       walletAddress: wallet.address,
       walletLabel: wallet.label,
       alignment: query.alignment,
+      truncationRisk,
       sourceKnowability: {
         startingCashKnown: false,
         accountValueMode: 'RECONSTRUCTED_RELATIVE',
         feeCoveragePct: reduced.summary.feeCoveragePct,
+        inferredFeeRatePct: feeInferenceRisk.inferredFeeRatePct,
         inferredShareEvents: reduced.summary.inferredShareEvents,
         inferredPriceEvents: reduced.summary.inferredPriceEvents,
         strictKnownOnly: query.strictKnownOnly,

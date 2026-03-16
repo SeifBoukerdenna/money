@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildFeeInferenceRisk,
+  buildTruncationRisk,
   bucketTrackedWalletTimeline,
   compareSourceVsSession,
   reduceTrackedWalletEvents,
@@ -171,6 +173,42 @@ describe('tracked-wallet-performance reducer', () => {
       reduced.cashDelta + reduced.openMarketValue,
       8,
     );
+  });
+
+  it('preserves liquidation-value invariants under relative starting capital baseline', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'inv-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 30,
+          price: 0.5,
+          fee: 0.2,
+        }),
+        event({
+          id: 'inv-2',
+          ts: '2026-03-01T00:10:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 10,
+          price: 0.65,
+          fee: 0.1,
+        }),
+      ],
+      markPriceByKey: new Map([['m1:YES', 0.6]]),
+    });
+
+    const startingCapital = 0;
+    const netLiquidationValue = reduced.reconstructedAccountValue;
+    const totalPnl = reduced.netPnl;
+
+    expect(
+      startingCapital + reduced.realizedPnlGross + reduced.unrealizedPnl - reduced.fees,
+    ).toBeCloseTo(netLiquidationValue, 8);
+    expect(netLiquidationValue).toBeCloseTo(reduced.cashDelta + reduced.openMarketValue, 8);
+    expect(totalPnl).toBeCloseTo(netLiquidationValue - startingCapital, 8);
   });
 
   it('dedupes duplicate source events by id', () => {
@@ -574,6 +612,52 @@ describe('tracked-wallet-performance reducer', () => {
         reduced.debugReport.eventCountsByType.FEE,
     ).toBeGreaterThan(0);
   });
+
+  it('tracks explicit and inferred fee event counters for mixed trade events', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'fee-mix-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 10,
+          price: 0.4,
+          fee: 0.1,
+        }),
+        event({
+          id: 'fee-mix-2',
+          ts: '2026-03-01T00:01:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 10,
+          price: 0.5,
+          fee: 0.1,
+          feeIsInferred: true,
+        }),
+        event({
+          id: 'fee-mix-3',
+          ts: '2026-03-01T00:02:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 5,
+          price: 0.3,
+          fee: 0.05,
+        }),
+      ],
+    });
+
+    const risk = buildFeeInferenceRisk({
+      tradeLikeEventCount: reduced.summary.tradeLikeEventCount,
+      inferredFeeEvents: reduced.summary.inferredFeeEvents,
+      inferredFeeTotalUsd: reduced.summary.inferredFeeTotalUsd,
+    });
+
+    expect(reduced.summary.tradeLikeEventCount).toBe(3);
+    expect(reduced.summary.explicitFeeEvents).toBe(2);
+    expect(reduced.summary.inferredFeeEvents).toBe(1);
+    expect(risk.inferredFeeRatePct).toBe(33.3);
+  });
 });
 
 describe('source vs session comparisons', () => {
@@ -807,6 +891,7 @@ describe('source vs session comparisons', () => {
     expect(comparison.unrealizedAsymmetryBps).toBeLessThan(0);
     expect(comparison.sourceHasOpenPositions).toBe(true);
     expect(comparison.sessionHasOpenPositions).toBe(false);
+    expect(comparison.markRisk?.recommendedGapField).toBe('realizedOnlyNetPnlGap');
   });
 
   it('does not warn when both source and session unrealized are zero', () => {
@@ -869,5 +954,125 @@ describe('source vs session comparisons', () => {
     });
 
     expect(comparison.markContaminationWarning).toBe(true);
+  });
+
+  it('computes fee overstatement bounds from inferred fees in comparison output', () => {
+    const comparison = compareSourceVsSession({
+      sourceTimeline: source.timeline,
+      sessionTimeline,
+      windowStart: '2026-03-01T00:00:00.000Z',
+      windowEnd: '2026-03-01T00:02:00.000Z',
+      sourceFeeStats: {
+        tradeLikeEventCount: 4,
+        inferredFeeEvents: 2,
+        inferredFeeTotalUsd: 1.8,
+      },
+    });
+
+    expect(comparison.feeInferenceRisk.inferredFeeRatePct).toBe(50);
+    expect(comparison.feeInferenceRisk.potentialFeeOverstatementUsd.minOverstatement).toBe(0.9);
+    expect(comparison.feeInferenceRisk.potentialFeeOverstatementUsd.maxOverstatement).toBe(1.8);
+  });
+
+  it('computes realizedOnlyNetPnlGap for mixed realized and unrealized components', () => {
+    const comparison = compareSourceVsSession({
+      sourceTimeline: [
+        {
+          index: 0,
+          eventId: 'mix-source',
+          eventTimestamp: '2026-03-01T00:00:00.000Z',
+          eventType: 'SNAP',
+          marketId: 'm1',
+          outcome: 'YES',
+          side: null,
+          realizedPnlGross: 20,
+          unrealizedPnl: 5,
+          fees: 0.5,
+          netPnl: 24.5,
+          cashDelta: 0,
+          openMarketValue: 0,
+          reconstructedAccountValue: 0,
+        },
+      ],
+      sessionTimeline: [
+        {
+          timestamp: '2026-03-01T00:00:00.000Z',
+          totalPnl: 13,
+          realizedPnl: 15,
+          unrealizedPnl: -1,
+          fees: 1,
+        },
+      ],
+      windowStart: '2026-03-01T00:00:00.000Z',
+      windowEnd: '2026-03-01T00:00:00.000Z',
+      sessionStartingCash: 1000,
+    });
+
+    expect(comparison.gaps.realizedOnlyNetPnlGap).toBe(4);
+    expect(comparison.gaps.markContaminatedPortionBps).toBe(60);
+  });
+
+  it('matches realizedOnlyNetPnlGap and netPnlGap when both unrealized components are zero', () => {
+    const comparison = compareSourceVsSession({
+      sourceTimeline: [
+        {
+          index: 0,
+          eventId: 'clean-source',
+          eventTimestamp: '2026-03-01T00:00:00.000Z',
+          eventType: 'SNAP',
+          marketId: 'm1',
+          outcome: 'YES',
+          side: null,
+          realizedPnlGross: 12,
+          unrealizedPnl: 0,
+          fees: 2,
+          netPnl: 10,
+          cashDelta: 0,
+          openMarketValue: 0,
+          reconstructedAccountValue: 0,
+        },
+      ],
+      sessionTimeline: [
+        {
+          timestamp: '2026-03-01T00:00:00.000Z',
+          totalPnl: 9,
+          realizedPnl: 10,
+          unrealizedPnl: 0,
+          fees: 1,
+        },
+      ],
+      windowStart: '2026-03-01T00:00:00.000Z',
+      windowEnd: '2026-03-01T00:00:00.000Z',
+      sessionStartingCash: 1000,
+    });
+
+    expect(comparison.markContaminationWarning).toBe(false);
+    expect(comparison.gaps.realizedOnlyNetPnlGap).toBe(comparison.gaps.netPnlGap);
+  });
+});
+
+describe('truncation risk', () => {
+  it('computes utilization and affected fraction percentages to 1dp', () => {
+    const risk = buildTruncationRisk({
+      eventsScanned: 200,
+      eventCap: 250,
+      affectedOpenPositions: 1,
+      totalOpenPositions: 3,
+    });
+
+    expect(risk.utilizationPct).toBe(80);
+    expect(risk.affectedFraction).toBe(33.3);
+  });
+
+  it('uses max(1, totalOpenPositions) denominator when open positions are zero', () => {
+    const risk = buildTruncationRisk({
+      eventsScanned: 10,
+      eventCap: 100,
+      affectedOpenPositions: 0,
+      totalOpenPositions: 0,
+    });
+
+    expect(risk.utilizationPct).toBe(10);
+    expect(risk.affectedFraction).toBe(0);
   });
 });

@@ -187,9 +187,11 @@ export type TrackedWalletReductionSummary = {
   tradeLikeEventCount: number;
   buyEventCount: number;
   sellEventCount: number;
+  explicitFeeEvents: number;
   inferredShareEvents: number;
   inferredPriceEvents: number;
   inferredFeeEvents: number;
+  inferredFeeTotalUsd: number;
   missingFeeEvents: number;
   feeCoveragePct: number;
   duplicateSkipped: number;
@@ -201,6 +203,15 @@ export type TrackedWalletReductionSummary = {
   estimatedMarkCount: number;
   unknownCostBasisPositions: number;
   eventCountsByType: Record<SourceLedgerEventType, number>;
+};
+
+export type FeeInferenceRisk = {
+  inferredFeeRatePct: number;
+  potentialFeeOverstatementUsd: {
+    minOverstatement: number;
+    maxOverstatement: number;
+  };
+  note: string;
 };
 
 export type TrackedWalletReductionResult = {
@@ -219,6 +230,15 @@ export type TrackedWalletReductionResult = {
   canonical: TrackedWalletCanonicalMetrics;
   confidenceModel: TrackedWalletConfidenceModel;
   debugReport: TrackedWalletDebugReport;
+};
+
+export type TruncationRisk = {
+  eventsScanned: number;
+  eventCap: number;
+  utilizationPct: number;
+  affectedOpenPositions: number;
+  totalOpenPositions: number;
+  affectedFraction: number;
 };
 
 export type SessionTimelinePoint = {
@@ -244,12 +264,14 @@ export type SourceVsSessionComparison = {
   };
   gaps: {
     netPnlGap: number;
+    realizedOnlyNetPnlGap: number;
     realizedGap: number;
     unrealizedGap: number;
     feeGap: number;
     frictionDrag: number;
     executionDrag: number;
     percentGap: number | null;
+    markContaminatedPortionBps: number;
   };
   curves: {
     sourceNetPnl: Array<{ timestamp: string; value: number }>;
@@ -265,10 +287,19 @@ export type SourceVsSessionComparison = {
       | 'NEUTRAL';
     summary: string;
   };
+  feeInferenceRisk: FeeInferenceRisk;
   markContaminationWarning: boolean;
   sourceHasOpenPositions: boolean;
   sessionHasOpenPositions: boolean;
   unrealizedAsymmetryBps: number;
+  markRisk: {
+    warning: true;
+    sourceHasOpenPositions: boolean;
+    sessionHasOpenPositions: boolean;
+    unrealizedAsymmetryBps: number;
+    recommendedGapField: 'realizedOnlyNetPnlGap';
+    reason: string;
+  } | null;
 };
 
 type PositionAccumulator = {
@@ -309,6 +340,57 @@ type ReductionMutableState = {
   impossibleStateTransitions: number;
   normalizationFailureCount: number;
 };
+
+function roundPct1dp(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(value * 10) / 10;
+}
+
+export function buildTruncationRisk(input: {
+  eventsScanned: number;
+  eventCap: number;
+  affectedOpenPositions: number;
+  totalOpenPositions: number;
+}): TruncationRisk {
+  const safeCap = Math.max(1, Math.floor(input.eventCap));
+  const safeScanned = Math.max(0, Math.floor(input.eventsScanned));
+  const safeAffected = Math.max(0, Math.floor(input.affectedOpenPositions));
+  const safeTotalOpen = Math.max(0, Math.floor(input.totalOpenPositions));
+
+  return {
+    eventsScanned: safeScanned,
+    eventCap: safeCap,
+    utilizationPct: roundPct1dp((safeScanned / safeCap) * 100),
+    affectedOpenPositions: safeAffected,
+    totalOpenPositions: safeTotalOpen,
+    affectedFraction: roundPct1dp((safeAffected / Math.max(1, safeTotalOpen)) * 100),
+  };
+}
+
+export function buildFeeInferenceRisk(input: {
+  tradeLikeEventCount: number;
+  inferredFeeEvents: number;
+  inferredFeeTotalUsd: number;
+}): FeeInferenceRisk {
+  const tradeLikeEventCount = Math.max(0, Math.floor(input.tradeLikeEventCount));
+  const inferredFeeEvents = Math.max(0, Math.floor(input.inferredFeeEvents));
+  const inferredFeeTotalUsd = normalizeMoney(Math.max(0, input.inferredFeeTotalUsd));
+
+  const inferredFeeRatePct = roundPct1dp(
+    (inferredFeeEvents / Math.max(1, tradeLikeEventCount)) * 100,
+  );
+  const minOverstatement = normalizeMoney(inferredFeeTotalUsd * 0.5);
+  const maxOverstatement = normalizeMoney(inferredFeeTotalUsd);
+
+  return {
+    inferredFeeRatePct,
+    potentialFeeOverstatementUsd: {
+      minOverstatement,
+      maxOverstatement,
+    },
+    note: 'Maker fills on Polymarket can have 0% fees. If some inferred-fee events were actually maker fills, source-side fees may be overstated within this range.',
+  };
+}
 
 export type TimelineBucket = 'RAW' | '5M' | '15M' | '1H';
 
@@ -989,9 +1071,11 @@ export function reduceTrackedWalletEvents(input: {
       tradeLikeEventCount: 0,
       buyEventCount: 0,
       sellEventCount: 0,
+      explicitFeeEvents: 0,
       inferredShareEvents: 0,
       inferredPriceEvents: 0,
       inferredFeeEvents: 0,
+      inferredFeeTotalUsd: 0,
       missingFeeEvents: 0,
       feeCoveragePct: 100,
       duplicateSkipped: 0,
@@ -1086,9 +1170,15 @@ export function reduceTrackedWalletEvents(input: {
         eventId: event.id,
         message: 'Event had no explicit fee; canonical known net is not fully authoritative.',
       });
-    }
-    if (eventForAccounting.feeIsInferred) {
+    } else if (eventForAccounting.feeIsInferred) {
       state.summary.inferredFeeEvents += 1;
+      if (eventForAccounting.fee !== null && Number.isFinite(eventForAccounting.fee)) {
+        state.summary.inferredFeeTotalUsd = normalizeMoney(
+          state.summary.inferredFeeTotalUsd + eventForAccounting.fee,
+        );
+      }
+    } else {
+      state.summary.explicitFeeEvents += 1;
     }
 
     const marketKey = normalizeMarketKey({
@@ -1363,6 +1453,12 @@ export function compareSourceVsSession(input: {
   sessionTimeline: SessionTimelinePoint[];
   windowStart: string;
   windowEnd: string;
+  sessionStartingCash?: number;
+  sourceFeeStats?: {
+    tradeLikeEventCount: number;
+    inferredFeeEvents: number;
+    inferredFeeTotalUsd: number;
+  };
 }): SourceVsSessionComparison {
   const startMs = new Date(input.windowStart).getTime();
   const baselineTimestamp = Number.isFinite(startMs)
@@ -1471,6 +1567,10 @@ export function compareSourceVsSession(input: {
   const realizedGap = normalizeMoney(sourceRealized - sessionRealized);
   const unrealizedGap = normalizeMoney(sourceUnrealized - sessionUnrealized);
   const netPnlGap = normalizeMoney(sourceNetPnl - sessionNetPnl);
+  const realizedOnlyNetPnlGap = normalizeMoney(sourceRealized - sessionRealized - sessionFees);
+
+  const sessionStartingCash = Math.max(1, Number(input.sessionStartingCash ?? 1));
+  const markContaminatedPortionBps = normalizeMoney((unrealizedGap / sessionStartingCash) * 10000);
 
   const frictionDrag = normalizeMoney(Math.max(0, netPnlGap));
   const executionDrag = normalizeMoney(Math.max(0, feeGap));
@@ -1502,6 +1602,23 @@ export function compareSourceVsSession(input: {
             ? 'Source and session divergence is mixed between source edge shifts and copy friction.'
             : 'Source and session are broadly aligned over this window.';
 
+  const feeInferenceRisk = buildFeeInferenceRisk({
+    tradeLikeEventCount: input.sourceFeeStats?.tradeLikeEventCount ?? 0,
+    inferredFeeEvents: input.sourceFeeStats?.inferredFeeEvents ?? 0,
+    inferredFeeTotalUsd: input.sourceFeeStats?.inferredFeeTotalUsd ?? 0,
+  });
+  const markRisk = markContaminationWarning
+    ? {
+        warning: true as const,
+        sourceHasOpenPositions,
+        sessionHasOpenPositions,
+        unrealizedAsymmetryBps: normalizeMoney(unrealizedAsymmetryBps),
+        recommendedGapField: 'realizedOnlyNetPnlGap' as const,
+        reason:
+          'Unrealized exposure is present on at least one side. Mark-to-market differences can contaminate total net PnL gap; prefer realizedOnlyNetPnlGap for cleaner attribution.',
+      }
+    : null;
+
   return {
     source: {
       realizedPnlGross: sourceRealized,
@@ -1517,12 +1634,14 @@ export function compareSourceVsSession(input: {
     },
     gaps: {
       netPnlGap,
+      realizedOnlyNetPnlGap,
       realizedGap,
       unrealizedGap,
       feeGap,
       frictionDrag,
       executionDrag,
       percentGap,
+      markContaminatedPortionBps,
     },
     curves: {
       sourceNetPnl: sourceCurve,
@@ -1533,9 +1652,11 @@ export function compareSourceVsSession(input: {
       dominantDriver,
       summary,
     },
+    feeInferenceRisk,
     markContaminationWarning,
     sourceHasOpenPositions,
     sessionHasOpenPositions,
-    unrealizedAsymmetryBps,
+    unrealizedAsymmetryBps: normalizeMoney(unrealizedAsymmetryBps),
+    markRisk,
   };
 }
