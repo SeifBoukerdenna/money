@@ -1832,6 +1832,7 @@ export async function registerRoutes(app: any): Promise<void> {
                 totalPnl: true,
                 returnPct: true,
                 realizedPnl: true,
+                fees: true,
               },
             }),
             db.paperCopyPosition.count({ where: { sessionId, status: 'OPEN' } }),
@@ -1867,6 +1868,7 @@ export async function registerRoutes(app: any): Promise<void> {
             ? Number(latestSnapshot.netLiquidationValue)
             : Number(s.currentCash),
           totalPnl,
+          fees: latestSnapshot ? Number(latestSnapshot.fees) : 0,
           returnPct: latestSnapshot ? Number(latestSnapshot.returnPct) : 0,
           realizedPnl: latestSnapshot ? Number(latestSnapshot.realizedPnl) : 0,
           openPositionsCount: openCount,
@@ -2251,7 +2253,7 @@ export async function registerRoutes(app: any): Promise<void> {
           db.paperPortfolioSnapshot.findFirst({
             where: { sessionId: row.id },
             orderBy: { timestamp: 'desc' },
-            select: { totalPnl: true, returnPct: true, netLiquidationValue: true },
+            select: { totalPnl: true, returnPct: true, netLiquidationValue: true, fees: true },
           }),
           db.paperCopyPosition.findMany({
             where: { sessionId: row.id, status: 'CLOSED' },
@@ -2291,6 +2293,7 @@ export async function registerRoutes(app: any): Promise<void> {
           lastAutoPausedAt: row.lastAutoPausedAt,
           totalPnl: latestSnapshot ? Number(latestSnapshot.totalPnl) : 0,
           returnPct: latestSnapshot ? Number(latestSnapshot.returnPct) : 0,
+          fees: latestSnapshot ? Number(latestSnapshot.fees) : 0,
           netLiquidationValue: latestSnapshot
             ? Number(latestSnapshot.netLiquidationValue)
             : Number(row.currentCash),

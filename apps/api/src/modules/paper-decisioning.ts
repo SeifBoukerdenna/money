@@ -1,4 +1,5 @@
 import type { PaperCopySession } from '@prisma/client';
+import { calculateSlippage, type SlippageConfig, type SlippageInput } from './slippage.js';
 
 export const PAPER_REASON_CODES = {
   COPY_APPROVED: 'COPY_APPROVED',
@@ -10,8 +11,8 @@ export const PAPER_REASON_CODES = {
   SKIP_NO_OPEN_POSITION: 'SKIP_NO_OPEN_POSITION',
   SKIP_INVALID_SOURCE_SIZE: 'SKIP_INVALID_SOURCE_SIZE',
   SKIP_GUARDRAIL_WALLET_QUALITY: 'SKIP_GUARDRAIL_WALLET_QUALITY',
-  SKIP_GUARDRAIL_DRAWDOWN: 'SKIP_GUARDRAIL_DRAWDOWN',
   SKIP_GUARDRAIL_HEALTH_DEGRADED: 'SKIP_GUARDRAIL_HEALTH_DEGRADED',
+  SKIP_MAX_ADVERSE_MOVE: 'SKIP_MAX_ADVERSE_MOVE',
   REDUCE_ON_SOURCE_REDUCTION: 'REDUCE_ON_SOURCE_REDUCTION',
   CLOSE_ON_SOURCE_EXIT: 'CLOSE_ON_SOURCE_EXIT',
   BOOTSTRAP_EXISTING_POSITION: 'BOOTSTRAP_EXISTING_POSITION',
@@ -269,7 +270,7 @@ export function evaluatePaperEventDecision(input: {
     | 'slippageBps'
     | 'copyRatio'
     | 'startedAt'
-  >;
+  > & { slippageConfig?: any };
   event: Record<string, unknown>;
   projectedCash: number;
   projectedGrossExposure: number;
@@ -340,7 +341,10 @@ export function evaluatePaperEventDecision(input: {
         side: 'SELL',
         copyRatio,
         reasonCode: PAPER_REASON_CODES.SKIP_NO_OPEN_POSITION,
-        humanReason: 'Source exit event arrived but no open copied position exists to close.',
+        humanReason:
+          eventType === 'REDEEM'
+            ? 'Ignored REDEEM: Copied position is already closed or was never opened.'
+            : 'Source exit event arrived but no open copied position exists to close.',
         sizingInputsJson: {
           eventType,
           triedMarketId: marketId,
@@ -455,18 +459,52 @@ export function evaluatePaperEventDecision(input: {
     });
   }
 
-  const slippageSign = effectiveSide === 'BUY' ? 1 : -1;
-  const slippageBps = Number(session.slippageBps);
-  const intendedFillPrice = Math.max(
-    0.0001,
-    sourcePrice + sourcePrice * (slippageBps / 10_000) * slippageSign,
-  );
   const maxPerMarket = Number(session.maxAllocationPerMarket);
   const minNotional = Number(session.minNotionalThreshold);
   const maxTotalExposure = Number(session.maxTotalExposure);
 
+  const slippageConfig = (session.slippageConfig ?? null) as SlippageConfig | null;
+
   let simulatedShares = sourceShares * copyRatio;
+  let latencyMs: number | undefined = undefined;
+  if (event.detectedAt instanceof Date && event.eventTimestamp instanceof Date) {
+    latencyMs = Math.max(0, event.detectedAt.getTime() - event.eventTimestamp.getTime());
+  }
+
+  const slippageInput: any = {
+    side: effectiveSide,
+    sourcePrice,
+    simulatedShares,
+  };
+  if (latencyMs !== undefined) slippageInput.latencyMs = latencyMs;
+
+  const slippageResult = calculateSlippage(slippageInput as SlippageInput, slippageConfig);
+
+  const intendedFillPrice = slippageResult.fillPrice;
   let notional = simulatedShares * intendedFillPrice;
+
+  if (slippageResult.isSkipped) {
+    return skipDecision({
+      marketId,
+      marketQuestion,
+      outcome,
+      side: effectiveSide,
+      sourceShares,
+      sourcePrice,
+      copyRatio,
+      reasonCode: PAPER_REASON_CODES.SKIP_MAX_ADVERSE_MOVE,
+      humanReason: slippageResult.skipReason ?? 'Trade skipped due to slippage policy.',
+      sizingInputsJson: {
+        eventType,
+        slippageResult,
+        sourceNotional,
+      },
+      riskChecksJson: {
+        latencyMs,
+        maxAdverseMovePercent: slippageConfig?.maxAdverseMovePercent,
+      },
+    });
+  }
 
   if (effectiveSide === 'BUY') {
     const availableCashCap = Math.min(projectedCash, maxPerMarket);
@@ -552,7 +590,7 @@ export function evaluatePaperEventDecision(input: {
       sourcePrice,
       intendedFillPrice,
       copyRatio,
-      sizingInputsJson: { eventType, projectedCash, maxPerMarket },
+      sizingInputsJson: { eventType, projectedCash, maxPerMarket, slippageResult },
       reasonCode: PAPER_REASON_CODES.COPY_APPROVED,
       humanReason: 'Source buy approved for copy execution under current session guardrails.',
       riskChecksJson: { projectedCash, maxTotalExposure },

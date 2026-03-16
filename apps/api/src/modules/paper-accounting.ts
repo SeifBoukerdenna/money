@@ -50,6 +50,8 @@ export type ReducedSessionState = {
   cash: number;
   realizedPnl: number;
   unrealizedPnl: number;
+  totalPnl: number;
+  fees: number;
   netLiquidationValue: number;
   grossExposure: number;
   openPositionsCount: number;
@@ -146,7 +148,7 @@ function applyLedgerRow(
     return 0;
   }
 
-  const realized = normalizeMoney(closeShares * (price - position.avgEntryPrice) - fee);
+  const realized = normalizeMoney(closeShares * (price - position.avgEntryPrice));
   position.realizedPnl += realized;
   position.netShares = Math.max(0, held - closeShares);
 
@@ -229,8 +231,10 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
   const warnings: LedgerWarning[] = [];
   const positionsByKey = new Map<string, PositionState>();
   let cash = Number(session.startingCash);
+  let fees = 0;
 
   for (const row of rows) {
+    fees += Number(row.feeApplied);
     const cashDelta = applyLedgerRow(positionsByKey, warnings, {
       ...row,
       simulatedPrice: Number(row.simulatedPrice),
@@ -281,11 +285,29 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     .filter((p) => p.status === 'OPEN')
     .reduce((sum, p) => sum + p.netShares * p.currentMarkPrice, 0);
 
+  const netLiquidationValue = cash + openMarketValue;
+  const startingCapital = Number(session.startingCash);
+  const totalPnl = netLiquidationValue - startingCapital;
+
+  if (Math.abs(startingCapital + realizedPnl + unrealizedPnl - fees - netLiquidationValue) > 0.05) {
+    logger.warn(
+      { sessionId, startingCapital, realizedPnl, unrealizedPnl, fees, netLiquidationValue },
+      'Ledger reconciliation mismatch: startingCapital + realizedPnL + unrealizedPnL - fees != accountValue',
+    );
+  }
+
+  logger.info(
+    { startingCapital, cash, positionValue: openMarketValue, accountValue: netLiquidationValue, realizedPnl, unrealizedPnl, fees, netPnl: totalPnl },
+    'Ledger reconciliation output explicit mathematical breakdown',
+  );
+
   return {
     cash,
     realizedPnl,
     unrealizedPnl,
-    netLiquidationValue: cash + openMarketValue,
+    totalPnl,
+    fees,
+    netLiquidationValue,
     grossExposure,
     openPositionsCount,
     warnings,

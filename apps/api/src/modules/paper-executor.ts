@@ -112,6 +112,7 @@ export class PaperLedgerExecutor implements PaperExecutorPort {
             humanReason: decision.humanReason,
             sizingInputs: decision.sizingInputsJson,
             riskChecks: decision.riskChecksJson,
+            slippageResult: decision.sizingInputsJson?.slippageResult ?? null,
           },
         },
       });

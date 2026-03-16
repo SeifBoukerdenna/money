@@ -447,6 +447,7 @@ model PaperCopySession {
   lastAutoPausedAt      DateTime?
   feeBps                Int     @default(0)
   slippageBps           Int     @default(0)
+  slippageConfig        Json?
   startedAt             DateTime?
   endedAt               DateTime?
   lastProcessedEventAt  DateTime?
@@ -597,6 +598,7 @@ model PaperPortfolioSnapshot {
   unrealizedPnl     Decimal
   totalPnl          Decimal
   returnPct         Decimal
+  fees              Decimal @default(0)
   createdAt         DateTime @default(now())
   session           PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
@@ -612,6 +614,7 @@ model PaperSessionMetricPoint {
   unrealizedPnl      Decimal
   netLiquidationValue Decimal
   openPositionsCount Int
+  fees               Decimal @default(0)
   createdAt          DateTime @default(now())
   session            PaperCopySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 

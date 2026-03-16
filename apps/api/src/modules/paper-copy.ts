@@ -8,6 +8,7 @@ import {
   PAPER_REASON_CODES,
 } from './paper-decisioning.js';
 import { resolvePaperExecutor } from './paper-executor.js';
+import { calculateSlippage, type SlippageConfig } from './slippage.js';
 import { raiseSystemAlert } from './system-alerts.js';
 import { closeResolvedPositions } from './force-close.js';
 import { processWalletPoll } from './ingestion.js';
@@ -63,6 +64,7 @@ export async function createPaperCopySession(input: {
   autoPauseOnHealthDegradation?: boolean;
   feeBps?: number;
   slippageBps?: number;
+  slippageConfig?: any;
 }) {
   const wallet = await prisma.watchedWallet.findUnique({
     where: { id: input.trackedWalletId },
@@ -95,6 +97,7 @@ export async function createPaperCopySession(input: {
       // Illiquid / newly listed markets can see 50-150 bps slippage.
       feeBps: input.feeBps ?? 200,
       slippageBps: input.slippageBps ?? 20,
+      slippageConfig: input.slippageConfig ?? null,
     },
   });
 }
@@ -1151,9 +1154,10 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
   if (!opts.force && nowMs - lastAt < MIN_SNAPSHOT_INTERVAL_MS) return;
   _lastSnapshotAt.set(sessionId, nowMs);
 
-  const [session, positions] = await Promise.all([
+  const [session, positions, trades] = await Promise.all([
     db.paperCopySession.findUnique({ where: { id: sessionId } }),
     db.paperCopyPosition.findMany({ where: { sessionId } }),
+    db.paperCopyTrade.findMany({ where: { sessionId }, select: { feeApplied: true } }),
   ]);
   if (!session) return;
 
@@ -1169,6 +1173,7 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
   );
   const realizedPnl = positions.reduce((s: number, p: any) => s + Number(p.realizedPnl), 0);
   const unrealizedPnl = openPos.reduce((s: number, p: any) => s + Number(p.unrealizedPnl), 0);
+  const fees = trades.reduce((s: number, t: any) => s + Number(t.feeApplied), 0);
 
   const cash = Number(session.currentCash);
   const netLiquidationValue = cash + openMarketValue;
@@ -1187,6 +1192,7 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
       realizedPnl,
       unrealizedPnl,
       totalPnl,
+      fees,
       returnPct,
     },
   });
@@ -1198,6 +1204,7 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
       totalPnl,
       realizedPnl,
       unrealizedPnl,
+      fees,
       netLiquidationValue,
       openPositionsCount: openPos.length,
     },

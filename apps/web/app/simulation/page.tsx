@@ -21,6 +21,7 @@ type SessionListItem = {
     currentCash: number;
     startedAt: string | null;
     totalPnl: number;
+    fees: number;
     returnPct: number;
     winRatePct?: number;
 };
@@ -32,6 +33,7 @@ type SessionDetail = {
     currentCash: number;
     startedAt: string | null;
     totalPnl: number;
+    fees: number;
     returnPct: number;
     winCount: number;
     lossCount: number;
@@ -89,15 +91,15 @@ type PaperTrade = {
 };
 
 type TabKey = 'live' | 'positions' | 'history' | 'market-history';
-type PositionSortKey = 'market' | 'shares' | 'value' | 'pnl' | 'since';
+type PositionSortKey = 'market' | 'outcome' | 'shares' | 'entry' | 'mark' | 'value' | 'pnl' | 'since';
 type SortDir = 'asc' | 'desc';
 
-const fmtUsd = (n: number, dp = 2) =>
-    `$${n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
+const fmtUsd = (n?: number | null, dp = 2) =>
+    `$${(n ?? 0).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
 
 // FIX: Epsilon-based normalization so +$0.00 / -$0.00 never appear
-const normMoney = (v: number) => (Math.abs(v) < 1e-9 ? 0 : v);
-const fmtPnl = (n: number) => {
+const normMoney = (v?: number | null) => (Math.abs(v ?? 0) < 1e-9 ? 0 : (v ?? 0));
+const fmtPnl = (n?: number | null) => {
     const v = normMoney(n);
     if (v > 0) return `+${fmtUsd(v)}`;
     if (v < 0) return `-${fmtUsd(Math.abs(v))}`;
@@ -139,6 +141,11 @@ export default function SimulationPage() {
     const [startingCash, setStartingCash] = useState('1000');
     const [copyRatio, setCopyRatio] = useState<'1' | '0.5' | '0.25'>('1');
     const [minNotional, setMinNotional] = useState('2');
+
+    const [slippageMode, setSlippageMode] = useState<string>('FIXED_BPS');
+    const [slippageValue1, setSlippageValue1] = useState('20');
+    const [slippageValue2, setSlippageValue2] = useState('');
+    const [maxAdverse, setMaxAdverse] = useState('');
 
     const [sourceSummary, setSourceSummary] = useState<SourceSummary | null>(null);
     const [sourcePnl, setSourcePnl] = useState<SourcePnlSummary | null>(null);
@@ -330,6 +337,18 @@ export default function SimulationPage() {
 
         setCreating(true);
         try {
+            let slippageConfig = null;
+            if (slippageMode !== 'NONE') {
+                slippageConfig = {
+                    enabled: true,
+                    mode: slippageMode,
+                    maxAdverseMovePercent: maxAdverse ? Number(maxAdverse) / 100 : undefined,
+                    ...(slippageMode === 'FIXED_PERCENT' ? { fixedPercent: Number(slippageValue1) / 100 } : {}),
+                    ...(slippageMode === 'FIXED_BPS' ? { fixedBps: Number(slippageValue1) } : {}),
+                    ...(slippageMode === 'RANDOM_RANGE' ? { randomRange: { min: Number(slippageValue1) / 100, max: Number(slippageValue2) / 100 } } : {})
+                };
+            }
+
             const createResp = await fetch(`${API}/paper-copy-sessions`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -340,6 +359,7 @@ export default function SimulationPage() {
                     minNotionalThreshold: minNotionalValue,
                     maxAllocationPerMarket: cash,
                     maxTotalExposure: cash,
+                    slippageConfig
                 }),
             });
             if (!createResp.ok) {
@@ -508,8 +528,12 @@ export default function SimulationPage() {
     }, [openLots]);
 
     const realizedPnlSummary = useMemo(
-        () => closedPositions.reduce((sum, p) => sum + p.realizedPnl, 0),
-        [closedPositions],
+        () => {
+            const closedSum = closedPositions.reduce((sum, p) => sum + p.realizedPnl, 0);
+            const openSum = openPositions.reduce((sum, p) => sum + p.realizedPnl, 0);
+            return closedSum + openSum;
+        },
+        [closedPositions, openPositions],
     );
 
     // FIX: Win rate excludes breakeven from denominator
@@ -531,7 +555,10 @@ export default function SimulationPage() {
 
             let cmp = 0;
             if (positionSortBy === 'market') cmp = (a.marketQuestion ?? a.marketId).localeCompare(b.marketQuestion ?? b.marketId);
+            if (positionSortBy === 'outcome') cmp = a.outcome.localeCompare(b.outcome);
             if (positionSortBy === 'shares') cmp = a.remainingShares - b.remainingShares;
+            if (positionSortBy === 'entry') cmp = a.entryPrice - b.entryPrice;
+            if (positionSortBy === 'mark') cmp = a.currentMarkPrice - b.currentMarkPrice;
             if (positionSortBy === 'value') cmp = aValue - bValue;
             if (positionSortBy === 'pnl') cmp = a.unrealizedPnl - b.unrealizedPnl;
             if (positionSortBy === 'since') cmp = aSince - bSince;
@@ -589,11 +616,56 @@ export default function SimulationPage() {
                             <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Min Notional</label>
                             <input className="input mt-1" value={minNotional} onChange={(e) => setMinNotional(e.target.value)} placeholder="0" />
                         </div>
-                        <button className="btn-primary h-10 px-5" disabled={creating} onClick={createAndStart}>
+                    </div>
+
+                    <div className="mt-4 flex flex-wrap items-end gap-3 rounded border border-slate-800/50 bg-slate-900/30 p-4">
+                        <div className="w-44">
+                            <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Slippage Mode</label>
+                            <select className="input mt-1 bg-slate-950/50" value={slippageMode} onChange={(e) => setSlippageMode(e.target.value)}>
+                                <option value="NONE">None</option>
+                                <option value="FIXED_BPS">Fixed BPS</option>
+                                <option value="FIXED_PERCENT">Fixed Percent</option>
+                                <option value="RANDOM_RANGE">Random Range</option>
+                            </select>
+                        </div>
+                        
+                        {slippageMode === 'FIXED_BPS' && (
+                            <div className="w-32">
+                                <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Penalty (BPS)</label>
+                                <input className="input mt-1 bg-slate-950/50" value={slippageValue1} onChange={(e) => setSlippageValue1(e.target.value)} placeholder="e.g. 20" />
+                            </div>
+                        )}
+                        {slippageMode === 'FIXED_PERCENT' && (
+                            <div className="w-32">
+                                <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Penalty (%)</label>
+                                <input className="input mt-1 bg-slate-950/50" value={slippageValue1} onChange={(e) => setSlippageValue1(e.target.value)} placeholder="e.g. 0.5" />
+                            </div>
+                        )}
+                        {slippageMode === 'RANDOM_RANGE' && (
+                            <>
+                                <div className="w-32">
+                                    <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Min (%)</label>
+                                    <input className="input mt-1 bg-slate-950/50" value={slippageValue1} onChange={(e) => setSlippageValue1(e.target.value)} placeholder="0.1" />
+                                </div>
+                                <div className="w-32">
+                                    <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Max (%)</label>
+                                    <input className="input mt-1 bg-slate-950/50" value={slippageValue2} onChange={(e) => setSlippageValue2(e.target.value)} placeholder="1.0" />
+                                </div>
+                            </>
+                        )}
+
+                        <div className="w-48">
+                            <label className="text-[10px] font-semibold uppercase tracking-wider text-amber-500/80">Max Adverse Skip (%)</label>
+                            <input className="input mt-1 bg-slate-950/50 border-amber-500/20 focus:border-amber-500/50 placeholder-slate-600" value={maxAdverse} onChange={(e) => setMaxAdverse(e.target.value)} placeholder="Optional (e.g. 2.0)" />
+                        </div>
+
+                        <div className="flex-1"></div>
+                        <button className="btn-primary h-10 px-8" disabled={creating} onClick={createAndStart}>
                             {creating ? 'Starting...' : 'Start Copy Trading ->'}
                         </button>
                     </div>
-                    {err && <p className="mt-2 text-xs text-rose-400">{err}</p>}
+
+                    {err && <p className="mt-3 text-sm text-rose-400 font-medium">{err}</p>}
 
                     {walletId && sourceSummary && sourcePnl && (
                         <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
@@ -611,7 +683,7 @@ export default function SimulationPage() {
                         <table className="w-full text-sm">
                             <thead>
                                 <tr className="border-b border-slate-800/60 text-[10px] uppercase tracking-wider text-slate-500">
-                                    <th className="py-2 text-left">Wallet</th><th className="py-2 text-right">Status</th><th className="py-2 text-right">Cash</th><th className="py-2 text-right">P&L</th><th className="py-2 text-right">Return%</th><th className="py-2 text-right">Win Rate</th><th className="py-2 text-right">Started</th><th className="py-2 text-right">Actions</th>
+                                    <th className="py-2 text-left">Wallet</th><th className="py-2 text-right">Status</th><th className="py-2 text-right">Cash</th><th className="py-2 text-right">Net P&amp;L</th><th className="py-2 text-right">Return%</th><th className="py-2 text-right">Win Rate</th><th className="py-2 text-right">Started</th><th className="py-2 text-right">Actions</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-800/30">
@@ -635,16 +707,52 @@ export default function SimulationPage() {
                 {detail && selected && (
                     <div className="space-y-4">
                         <div className="panel p-4">
-                            <div className="flex flex-wrap items-center justify-between gap-3">
+                            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
                                 <div>
                                     <p className="text-lg font-semibold text-slate-100">{detail.trackedWalletLabel} | Started {shortDateTime(detail.startedAt)}</p>
-                                    <p className="mt-1 text-xs text-slate-400">Cash: {fmtUsd(detail.currentCash, 0)} | Open: {openLots.length} lots | P&amp;L: <span className={pnlClass(detail.totalPnl)}>{fmtPnl(detail.totalPnl)} ({fmtPct(detail.returnPct)})</span> | Unrealized: <span className={pnlClass(openLotsSummary.totalUnrealizedPnl)}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</span> | Realized: <span className={pnlClass(realizedPnlSummary)}>{fmtPnl(realizedPnlSummary)}</span> | Win rate (closed): {detail.winRatePct.toFixed(1)}%</p>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${statusPill(detail.status)}`}>{detail.status}</span>
                                     {detail.status === 'RUNNING' && <button className="btn-muted text-xs" onClick={() => sessionAction('pause')}>Pause</button>}
                                     {detail.status === 'PAUSED' && <button className="btn-muted text-xs" onClick={() => sessionAction('resume')}>Resume</button>}
                                     {detail.status !== 'COMPLETED' && <button className="btn-muted text-xs text-rose-300" onClick={() => sessionAction('stop')}>Stop</button>}
+                                </div>
+                            </div>
+                            
+                            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8 mb-2">
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Account Value</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">{fmtUsd(detail.currentCash + openLotsSummary.totalValue, 2)}</p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Cash</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">{fmtUsd(detail.currentCash, 0)}</p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Open</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">{openLots.length} lots</p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Net P&amp;L</p>
+                                    <p className={`mt-1 text-sm font-semibold flex items-baseline gap-1 ${pnlClass(detail.totalPnl)}`}>
+                                        {fmtPnl(detail.totalPnl)} <span className="text-[10px] font-normal opacity-80">({fmtPct(detail.returnPct)})</span>
+                                    </p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Unrealized</p>
+                                    <p className={`mt-1 text-sm font-semibold ${pnlClass(openLotsSummary.totalUnrealizedPnl)}`}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Realized</p>
+                                    <p className={`mt-1 text-sm font-semibold ${pnlClass(realizedPnlSummary)}`}>{fmtPnl(realizedPnlSummary)}</p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Fees</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-400">-{fmtUsd(detail.fees)}</p>
+                                </div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
+                                    <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Win Rate</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">{closedWinRatePct.toFixed(1)}%</p>
                                 </div>
                             </div>
                             <p className="mt-2 text-[11px] text-slate-500">Last updated: {lastUpdatedSeconds != null ? `${lastUpdatedSeconds}s ago` : '-'}</p>
@@ -705,10 +813,10 @@ export default function SimulationPage() {
                                                     <thead>
                                                         <tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500">
                                                             <th className="cursor-pointer py-2 text-left" onClick={() => togglePositionSort('market')}>Market{sortLabel('market')}</th>
-                                                            <th className="py-2 text-right">Outcome</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('outcome')}>Outcome{sortLabel('outcome')}</th>
                                                             <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('shares')}>Shares{sortLabel('shares')}</th>
-                                                            <th className="py-2 text-right">Entry</th>
-                                                            <th className="py-2 text-right">Mark</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('entry')}>Entry{sortLabel('entry')}</th>
+                                                            <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('mark')}>Mark{sortLabel('mark')}</th>
                                                             <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('value')}>Value{sortLabel('value')}</th>
                                                             <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('pnl')}>P&L{sortLabel('pnl')}</th>
                                                             <th className="cursor-pointer py-2 text-right" onClick={() => togglePositionSort('since')}>Since{sortLabel('since')}</th>
