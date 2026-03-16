@@ -80,3 +80,38 @@ Scope: Source-wallet ingestion/reduction/API semantics for tracked-wallet perfor
 1. Full transfer/cashflow semantics are still bounded by available event attributes in source activity feed.
 2. Canonical known net is intentionally conservative and may understate true net when unknown components exist.
 3. Truncation by event cap can still occur; now explicitly flagged and confidence-downgraded.
+
+## 2026 Engineering Fixes
+
+1. Issue 1 — live-book anchored fill pricing and book-gap visibility.
+- Files: apps/api/src/modules/slippage.ts, apps/api/src/modules/paper-decisioning.ts, apps/api/src/modules/paper-copy.ts, apps/api/tests/slippage.test.ts, apps/api/tests/paper-decisioning.test.ts.
+
+2. Issue 2 — half-spread friction layered before slippage/drift and exposed in telemetry.
+- Files: apps/api/src/modules/slippage.ts, apps/api/src/modules/paper-decisioning.ts, apps/api/tests/slippage.test.ts.
+
+3. Issue 3 — pagination truncation detection, summary flags, and operator warning.
+- Files: apps/api/src/modules/ingestion.ts, apps/api/tests/ingestion-watermark.test.ts.
+
+4. Issue 4 — skipped max-adverse-move accounting surfaced as parallel conservative lower bound.
+- Files: apps/api/src/modules/paper-copy.ts, apps/api/tests/paper-copy.test.ts.
+
+5. Issue 5 — invariant tolerance moved to max(0.01, startingCapital*0.0001), drift materiality context added, cumulative drift tracked.
+- Files: apps/api/src/modules/paper-accounting.ts, apps/api/src/modules/paper-copy.ts, apps/api/src/routes.ts, apps/api/tests/paper-accounting.test.ts.
+
+6. Issue 6 — realized/unrealized/fees/net breakout promoted to top-level session and analytics payloads with unrealized quality warnings.
+- Files: apps/api/src/modules/paper-copy.ts, apps/api/src/routes.ts, apps/api/tests/paper-copy.test.ts.
+
+7. Issue 7 — explicit win-rate definition declared and gross-vs-net split exposed.
+- Files: packages/wallet-analytics/src/index.ts, packages/wallet-analytics/tests/wallet-analytics.test.ts, apps/api/src/routes.ts.
+
+8. Issue 8 — insert-failure gap risk tracking with reconciliation issue persistence.
+- Files: apps/api/src/modules/ingestion.ts, apps/api/tests/ingestion-watermark.test.ts.
+
+9. Issue 9 — source-vs-session mark contamination metadata and warning path.
+- Files: apps/api/src/modules/tracked-wallet-performance.ts, apps/api/src/routes.ts, apps/api/tests/tracked-wallet-performance.test.ts.
+
+10. Issue 10 — queue/processing/total latency transparency added to sizing inputs and analytics friction summary.
+- Files: apps/api/src/modules/paper-copy.ts, apps/api/tests/paper-copy.test.ts.
+
+11. Cross-cutting — simulation bias report added to session detail payload.
+- Files: apps/api/src/routes.ts.

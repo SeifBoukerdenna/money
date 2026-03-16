@@ -428,6 +428,28 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
   const nlv = latestSnapshot
     ? Number(latestSnapshot.netLiquidationValue)
     : Number(session.currentCash);
+  const realizedPnl = positions.reduce((sum: number, row: any) => sum + Number(row.realizedPnl), 0);
+  const unrealizedPnl = positions
+    .filter((row: any) => row.status === 'OPEN')
+    .reduce((sum: number, row: any) => sum + Number(row.unrealizedPnl), 0);
+  const totalFees = trades.reduce((sum: number, row: any) => sum + Number(row.feeApplied ?? 0), 0);
+  const netPnl = realizedPnl + unrealizedPnl - totalFees;
+  const openPositionCount = positions.filter((row: any) => row.status === 'OPEN').length;
+  const openPositionGrossExposure = positions
+    .filter((row: any) => row.status === 'OPEN')
+    .reduce(
+      (sum: number, row: any) =>
+        sum + Math.abs(Number(row.netShares) * Number(row.currentMarkPrice)),
+      0,
+    );
+  const realizedFraction = Math.abs(netPnl) > 1e-9 ? realizedPnl / netPnl : null;
+  const unrealizedFraction = Math.abs(netPnl) > 1e-9 ? unrealizedPnl / Math.abs(netPnl) : 0;
+  const dataQualityWarnings: string[] = [];
+  if (Math.abs(netPnl) > 1e-9 && unrealizedPnl / Math.abs(netPnl) > 0.25) {
+    dataQualityWarnings.push(
+      'More than 25% of net PnL is unrealized. Result is sensitive to current mark prices and may change on resolution.',
+    );
+  }
   const startedAtMs = session.startedAt ? new Date(session.startedAt).getTime() : null;
   const endedAtMs = session.endedAt ? new Date(session.endedAt).getTime() : null;
   const runtimeSeconds =
@@ -446,6 +468,7 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
       acc: {
         count: number;
         latencyMs: number;
+        totalLatencyMs: number;
         slippageBps: number;
         driftBps: number;
         totalAdverseBps: number;
@@ -455,28 +478,65 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
       const sr = (d?.sizingInputsJson as Record<string, any>).slippageResult as Record<string, any>;
       acc.count += 1;
       acc.latencyMs += Number(sr.latencyApplied ?? 0);
+      acc.totalLatencyMs += Number(
+        (d?.sizingInputsJson as Record<string, any>)?.totalObservedLatencyMs ?? 0,
+      );
       acc.slippageBps += Number(sr.slippageBps ?? 0);
       acc.driftBps += Number(sr.driftBps ?? 0);
       acc.totalAdverseBps += Number(sr.totalAdverseBps ?? sr.slippageBps ?? 0);
       return acc;
     },
-    { count: 0, latencyMs: 0, slippageBps: 0, driftBps: 0, totalAdverseBps: 0 },
+    { count: 0, latencyMs: 0, totalLatencyMs: 0, slippageBps: 0, driftBps: 0, totalAdverseBps: 0 },
   );
 
   const frictionAverages =
     frictionTotals.count > 0
       ? {
           avgLatencyMs: frictionTotals.latencyMs / frictionTotals.count,
+          avgTotalLatencyMs: frictionTotals.totalLatencyMs / frictionTotals.count,
           avgSlippageBps: frictionTotals.slippageBps / frictionTotals.count,
           avgDriftBps: frictionTotals.driftBps / frictionTotals.count,
           avgTotalAdverseBps: frictionTotals.totalAdverseBps / frictionTotals.count,
         }
       : {
           avgLatencyMs: 0,
+          avgTotalLatencyMs: 0,
           avgSlippageBps: 0,
           avgDriftBps: 0,
           avgTotalAdverseBps: 0,
         };
+
+  const skippedDueToMaxAdverseMoveRows = decisions.filter(
+    (row: any) =>
+      String(row.status) === 'SKIPPED' &&
+      String(row.reasonCode) === PAPER_REASON_CODES.SKIP_MAX_ADVERSE_MOVE,
+  );
+  const skippedDueToMaxAdverseMove = skippedDueToMaxAdverseMoveRows.length;
+  const skippedNotionalForegoone = skippedDueToMaxAdverseMoveRows.reduce(
+    (sum: number, row: any) => {
+      const sourceNotional = Number(
+        (row?.sizingInputsJson as Record<string, any> | null)?.sourceNotional ??
+          Number(row.sourceShares ?? 0) * Number(row.sourcePrice ?? 0),
+      );
+      return sum + Math.abs(Number.isFinite(sourceNotional) ? sourceNotional : 0);
+    },
+    0,
+  );
+  const maxAdverseMovePercent = Number(
+    (session.slippageConfig as Record<string, any> | null)?.maxAdverseMovePercent ?? 0,
+  );
+  const conservativeSkipLoss = skippedNotionalForegoone * Math.max(0, maxAdverseMovePercent);
+  const grossIncludingSkips = {
+    netPnlIfAllSkipsExecutedAtMaxAdverse: nlv - Number(session.startingCash) - conservativeSkipLoss,
+    skippedTradeCount: skippedDueToMaxAdverseMove,
+    skippedNotional: skippedNotionalForegoone,
+  };
+  const summaryWarnings: string[] = [];
+  if (skippedDueToMaxAdverseMove > 0) {
+    summaryWarnings.push(
+      `Reported net PnL excludes ${skippedDueToMaxAdverseMove} trades skipped for adverse move. Conservative lower bound including skips: $${grossIncludingSkips.netPnlIfAllSkipsExecutedAtMaxAdverse.toFixed(2)}`,
+    );
+  }
 
   return {
     sessionId,
@@ -484,9 +544,18 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
       startingCash: Number(session.startingCash),
       currentNlv: nlv,
       totalPnl: nlv - Number(session.startingCash),
+      realizedPnl,
+      unrealizedPnl,
+      totalFees,
+      netPnl,
+      realizedFraction,
+      openPositionCount,
+      openPositionGrossExposure,
+      unrealizedFraction,
+      dataQualityWarnings,
       trades: totalTradeCount,
       decisions: totalDecisionCount,
-      openPositions: positions.filter((row: any) => row.status === 'OPEN').length,
+      openPositions: openPositionCount,
       closedPositions: positions.filter((row: any) => row.status === 'CLOSED').length,
       runtimeSeconds,
       tradeHistory: {
@@ -499,6 +568,10 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
         samples: frictionTotals.count,
         ...frictionAverages,
       },
+      skippedDueToMaxAdverseMove,
+      skippedNotionalForegoone,
+      grossIncludingSkips,
+      warnings: summaryWarnings,
     },
     decisionBreakdown,
     executionStatusBreakdown: statusBreakdown,
@@ -1242,13 +1315,54 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         continue;
       }
 
+      let liveMarketPrice: { bestAsk: number; bestBid: number; spreadBps?: number } | undefined;
+      if (typeof event.marketId === 'string' && event.marketId.trim().length > 0) {
+        try {
+          const liveMarket = await adapter.getMarket(event.marketId);
+          if (
+            liveMarket &&
+            Number.isFinite(liveMarket.bestAsk) &&
+            Number.isFinite(liveMarket.bestBid)
+          ) {
+            liveMarketPrice = {
+              bestAsk: Number(liveMarket.bestAsk),
+              bestBid: Number(liveMarket.bestBid),
+              spreadBps: Number.isFinite(liveMarket.spreadBps)
+                ? Number(liveMarket.spreadBps)
+                : undefined,
+            };
+          }
+        } catch (error) {
+          logger.warn(
+            { sessionId, eventId: event.id, marketId: event.marketId, error },
+            'failed to fetch live market book for paper decision; falling back to source-price mode',
+          );
+        }
+      }
+
       const draft = evaluatePaperEventDecision({
         session,
         event,
         projectedCash,
         projectedGrossExposure,
         positionStateByKey,
+        liveMarketPrice,
       });
+
+      const draftSlippage =
+        draft?.sizingInputsJson && typeof draft.sizingInputsJson === 'object'
+          ? (draft.sizingInputsJson as Record<string, any>).slippageResult
+          : null;
+      if (
+        draftSlippage &&
+        typeof draftSlippage === 'object' &&
+        String(draftSlippage.priceSource ?? '') === 'SOURCE_PRICE'
+      ) {
+        logger.warn(
+          { sessionId, eventId: event.id, marketId: event.marketId },
+          'paper decision slippage used SOURCE_PRICE because live market book was unavailable',
+        );
+      }
 
       const decision = await db.paperCopyDecision.upsert({
         where: {
@@ -1355,6 +1469,35 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         },
       });
 
+      const sourceAtMs =
+        event.eventTimestamp instanceof Date ? event.eventTimestamp.getTime() : NaN;
+      const detectedAtMs = event.detectedAt instanceof Date ? event.detectedAt.getTime() : NaN;
+      const persistedAtMs = Date.now();
+      const pollingLatencyMs =
+        Number.isFinite(sourceAtMs) && Number.isFinite(detectedAtMs)
+          ? Math.max(0, detectedAtMs - sourceAtMs)
+          : 0;
+      const totalObservedLatencyMs = Number.isFinite(sourceAtMs)
+        ? Math.max(0, persistedAtMs - sourceAtMs)
+        : 0;
+      const queueAndProcessingLatencyMs = Math.max(0, totalObservedLatencyMs - pollingLatencyMs);
+
+      const existingSizingInputs =
+        draft.sizingInputsJson && typeof draft.sizingInputsJson === 'object'
+          ? (draft.sizingInputsJson as Record<string, unknown>)
+          : {};
+      await db.paperCopyDecision.update({
+        where: { id: decision.id },
+        data: {
+          sizingInputsJson: {
+            ...existingSizingInputs,
+            pollingLatencyMs,
+            queueAndProcessingLatencyMs,
+            totalObservedLatencyMs,
+          },
+        },
+      });
+
       if (execution.status === 'FAILED') {
         consecutiveFailures += 1;
       } else {
@@ -1369,10 +1512,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
           reasonCode: execution.reasonCode,
         });
 
-        const sourceAtMs =
-          event.eventTimestamp instanceof Date ? event.eventTimestamp.getTime() : NaN;
-        const detectedAtMs = event.detectedAt instanceof Date ? event.detectedAt.getTime() : NaN;
-        const executedAtMs = Date.now();
+        const executedAtMs = persistedAtMs;
 
         if (Number.isFinite(sourceAtMs)) {
           paperEndToEndLatency.observe(
@@ -1601,6 +1741,7 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
     Math.abs(accountValueCompositionDrift),
     Math.abs(netPnlSinceStartDrift),
   );
+  const invariantTolerance = Math.max(0.01, Number(session.startingCash) * 0.0001);
 
   await db.paperPortfolioSnapshot.create({
     data: {
@@ -1630,7 +1771,7 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
     },
   });
 
-  if (maxAbsDrift > 0.05) {
+  if (maxAbsDrift > invariantTolerance) {
     logger.error(
       {
         sessionId,
@@ -1645,6 +1786,7 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
         realizedPnl,
         unrealizedPnl,
         fees,
+        tolerance: invariantTolerance,
       },
       'paper accounting invariant drift detected during snapshot write',
     );

@@ -2,6 +2,113 @@ import { describe, expect, it } from 'vitest';
 import { calculateSlippage, type SlippageConfig } from '../src/modules/slippage.js';
 
 describe('Slippage Engine unit tests', () => {
+  describe('LIVE_BOOK pricing source', () => {
+    it('uses live ask as BUY base when provided and fills at/above live ask', () => {
+      const res = calculateSlippage(
+        {
+          side: 'BUY',
+          sourcePrice: 0.2,
+          liveAsk: 0.45,
+          simulatedShares: 100,
+        },
+        { enabled: true, mode: 'FIXED_BPS', fixedBps: 20 },
+      );
+
+      expect(res.fillPrice).toBeGreaterThanOrEqual(0.45);
+      expect(res.priceSource).toBe('LIVE_BOOK');
+      expect(res.liveBookGapBps).toBeGreaterThanOrEqual(0);
+    });
+
+    it('matches legacy math when live ask equals source price', () => {
+      const res = calculateSlippage(
+        {
+          side: 'BUY',
+          sourcePrice: 0.5,
+          liveAsk: 0.5,
+          simulatedShares: 100,
+        },
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.01 },
+      );
+
+      expect(res.fillPrice).toBeCloseTo(0.5 * 1.01, 12);
+      expect(res.priceSource).toBe('LIVE_BOOK');
+      expect(res.liveBookGapBps).toBeCloseTo(0, 12);
+    });
+
+    it('falls back to source price mode when no live prices are provided', () => {
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.01 },
+      );
+
+      expect(res.fillPrice).toBeCloseTo(0.505, 12);
+      expect(res.priceSource).toBe('SOURCE_PRICE');
+      expect(res.liveBookGapBps).toBeCloseTo(0, 12);
+    });
+  });
+
+  describe('Spread friction', () => {
+    it('applies ~half-spread adverse for BUY when spreadBps is provided', () => {
+      const noSpread = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, spreadBps: 0 },
+        { enabled: true, mode: 'NONE' },
+      );
+      const withSpread = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, spreadBps: 200 },
+        { enabled: true, mode: 'NONE' },
+      );
+
+      const upliftBps = ((withSpread.fillPrice - noSpread.fillPrice) / noSpread.fillPrice) * 10000;
+      expect(upliftBps).toBeCloseTo(100, 6);
+      expect(withSpread.spreadBpsApplied).toBe(200);
+      expect(withSpread.halfSpreadAdverseBps).toBe(100);
+    });
+
+    it('applies ~half-spread adverse for SELL when spreadBps is provided', () => {
+      const noSpread = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.5, simulatedShares: 100, spreadBps: 0 },
+        { enabled: true, mode: 'NONE' },
+      );
+      const withSpread = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.5, simulatedShares: 100, spreadBps: 200 },
+        { enabled: true, mode: 'NONE' },
+      );
+
+      const dropBps = ((noSpread.fillPrice - withSpread.fillPrice) / noSpread.fillPrice) * 10000;
+      expect(dropBps).toBeCloseTo(100, 6);
+      expect(withSpread.spreadBpsApplied).toBe(200);
+      expect(withSpread.halfSpreadAdverseBps).toBe(100);
+    });
+
+    it('keeps spread fields at zero when spreadBps is not provided', () => {
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
+        { enabled: true, mode: 'NONE' },
+      );
+
+      expect(res.spreadBpsApplied).toBe(0);
+      expect(res.halfSpreadAdverseBps).toBe(0);
+    });
+
+    it('stacks live ask + spread + fixed slippage correctly', () => {
+      const res = calculateSlippage(
+        {
+          side: 'BUY',
+          sourcePrice: 0.2,
+          liveAsk: 0.45,
+          spreadBps: 200,
+          simulatedShares: 100,
+        },
+        { enabled: true, mode: 'FIXED_BPS', fixedBps: 50 },
+      );
+
+      const expected = 0.45 * (1 + 0.01) * (1 + 0.005);
+      expect(res.fillPrice).toBeCloseTo(expected, 12);
+      expect(res.priceSource).toBe('LIVE_BOOK');
+      expect(res.liveBookGapBps).toBeGreaterThan(0);
+    });
+  });
+
   it('handles NONE mode correctly', () => {
     const res = calculateSlippage(
       { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },

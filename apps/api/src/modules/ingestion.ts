@@ -56,6 +56,9 @@ type IngestionRunSummary = {
   decisionEnqueueErrors: number;
   gapIssuesDetected: number;
   warnings: number;
+  historyTruncated: boolean;
+  truncatedAtPage: number | null;
+  droppedEventRisk: boolean;
 };
 
 type CursorState = {
@@ -180,15 +183,17 @@ async function getOrCreateCursor(walletId: string): Promise<CursorState> {
   };
 }
 
-async function fetchWalletActivityPages(
+export async function fetchWalletActivityPages(
   address: string,
   baseQuery: Omit<WalletActivityFeedQuery, 'offset' | 'limit'>,
-): Promise<WalletActivityFeedEvent[]> {
+): Promise<{ events: WalletActivityFeedEvent[]; truncated: boolean; pagesConsumed: number }> {
   const pageLimit = config.INGEST_BACKFILL_PAGE_LIMIT;
   const pageSize = config.INGEST_ACTIVITY_PAGE_SIZE;
   const results: WalletActivityFeedEvent[] = [];
+  let pagesConsumed = 0;
 
   for (let page = 0; page < pageLimit; page += 1) {
+    pagesConsumed = page + 1;
     const offset = page * pageSize;
     const batch = await dataAdapter.getWalletActivityFeed(address, {
       ...baseQuery,
@@ -196,15 +201,20 @@ async function fetchWalletActivityPages(
       limit: pageSize,
     });
     if (batch.length === 0) {
-      break;
+      return { events: results, truncated: false, pagesConsumed };
     }
     results.push(...batch);
     if (batch.length < pageSize) {
-      break;
+      return { events: results, truncated: false, pagesConsumed };
+    }
+
+    const isLastAllowedPage = page + 1 === pageLimit;
+    if (isLastAllowedPage) {
+      return { events: results, truncated: true, pagesConsumed };
     }
   }
 
-  return results;
+  return { events: results, truncated: false, pagesConsumed };
 }
 
 function sourceEventIdForTradeEvent(event: WalletActivityFeedEvent, dedupeKey: string): string {
@@ -427,6 +437,9 @@ export async function processWalletPoll(walletId: string, address: string): Prom
     decisionEnqueueErrors: 0,
     gapIssuesDetected: 0,
     warnings: 0,
+    historyTruncated: false,
+    truncatedAtPage: null,
+    droppedEventRisk: false,
   };
 
   try {
@@ -518,12 +531,29 @@ export async function processWalletPoll(walletId: string, address: string): Prom
     try {
       if (summary.mode === 'BACKFILL') {
         const fetched = await fetchWalletActivityPages(address, {});
-        events = fetched.filter((event) => {
+        events = fetched.events.filter((event) => {
           const ts = new Date(event.eventTimestamp).getTime();
           return Number.isFinite(ts) && ts >= lookbackStartMs;
         });
+        summary.historyTruncated = fetched.truncated;
+        summary.truncatedAtPage = fetched.truncated ? fetched.pagesConsumed : null;
       } else {
-        events = await fetchWalletActivityPages(address, incrementalQuery);
+        const fetched = await fetchWalletActivityPages(address, incrementalQuery);
+        events = fetched.events;
+        summary.historyTruncated = fetched.truncated;
+        summary.truncatedAtPage = fetched.truncated ? fetched.pagesConsumed : null;
+      }
+
+      if (summary.historyTruncated) {
+        logger.warn(
+          {
+            walletId,
+            pagesConsumed: summary.truncatedAtPage,
+            pageLimit: config.INGEST_BACKFILL_PAGE_LIMIT,
+            pageSize: config.INGEST_ACTIVITY_PAGE_SIZE,
+          },
+          'wallet backfill hit page limit — history may be truncated',
+        );
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown ingestion fetch error';
@@ -572,11 +602,14 @@ export async function processWalletPoll(walletId: string, address: string): Prom
 
     let latestSafeActivityAt: Date | null = cursorState.highWatermarkTimestamp;
     let latestSafeCursor: string | null = cursorState.highWatermarkCursor;
+    let consecutiveInsertFailures = 0;
+    let maxConsecutiveInsertFailures = 0;
     let firstNonDuplicateInsertFailure: {
       dedupeKey: string;
       externalEventId: string | null;
       eventTimestamp: string;
       message: string;
+      eventId: string | null;
     } | null = null;
 
     for (const event of orderEventsForSafeIngestion(events)) {
@@ -648,6 +681,7 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           },
         });
         summary.insertedActivityEvents += 1;
+        consecutiveInsertFailures = 0;
 
         const candidateCursor = activityCursorForEvent(event);
         if (
@@ -690,7 +724,13 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           externalEventId: event.externalEventId ?? null,
           eventTimestamp: event.eventTimestamp,
           message: error instanceof Error ? error.message : String(error),
+          eventId: event.externalEventId ?? event.id ?? null,
         };
+        consecutiveInsertFailures += 1;
+        maxConsecutiveInsertFailures = Math.max(
+          maxConsecutiveInsertFailures,
+          consecutiveInsertFailures,
+        );
         logger.warn(
           {
             walletId,
@@ -729,6 +769,7 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           },
         });
         summary.insertedTradeEvents += 1;
+        consecutiveInsertFailures = 0;
 
         ingestionRate.inc({ wallet_tier: activeTier.toLowerCase() });
 
@@ -815,6 +856,11 @@ export async function processWalletPoll(walletId: string, address: string): Prom
           continue;
         }
         summary.dbInsertErrors += 1;
+        consecutiveInsertFailures += 1;
+        maxConsecutiveInsertFailures = Math.max(
+          maxConsecutiveInsertFailures,
+          consecutiveInsertFailures,
+        );
         logger.warn(
           { walletId, dedupeKey, externalEventId: event.externalEventId ?? null, error },
           'failed to process trade-like activity event',
@@ -825,6 +871,26 @@ export async function processWalletPoll(walletId: string, address: string): Prom
     const nextInterval = computeNextPollIntervalMs(activeTier === 'ACTIVE');
     const hasHardFailures = summary.dbInsertErrors > 0;
     const hasWarnings = summary.decisionEnqueueErrors > 0;
+    if (hasHardFailures) {
+      summary.droppedEventRisk = true;
+      await prisma.walletReconciliationIssue.create({
+        data: {
+          trackedWalletId: walletId,
+          sourceName: SOURCE_NAME,
+          issueType: 'INSERT_FAILURE_GAP',
+          severity: 'WARN',
+          notes:
+            'Non-duplicate insert failures may have created an event gap. Events beyond overlap window may be permanently missing.',
+          actualValue: {
+            detectedAt: new Date().toISOString(),
+            firstAffectedEventId: firstNonDuplicateInsertFailure?.eventId ?? null,
+            eventCount: summary.dbInsertErrors,
+            consecutiveInsertFailures: maxConsecutiveInsertFailures,
+          },
+        },
+      });
+    }
+
     summary.warnings = hasWarnings ? 1 : 0;
     const outcome: 'SUCCESS' | 'PARTIAL' = hasHardFailures || hasWarnings ? 'PARTIAL' : 'SUCCESS';
 
@@ -870,7 +936,7 @@ export async function processWalletPoll(walletId: string, address: string): Prom
             highWatermarkCursor: latestSafeCursor,
             overlapWindowSec: cursor.overlapWindowSec,
             lastSuccessAt: new Date(),
-            lastErrorClass: null,
+            lastErrorClass: summary.historyTruncated ? 'HISTORY_TRUNCATED' : null,
             lagSec,
             status: outcome === 'SUCCESS' ? 'ACTIVE' : 'DEGRADED',
             lastFetchedCount: summary.fetchedEvents,

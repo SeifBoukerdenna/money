@@ -53,6 +53,8 @@ function makeEvent(input: { id: string; cursor: string; ts: string }): FeedEvent
 async function setup(input: {
   events: FeedEvent[];
   createBehavior: (eventId: string) => 'ok' | 'dup' | 'fail';
+  getWalletActivityFeed?: (query?: { offset?: number; limit?: number }) => Promise<FeedEvent[]>;
+  configOverrides?: Partial<Record<string, number>>;
 }) {
   vi.resetModules();
 
@@ -101,6 +103,13 @@ async function setup(input: {
     return { id: `wae:${eventId}` };
   });
 
+  const loggerMock = { warn: vi.fn(), debug: vi.fn(), error: vi.fn(), info: vi.fn() };
+  const reconciliationIssueCreate = vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({
+    id: 'recon-1',
+    ...data,
+  }));
+  const ingestionDiagnostics: Array<Record<string, unknown>> = [];
+
   vi.doMock('../src/config.js', () => ({
     config: {
       INGEST_OVERLAP_WINDOW_SEC: 180,
@@ -117,12 +126,13 @@ async function setup(input: {
       CLUSTER_WINDOW_SECONDS: 120,
       TURBO_DECISION_BACKOFF_MS: 200,
       INGEST_POLL_MAX_INTERVAL_MS: 30000,
+      ...(input.configOverrides ?? {}),
     },
   }));
 
   vi.doMock('../src/lib/redis.js', () => ({ redis: redisMock }));
   vi.doMock('../src/lib/logger.js', () => ({
-    logger: { warn: vi.fn(), debug: vi.fn(), error: vi.fn(), info: vi.fn() },
+    logger: loggerMock,
   }));
   vi.doMock('../src/lib/metrics.js', () => ({
     apiLatency: { observe: vi.fn() },
@@ -134,7 +144,10 @@ async function setup(input: {
 
   vi.doMock('../src/modules/polymarket.js', () => ({
     createPolymarketDataAdapter: () => ({
-      getWalletActivityFeed: vi.fn(async () => input.events),
+      getWalletActivityFeed: vi.fn(
+        async (_address: string, query?: { offset?: number; limit?: number }) =>
+          input.getWalletActivityFeed ? input.getWalletActivityFeed(query) : input.events,
+      ),
     }),
   }));
 
@@ -170,7 +183,13 @@ async function setup(input: {
         findFirst: vi.fn(async () => null),
       },
       auditLog: {
-        create: vi.fn(async () => ({ id: 'audit-1' })),
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
+          ingestionDiagnostics.push(data);
+          return { id: 'audit-1' };
+        }),
+      },
+      walletReconciliationIssue: {
+        create: reconciliationIssueCreate,
       },
       $transaction: vi.fn(async (ops: Array<Promise<unknown>>) => Promise.all(ops)),
     },
@@ -180,12 +199,83 @@ async function setup(input: {
 
   return {
     processWalletPoll: ingestion.processWalletPoll,
+    fetchWalletActivityPages: ingestion.fetchWalletActivityPages,
     walletActivityEventCreate,
     cursorUpdates,
+    loggerMock,
+    reconciliationIssueCreate,
+    ingestionDiagnostics,
   };
 }
 
 describe('ingestion watermark safety', () => {
+  it('returns truncated=true when page limit is hit with full pages', async () => {
+    const { fetchWalletActivityPages } = await setup({
+      events: [],
+      createBehavior: () => 'ok',
+      configOverrides: {
+        INGEST_BACKFILL_PAGE_LIMIT: 2,
+        INGEST_ACTIVITY_PAGE_SIZE: 2,
+      },
+      getWalletActivityFeed: async (query) => {
+        const offset = query?.offset ?? 0;
+        if (offset === 0 || offset === 2) {
+          return [
+            makeEvent({
+              id: `e-${offset}-1`,
+              cursor: `c-${offset}-1`,
+              ts: '2026-03-16T00:00:01.000Z',
+            }),
+            makeEvent({
+              id: `e-${offset}-2`,
+              cursor: `c-${offset}-2`,
+              ts: '2026-03-16T00:00:02.000Z',
+            }),
+          ];
+        }
+        return [];
+      },
+    });
+
+    const result = await fetchWalletActivityPages('0x0000000000000000000000000000000000000001', {});
+    expect(result.truncated).toBe(true);
+    expect(result.pagesConsumed).toBe(2);
+    expect(result.events.length).toBe(4);
+  });
+
+  it('returns truncated=false when loop ends on empty page', async () => {
+    const { fetchWalletActivityPages } = await setup({
+      events: [],
+      createBehavior: () => 'ok',
+      getWalletActivityFeed: async () => [],
+    });
+
+    const result = await fetchWalletActivityPages('0x0000000000000000000000000000000000000001', {});
+    expect(result.truncated).toBe(false);
+    expect(result.events.length).toBe(0);
+  });
+
+  it('returns truncated=false when loop ends on partial page', async () => {
+    const { fetchWalletActivityPages } = await setup({
+      events: [],
+      createBehavior: () => 'ok',
+      configOverrides: {
+        INGEST_BACKFILL_PAGE_LIMIT: 3,
+        INGEST_ACTIVITY_PAGE_SIZE: 5,
+      },
+      getWalletActivityFeed: async (query) => {
+        if ((query?.offset ?? 0) === 0) {
+          return [makeEvent({ id: 'e1', cursor: 'c1', ts: '2026-03-16T00:00:01.000Z' })];
+        }
+        return [];
+      },
+    });
+
+    const result = await fetchWalletActivityPages('0x0000000000000000000000000000000000000001', {});
+    expect(result.truncated).toBe(false);
+    expect(result.events.length).toBe(1);
+  });
+
   it('advances watermark through duplicate events (idempotent-safe)', async () => {
     const events = [
       makeEvent({ id: 'e1', cursor: 'c1', ts: '2026-03-16T00:00:01.000Z' }),
@@ -214,7 +304,13 @@ describe('ingestion watermark safety', () => {
       makeEvent({ id: 'e3', cursor: 'c3', ts: '2026-03-16T00:00:03.000Z' }),
     ];
 
-    const { processWalletPoll, walletActivityEventCreate, cursorUpdates } = await setup({
+    const {
+      processWalletPoll,
+      walletActivityEventCreate,
+      cursorUpdates,
+      reconciliationIssueCreate,
+      ingestionDiagnostics,
+    } = await setup({
       events,
       createBehavior: (eventId) => {
         if (eventId === 'e1') return 'dup';
@@ -235,5 +331,47 @@ describe('ingestion watermark safety', () => {
     );
     expect(cursorUpdate?.highWatermarkCursor).toBe('c1');
     expect(cursorUpdate?.lastInsertErrorCount).toBe(1);
+
+    expect(reconciliationIssueCreate).toHaveBeenCalledTimes(1);
+    const issueData = reconciliationIssueCreate.mock.calls[0]?.[0]?.data as Record<string, any>;
+    expect(issueData.issueType).toBe('INSERT_FAILURE_GAP');
+
+    const latestDiagnostic = ingestionDiagnostics.at(-1) as Record<string, any>;
+    expect(latestDiagnostic).toBeDefined();
+    expect((latestDiagnostic.payload as any).summary.droppedEventRisk).toBe(true);
+  });
+
+  it('sets historyTruncated=true and emits warning when pagination is truncated', async () => {
+    const events = [
+      makeEvent({ id: 'e1', cursor: 'c1', ts: '2026-03-16T00:00:01.000Z' }),
+      makeEvent({ id: 'e2', cursor: 'c2', ts: '2026-03-16T00:00:02.000Z' }),
+    ];
+
+    const { processWalletPoll, loggerMock, ingestionDiagnostics } = await setup({
+      events,
+      createBehavior: () => 'dup',
+      configOverrides: {
+        INGEST_BACKFILL_PAGE_LIMIT: 1,
+        INGEST_ACTIVITY_PAGE_SIZE: 2,
+      },
+      getWalletActivityFeed: async (query) => {
+        if ((query?.offset ?? 0) === 0) return events;
+        return [];
+      },
+    });
+
+    await processWalletPoll('wallet-1', '0x0000000000000000000000000000000000000001');
+
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        walletId: 'wallet-1',
+        pageLimit: 1,
+        pageSize: 2,
+      }),
+      'wallet backfill hit page limit — history may be truncated',
+    );
+
+    const latestDiagnostic = ingestionDiagnostics.at(-1) as Record<string, any>;
+    expect((latestDiagnostic.payload as any).summary.historyTruncated).toBe(true);
   });
 });

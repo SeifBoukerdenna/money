@@ -113,6 +113,7 @@ describe('GET /paper-copy-sessions/:id/analytics contract', () => {
 
     vi.doMock('../src/modules/paper-accounting.js', () => ({
       materializePaperSessionState: vi.fn(async () => ({ positions: [], closedPositions: [] })),
+      getCumulativeInvariantDrift: vi.fn(() => 0),
     }));
 
     vi.doMock('../src/modules/reconciliation.js', () => ({

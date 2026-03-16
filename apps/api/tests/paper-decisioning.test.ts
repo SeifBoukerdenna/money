@@ -132,4 +132,47 @@ describe('paper-decisioning accounting guards', () => {
     expect(decision.decisionType).toBe('COPY');
     expect(decision.simulatedShares).toBeCloseTo(98.039215686, 6);
   });
+
+  it('uses live ask in BUY slippage and persists price source metadata', () => {
+    const session = {
+      maxAllocationPerMarket: 10000,
+      maxTotalExposure: 10000,
+      minNotionalThreshold: 1,
+      feeBps: 0,
+      slippageBps: 100,
+      copyRatio: 1,
+      startedAt: new Date('2026-03-16T00:00:00.000Z'),
+      slippageConfig: null,
+    } as any;
+
+    const decision = evaluatePaperEventDecision({
+      session,
+      event: {
+        id: 'buy-live-book',
+        eventType: 'BUY',
+        marketId: 'm-4',
+        outcome: 'YES',
+        side: 'BUY',
+        price: 0.2,
+        shares: 10,
+        eventTimestamp: new Date('2026-03-16T00:01:00.000Z'),
+      },
+      projectedCash: 10000,
+      projectedGrossExposure: 0,
+      positionStateByKey: new Map(),
+      liveMarketPrice: {
+        bestAsk: 0.45,
+        bestBid: 0.44,
+        spreadBps: 200,
+      },
+    });
+
+    expect(decision.decisionType).toBe('COPY');
+    expect(Number(decision.intendedFillPrice)).toBeGreaterThan(0.45);
+
+    const sizing = decision.sizingInputsJson as Record<string, any>;
+    expect(sizing.priceSource).toBe('LIVE_BOOK');
+    expect(Number(sizing.liveBookGapBps)).toBeGreaterThanOrEqual(0);
+    expect(Number(sizing.slippageResult?.spreadBpsApplied ?? 0)).toBe(200);
+  });
 });

@@ -732,4 +732,108 @@ describe('source vs session comparisons', () => {
     expect(comparison.curves.sessionNetPnl[0]?.timestamp).toBe('2026-03-01T01:00:00.000Z');
     expect(comparison.curves.sessionNetPnl[0]?.value).toBeCloseTo(0, 8);
   });
+
+  it('flags mark contamination and negative unrealized asymmetry when source unrealized > session unrealized', () => {
+    const now = Date.now();
+    const start = new Date(now - 60 * 60 * 1000).toISOString();
+    const end = new Date(now).toISOString();
+
+    const sourceTimeline: SessionTimelinePoint[] = [
+      { timestamp: start, totalPnl: 0, realizedPnl: 0, unrealizedPnl: 0, fees: 0 },
+      { timestamp: end, totalPnl: 10, realizedPnl: 4, unrealizedPnl: 6, fees: 0 },
+    ];
+    const sessionTimelineLocal: SessionTimelinePoint[] = [
+      { timestamp: start, totalPnl: 0, realizedPnl: 0, unrealizedPnl: 0, fees: 0 },
+      { timestamp: end, totalPnl: 4, realizedPnl: 4, unrealizedPnl: 0, fees: 0 },
+    ];
+
+    const comparison = compareSourceVsSession({
+      sourceTimeline: sourceTimeline.map((p) => ({
+        index: 0,
+        eventId: p.timestamp,
+        eventTimestamp: p.timestamp,
+        eventType: 'SNAP',
+        marketId: 'm1',
+        outcome: 'YES',
+        side: null,
+        realizedPnlGross: p.realizedPnl,
+        unrealizedPnl: p.unrealizedPnl,
+        fees: p.fees,
+        netPnl: p.totalPnl,
+        cashDelta: 0,
+        openMarketValue: 0,
+        reconstructedAccountValue: 0,
+      })),
+      sessionTimeline: sessionTimelineLocal,
+      windowStart: start,
+      windowEnd: end,
+    });
+
+    expect(comparison.markContaminationWarning).toBe(true);
+    expect(comparison.unrealizedAsymmetryBps).toBeLessThan(0);
+    expect(comparison.sourceHasOpenPositions).toBe(true);
+    expect(comparison.sessionHasOpenPositions).toBe(false);
+  });
+
+  it('does not warn when both source and session unrealized are zero', () => {
+    const comparison = compareSourceVsSession({
+      sourceTimeline: source.timeline,
+      sessionTimeline: [
+        {
+          timestamp: '2026-03-01T00:00:00.000Z',
+          totalPnl: 0,
+          realizedPnl: 0,
+          unrealizedPnl: 0,
+          fees: 0,
+        },
+        {
+          timestamp: '2026-03-01T00:02:00.000Z',
+          totalPnl: 18,
+          realizedPnl: 18,
+          unrealizedPnl: 0,
+          fees: 0,
+        },
+      ],
+      windowStart: '2026-03-01T00:00:00.000Z',
+      windowEnd: '2026-03-01T00:02:00.000Z',
+    });
+
+    expect(comparison.markContaminationWarning).toBe(false);
+  });
+
+  it('still warns for older windows when either side has open unrealized exposure', () => {
+    const comparison = compareSourceVsSession({
+      sourceTimeline: [
+        {
+          index: 0,
+          eventId: 'old-1',
+          eventTimestamp: '2025-01-01T00:00:00.000Z',
+          eventType: 'SNAP',
+          marketId: 'm1',
+          outcome: 'YES',
+          side: null,
+          realizedPnlGross: 0,
+          unrealizedPnl: 2,
+          fees: 0,
+          netPnl: 2,
+          cashDelta: 0,
+          openMarketValue: 0,
+          reconstructedAccountValue: 0,
+        },
+      ],
+      sessionTimeline: [
+        {
+          timestamp: '2025-01-01T00:00:00.000Z',
+          totalPnl: 1,
+          realizedPnl: 0,
+          unrealizedPnl: 1,
+          fees: 0,
+        },
+      ],
+      windowStart: '2025-01-01T00:00:00.000Z',
+      windowEnd: '2025-01-01T00:00:00.000Z',
+    });
+
+    expect(comparison.markContaminationWarning).toBe(true);
+  });
 });

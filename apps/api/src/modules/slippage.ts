@@ -47,17 +47,24 @@ export interface SlippageInput {
   sourcePrice: number;
   simulatedShares: number;
   latencyMs?: number;
+  liveAsk?: number;
+  liveBid?: number;
+  spreadBps?: number;
 }
 
 export interface SlippageResult {
   fillPrice: number;
   originalPrice: number;
+  priceSource: 'LIVE_BOOK' | 'SOURCE_PRICE';
+  liveBookGapBps: number;
   slippagePercent: number;
   slippageBps: number;
   driftPercent: number;
   driftBps: number;
   totalAdversePercent: number;
   totalAdverseBps: number;
+  spreadBpsApplied: number;
+  halfSpreadAdverseBps: number;
   slippageModeUsed: SlippageMode;
   isSkipped: boolean;
   latencyApplied?: number;
@@ -69,19 +76,42 @@ export function calculateSlippage(
   input: SlippageInput,
   config?: SlippageConfig | null,
 ): SlippageResult {
-  const { side, sourcePrice, simulatedShares, latencyMs } = input;
+  const { side, sourcePrice, simulatedShares, latencyMs, liveAsk, liveBid, spreadBps } = input;
   const notional = simulatedShares * sourcePrice;
+  const hasLiveBookPrice =
+    (side === 'BUY' && typeof liveAsk === 'number' && Number.isFinite(liveAsk) && liveAsk > 0) ||
+    (side === 'SELL' && typeof liveBid === 'number' && Number.isFinite(liveBid) && liveBid > 0);
+  const basePrice =
+    side === 'BUY'
+      ? hasLiveBookPrice
+        ? (liveAsk as number)
+        : sourcePrice
+      : hasLiveBookPrice
+        ? (liveBid as number)
+        : sourcePrice;
+  const priceSource: 'LIVE_BOOK' | 'SOURCE_PRICE' = hasLiveBookPrice ? 'LIVE_BOOK' : 'SOURCE_PRICE';
+  const liveBookGapBps = sourcePrice > 0 ? ((basePrice - sourcePrice) / sourcePrice) * 10000 : 0;
+  const spreadBpsApplied =
+    typeof spreadBps === 'number' && Number.isFinite(spreadBps) && spreadBps > 0 ? spreadBps : 0;
+  const halfSpreadAdverseBps = spreadBpsApplied / 2;
+  const halfSpreadAdverse = halfSpreadAdverseBps / 10000;
+  const effectiveBasePrice =
+    side === 'BUY' ? basePrice * (1 + halfSpreadAdverse) : basePrice * (1 - halfSpreadAdverse);
 
   // Base case: No slippage
   const noSlippageResult: any = {
-    fillPrice: sourcePrice,
+    fillPrice: effectiveBasePrice,
     originalPrice: sourcePrice,
+    priceSource,
+    liveBookGapBps,
     slippagePercent: 0,
     slippageBps: 0,
     driftPercent: 0,
     driftBps: 0,
     totalAdversePercent: 0,
     totalAdverseBps: 0,
+    spreadBpsApplied,
+    halfSpreadAdverseBps,
     slippageModeUsed: 'NONE',
     isSkipped: false,
     sizeApplied: notional,
@@ -163,9 +193,9 @@ export function calculateSlippage(
   let fillPrice = sourcePrice;
   if (!isSkipped) {
     if (side === 'BUY') {
-      fillPrice = sourcePrice * (1 + totalAdversePercent);
+      fillPrice = effectiveBasePrice * (1 + totalAdversePercent);
     } else {
-      fillPrice = sourcePrice * (1 - totalAdversePercent);
+      fillPrice = effectiveBasePrice * (1 - totalAdversePercent);
     }
     // Prevent price out of bounds for Polymarket (0.0001 to 0.9999 usually, but we clamp aggressively to 0)
     fillPrice = Math.max(0.0001, fillPrice);
@@ -174,12 +204,16 @@ export function calculateSlippage(
   const result: any = {
     fillPrice,
     originalPrice: sourcePrice,
+    priceSource,
+    liveBookGapBps,
     slippagePercent: adverseSlippagePercent,
     slippageBps: adverseSlippagePercent * 10000,
     driftPercent: adverseDriftPercent,
     driftBps: adverseDriftPercent * 10000,
     totalAdversePercent,
     totalAdverseBps: totalAdversePercent * 10000,
+    spreadBpsApplied,
+    halfSpreadAdverseBps,
     slippageModeUsed: mode,
     isSkipped,
     sizeApplied: notional,

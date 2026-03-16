@@ -4,14 +4,19 @@ export type WalletTrade = {
   side: 'BUY' | 'SELL';
   size: number;
   price: number;
+  fee?: number;
   tradedAt: string;
 };
+
+export const WIN_RATE_DEFINITION = 'NET_OF_FEES_PER_CLOSED_POSITION' as const;
 
 export type WalletAnalytics = {
   totalTrades: number;
   wins: number;
   losses: number;
   winRate: number;
+  grossWinRate: number;
+  winRateDefinition: string;
   averageEntryPrice: number;
   averageExitPrice: number;
   averageHoldTimeSeconds: number;
@@ -42,6 +47,8 @@ export function computeWalletAnalytics(trades: WalletTrade[]): WalletAnalytics {
       wins: 0,
       losses: 0,
       winRate: 0,
+      grossWinRate: 0,
+      winRateDefinition: WIN_RATE_DEFINITION,
       averageEntryPrice: 0,
       averageExitPrice: 0,
       averageHoldTimeSeconds: 0,
@@ -65,6 +72,7 @@ export function computeWalletAnalytics(trades: WalletTrade[]): WalletAnalytics {
   );
   const positions = new Map<string, PositionState>();
   const realizedSeries: number[] = [];
+  const realizedGrossSeries: number[] = [];
   const holdTimes: number[] = [];
   let realizedPnl = 0;
   let entryPriceSum = 0;
@@ -100,9 +108,11 @@ export function computeWalletAnalytics(trades: WalletTrade[]): WalletAnalytics {
       exitPriceSum += trade.price;
       exitCount += 1;
       const closeSize = Math.min(state.size, trade.size);
-      const pnl = closeSize * (trade.price - state.avgPrice);
+      const pnlGross = closeSize * (trade.price - state.avgPrice);
+      const pnl = pnlGross - Number(trade.fee ?? 0);
       realizedPnl += pnl;
       realizedSeries.push(pnl);
+      realizedGrossSeries.push(pnlGross);
       bestTrade = Math.max(bestTrade, pnl);
       worstTrade = Math.min(worstTrade, pnl);
       if (closeSize > 0) {
@@ -118,6 +128,8 @@ export function computeWalletAnalytics(trades: WalletTrade[]): WalletAnalytics {
 
   const wins = realizedSeries.filter((value) => value > 0).length;
   const losses = realizedSeries.filter((value) => value < 0).length;
+  const grossWins = realizedGrossSeries.filter((value) => value > 0).length;
+  const grossLosses = realizedGrossSeries.filter((value) => value < 0).length;
   const grossProfit = realizedSeries
     .filter((value) => value > 0)
     .reduce((sum, value) => sum + value, 0);
@@ -141,6 +153,8 @@ export function computeWalletAnalytics(trades: WalletTrade[]): WalletAnalytics {
     wins,
     losses,
     winRate: wins + losses > 0 ? wins / (wins + losses) : 0,
+    grossWinRate: grossWins + grossLosses > 0 ? grossWins / (grossWins + grossLosses) : 0,
+    winRateDefinition: WIN_RATE_DEFINITION,
     averageEntryPrice: entryCount > 0 ? entryPriceSum / entryCount : 0,
     averageExitPrice: exitCount > 0 ? exitPriceSum / exitCount : 0,
     averageHoldTimeSeconds:

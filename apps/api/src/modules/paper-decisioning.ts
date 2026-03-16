@@ -298,6 +298,7 @@ export function evaluatePaperEventDecision(input: {
   projectedCash: number;
   projectedGrossExposure: number;
   positionStateByKey: Map<string, ProjectedPositionState>;
+  liveMarketPrice?: { bestAsk: number; bestBid: number; spreadBps?: number };
 }): PaperDecisionDraft {
   const { session, event, projectedCash, projectedGrossExposure, positionStateByKey } = input;
   const eventType = String(event.eventType ?? '').toUpperCase();
@@ -510,6 +511,13 @@ export function evaluatePaperEventDecision(input: {
     simulatedShares,
   };
   if (latencyMs !== undefined) slippageInput.latencyMs = latencyMs;
+  if (input.liveMarketPrice) {
+    slippageInput.liveAsk = input.liveMarketPrice.bestAsk;
+    slippageInput.liveBid = input.liveMarketPrice.bestBid;
+    if (input.liveMarketPrice.spreadBps !== undefined) {
+      slippageInput.spreadBps = input.liveMarketPrice.spreadBps;
+    }
+  }
 
   const slippageResult = calculateSlippage(slippageInput as SlippageInput, slippageConfig);
 
@@ -531,6 +539,8 @@ export function evaluatePaperEventDecision(input: {
         eventType,
         slippageResult,
         sourceNotional,
+        priceSource: slippageResult.priceSource,
+        liveBookGapBps: slippageResult.liveBookGapBps,
       },
       riskChecksJson: {
         latencyMs,
@@ -660,7 +670,14 @@ export function evaluatePaperEventDecision(input: {
       sourcePrice,
       intendedFillPrice,
       copyRatio,
-      sizingInputsJson: { eventType, projectedCash, maxPerMarket, slippageResult },
+      sizingInputsJson: {
+        eventType,
+        projectedCash,
+        maxPerMarket,
+        slippageResult,
+        priceSource: slippageResult.priceSource,
+        liveBookGapBps: slippageResult.liveBookGapBps,
+      },
       reasonCode: PAPER_REASON_CODES.COPY_APPROVED,
       humanReason: 'Source buy approved for copy execution under current session guardrails.',
       riskChecksJson: { projectedCash, maxTotalExposure },
@@ -684,7 +701,14 @@ export function evaluatePaperEventDecision(input: {
     sourcePrice,
     intendedFillPrice,
     copyRatio,
-    sizingInputsJson: { eventType, heldShares: position?.netShares ?? 0, remainingShares },
+    sizingInputsJson: {
+      eventType,
+      heldShares: position?.netShares ?? 0,
+      remainingShares,
+      slippageResult,
+      priceSource: slippageResult.priceSource,
+      liveBookGapBps: slippageResult.liveBookGapBps,
+    },
     reasonCode:
       decisionType === 'CLOSE'
         ? PAPER_REASON_CODES.CLOSE_ON_SOURCE_EXIT

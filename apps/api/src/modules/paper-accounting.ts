@@ -51,6 +51,7 @@ type LedgerWarning = {
 
 export type AccountingInvariantReport = {
   healthy: boolean;
+  tolerance: number;
   maxAbsDrift: number;
   accountingIdentityDrift: number;
   accountValueCompositionDrift: number;
@@ -68,10 +69,16 @@ export type ReducedSessionState = {
   openPositionsCount: number;
   warnings: LedgerWarning[];
   invariants: AccountingInvariantReport;
+  cumulativeInvariantDrift: number;
   positions: PositionState[];
 };
 
 const EPSILON = 1e-9;
+const cumulativeInvariantDriftBySession = new Map<string, number>();
+
+export function getCumulativeInvariantDrift(sessionId: string): number {
+  return cumulativeInvariantDriftBySession.get(sessionId) ?? 0;
+}
 
 function keyFor(marketId: string, outcome: string): string {
   return `${marketId}:${outcome.toUpperCase()}`;
@@ -310,9 +317,11 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     Math.abs(accountValueCompositionDrift),
     Math.abs(netPnlSinceStartDrift),
   );
-  const healthy = maxAbsDrift <= 0.05;
+  const tolerance = Math.max(0.01, startingCapital * 0.0001);
+  const healthy = maxAbsDrift <= tolerance;
+  const netPnl = totalPnl;
 
-  if (Math.abs(accountingIdentityDrift) > 0.05) {
+  if (Math.abs(accountingIdentityDrift) > tolerance) {
     warnings.push({
       code: 'INVARIANT_ACCOUNTING_IDENTITY_MISMATCH',
       message: 'startingCapital + realizedPnL + unrealizedPnL - fees does not match accountValue.',
@@ -324,10 +333,13 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
         fees,
         accountValue: netLiquidationValue,
         drift: accountingIdentityDrift,
+        driftAsFractionOfNetPnl:
+          Math.abs(netPnl) > EPSILON ? accountingIdentityDrift / Math.abs(netPnl) : null,
+        tolerance,
       },
     });
   }
-  if (Math.abs(accountValueCompositionDrift) > 0.05) {
+  if (Math.abs(accountValueCompositionDrift) > tolerance) {
     warnings.push({
       code: 'INVARIANT_ACCOUNT_VALUE_MISMATCH',
       message: 'accountValue does not match cash + openPositionMarketValue.',
@@ -337,10 +349,11 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
         cash,
         openPositionMarketValue: openMarketValue,
         drift: accountValueCompositionDrift,
+        tolerance,
       },
     });
   }
-  if (Math.abs(netPnlSinceStartDrift) > 0.05) {
+  if (Math.abs(netPnlSinceStartDrift) > tolerance) {
     warnings.push({
       code: 'INVARIANT_NET_PNL_SINCE_START_MISMATCH',
       message: 'netPnLSinceStart does not match accountValue - startingCapital.',
@@ -350,8 +363,25 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
         accountValue: netLiquidationValue,
         startingCapital,
         drift: netPnlSinceStartDrift,
+        tolerance,
       },
     });
+  }
+
+  const previousCumulative = cumulativeInvariantDriftBySession.get(sessionId) ?? 0;
+  const cumulativeInvariantDrift = previousCumulative + maxAbsDrift;
+  cumulativeInvariantDriftBySession.set(sessionId, cumulativeInvariantDrift);
+
+  if (cumulativeInvariantDrift > startingCapital * 0.01) {
+    logger.error(
+      {
+        sessionId,
+        cumulativeInvariantDrift,
+        cumulativeDriftLimit: startingCapital * 0.01,
+        startingCapital,
+      },
+      'Cumulative accounting invariant drift exceeded 1% of starting capital',
+    );
   }
 
   if (!healthy) {
@@ -399,11 +429,13 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     warnings,
     invariants: {
       healthy,
+      tolerance,
       maxAbsDrift,
       accountingIdentityDrift,
       accountValueCompositionDrift,
       netPnlSinceStartDrift,
     },
+    cumulativeInvariantDrift,
     positions,
   };
 }

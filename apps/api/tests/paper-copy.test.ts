@@ -138,6 +138,14 @@ function createPrismaMock(state: MockState) {
           }) ?? null
         );
       }),
+      count: vi.fn(async ({ where }) => {
+        return state.decisions.filter((row) => {
+          if (where?.sessionId && row.sessionId !== where.sessionId) return false;
+          if (where?.status && row.status !== where.status) return false;
+          if (where?.notes && row.notes !== where.notes) return false;
+          return true;
+        }).length;
+      }),
       upsert: vi.fn(async ({ where, create, update }) => {
         const existing = state.decisions.find(
           (row) =>
@@ -262,6 +270,13 @@ function createPrismaMock(state: MockState) {
           }) ?? null
         );
       }),
+      count: vi.fn(async ({ where }) => {
+        return state.trades.filter((row) => {
+          if (where?.sessionId && row.sessionId !== where.sessionId) return false;
+          if (where?.side && row.side !== where.side) return false;
+          return true;
+        }).length;
+      }),
     },
     walletActivityEvent: {
       findMany: vi.fn(async ({ where }) => {
@@ -321,6 +336,15 @@ function createPrismaMock(state: MockState) {
         const row = { id: `snap-${state.snapshots.length + 1}`, ...data };
         state.snapshots.push(row);
         return row;
+      }),
+      findFirst: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+        const rows = state.snapshots
+          .filter((row) => {
+            if (where?.sessionId && row.sessionId !== where.sessionId) return false;
+            return true;
+          })
+          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+        return rows[0] ?? null;
       }),
     },
     paperSessionMetricPoint: {
@@ -544,6 +568,46 @@ describe('paper copy engine (mocked)', () => {
 
     expect(state.snapshots.length).toBeGreaterThanOrEqual(1);
     expect(state.metrics.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('stores polling, queue/processing, and total observed latency in sizingInputsJson', async () => {
+    const { state, adapterMock, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+    adapterMock.getWalletPositions.mockResolvedValue([]);
+
+    const session = await paperCopy.createPaperCopySession({
+      trackedWalletId: 'wallet-1',
+      startingCash: 10000,
+      minNotionalThreshold: 1,
+    });
+
+    await paperCopy.startPaperCopySession(session.id);
+    const startedSession = state.sessions.find((s) => s.id === session.id)!;
+    const sourceTs = new Date(startedSession.startedAt.getTime() + 1000);
+
+    state.activityEvents.push({
+      ...createActivityEvent({
+        id: 'evt-latency-fields',
+        trackedWalletId: 'wallet-1',
+        side: 'BUY',
+        marketId: 'market-latency',
+        outcome: 'YES',
+        shares: 50,
+        price: 0.5,
+        eventTimestamp: sourceTs,
+      }),
+      detectedAt: new Date(sourceTs.getTime() + 50),
+    });
+
+    await paperCopy.processPaperSessionTick(session.id);
+
+    const decision = state.decisions.find((d) => d.sourceActivityEventId === 'evt-latency-fields');
+    expect(decision).toBeDefined();
+    const sizing = (decision?.sizingInputsJson ?? {}) as Record<string, number>;
+    expect(typeof sizing.pollingLatencyMs).toBe('number');
+    expect(typeof sizing.queueAndProcessingLatencyMs).toBe('number');
+    expect(typeof sizing.totalObservedLatencyMs).toBe('number');
+    expect(Number(sizing.queueAndProcessingLatencyMs)).toBeGreaterThanOrEqual(0);
   });
 
   it('ignores below-threshold activity and only ticks RUNNING sessions', async () => {
@@ -916,6 +980,154 @@ describe('paper copy engine (mocked)', () => {
     const sessionPositions = state.positions.filter((p) => p.sessionId === session.id);
     const uniquePositionKeys = new Set(sessionPositions.map((p) => `${p.marketId}:${p.outcome}`));
     expect(uniquePositionKeys.size).toBe(sessionPositions.length);
+  });
+
+  it('reports skipped max-adverse trades and conservative lower bound in analytics', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const session = await paperCopy.createPaperCopySession({
+      trackedWalletId: 'wallet-1',
+      startingCash: 10000,
+      slippageConfig: {
+        enabled: true,
+        mode: 'FIXED_BPS',
+        fixedBps: 10,
+        maxAdverseMovePercent: 0.1,
+      },
+    } as any);
+
+    state.decisions.push(
+      {
+        id: 'skip-1',
+        sessionId: session.id,
+        status: 'SKIPPED',
+        reasonCode: 'SKIP_MAX_ADVERSE_MOVE',
+        sizingInputsJson: { sourceNotional: 100 },
+      },
+      {
+        id: 'skip-2',
+        sessionId: session.id,
+        status: 'SKIPPED',
+        reasonCode: 'SKIP_MAX_ADVERSE_MOVE',
+        sizingInputsJson: { sourceNotional: 200 },
+      },
+      {
+        id: 'exec-1',
+        sessionId: session.id,
+        status: 'EXECUTED',
+        reasonCode: 'COPY_APPROVED',
+        sizingInputsJson: {},
+      },
+    );
+
+    state.snapshots.push({
+      id: 'snap-1',
+      sessionId: session.id,
+      netLiquidationValue: 10100,
+      timestamp: new Date(),
+    });
+
+    const analytics = await paperCopy.getPaperCopySessionAnalytics(session.id);
+    expect(analytics?.summary.skippedDueToMaxAdverseMove).toBe(2);
+    expect(analytics?.summary.grossIncludingSkips.skippedTradeCount).toBe(2);
+    expect(analytics?.summary.grossIncludingSkips.skippedNotional).toBeCloseTo(300, 8);
+    expect(
+      analytics?.summary.grossIncludingSkips.netPnlIfAllSkipsExecutedAtMaxAdverse,
+    ).toBeLessThanOrEqual(analytics?.summary.totalPnl ?? 0);
+  });
+
+  it('reports zero skip-bias metrics when no max-adverse skips occurred', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+    state.snapshots.push({
+      id: 'snap-1',
+      sessionId: session.id,
+      netLiquidationValue: 10000,
+      timestamp: new Date(),
+    });
+
+    const analytics = await paperCopy.getPaperCopySessionAnalytics(session.id);
+    expect(analytics?.summary.skippedDueToMaxAdverseMove).toBe(0);
+    expect(analytics?.summary.grossIncludingSkips.skippedTradeCount).toBe(0);
+    expect(analytics?.summary.grossIncludingSkips.skippedNotional).toBe(0);
+  });
+
+  it('reports unrealizedFraction=0 when session has only realized PnL', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+    state.positions.push({
+      id: 'p-1',
+      sessionId: session.id,
+      marketId: 'm1',
+      outcome: 'YES',
+      status: 'CLOSED',
+      realizedPnl: 50,
+      unrealizedPnl: 0,
+      netShares: 0,
+      currentMarkPrice: 0.5,
+    });
+
+    const analytics = await paperCopy.getPaperCopySessionAnalytics(session.id);
+    expect(analytics?.summary.unrealizedFraction).toBe(0);
+  });
+
+  it('emits data quality warning when unrealized contribution is large', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+    state.positions.push({
+      id: 'p-open',
+      sessionId: session.id,
+      marketId: 'm-open',
+      outcome: 'YES',
+      status: 'OPEN',
+      realizedPnl: 5,
+      unrealizedPnl: 30,
+      netShares: 100,
+      currentMarkPrice: 0.5,
+    });
+
+    const analytics = await paperCopy.getPaperCopySessionAnalytics(session.id);
+    expect(Array.isArray(analytics?.summary.dataQualityWarnings)).toBe(true);
+    expect((analytics?.summary.dataQualityWarnings ?? []).length).toBeGreaterThan(0);
+  });
+
+  it('preserves net identity realized + unrealized - fees = netPnl in analytics summary', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+    state.positions.push({
+      id: 'p-1',
+      sessionId: session.id,
+      marketId: 'm1',
+      outcome: 'YES',
+      status: 'CLOSED',
+      realizedPnl: 10,
+      unrealizedPnl: 0,
+      netShares: 0,
+      currentMarkPrice: 0.5,
+    });
+    state.trades.push({
+      id: 't-1',
+      sessionId: session.id,
+      feeApplied: 2,
+      side: 'BUY',
+      eventTimestamp: new Date(),
+    });
+
+    const analytics = await paperCopy.getPaperCopySessionAnalytics(session.id);
+    const summary = analytics?.summary;
+    expect(summary).toBeDefined();
+    expect(
+      (summary?.realizedPnl ?? 0) + (summary?.unrealizedPnl ?? 0) - (summary?.totalFees ?? 0),
+    ).toBeCloseTo(summary?.netPnl ?? 0, 8);
   });
 
   it('stopping a session sets COMPLETED and writes a final snapshot/metric point', async () => {

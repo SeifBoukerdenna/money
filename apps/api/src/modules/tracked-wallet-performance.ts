@@ -248,6 +248,10 @@ export type SourceVsSessionComparison = {
       | 'NEUTRAL';
     summary: string;
   };
+  markContaminationWarning: boolean;
+  sourceHasOpenPositions: boolean;
+  sessionHasOpenPositions: boolean;
+  unrealizedAsymmetryBps: number;
 };
 
 type PositionAccumulator = {
@@ -1411,6 +1415,11 @@ export function compareSourceVsSession(input: {
   const sessionRealized = normalizeMoney(sessionRealizedEnd - sessionRealizedStart);
   const sessionFees = normalizeMoney(sessionFeesEnd - sessionFeesStart);
   const sessionUnrealized = normalizeMoney(sessionUnrealizedEnd - sessionUnrealizedStart);
+  const sourceHasOpenPositions = Math.abs(sourceUnrealized) > EPSILON;
+  const sessionHasOpenPositions = Math.abs(sessionUnrealized) > EPSILON;
+  const markContaminationWarning = sourceHasOpenPositions || sessionHasOpenPositions;
+  const notionalBase = Math.max(Math.abs(sourceNetPnl), Math.abs(sessionNetPnl), 1);
+  const unrealizedAsymmetryBps = ((sessionUnrealized - sourceUnrealized) / notionalBase) * 10000;
 
   const feeGap = normalizeMoney(sessionFees - sourceFees);
   const realizedGap = normalizeMoney(sourceRealized - sessionRealized);
@@ -1478,5 +1487,9 @@ export function compareSourceVsSession(input: {
       dominantDriver,
       summary,
     },
+    markContaminationWarning,
+    sourceHasOpenPositions,
+    sessionHasOpenPositions,
+    unrealizedAsymmetryBps,
   };
 }

@@ -28,7 +28,10 @@ import {
   updatePaperCopySessionGuardrails,
 } from './modules/paper-copy.js';
 import { resolvePaperExecutor } from './modules/paper-executor.js';
-import { materializePaperSessionState } from './modules/paper-accounting.js';
+import {
+  getCumulativeInvariantDrift,
+  materializePaperSessionState,
+} from './modules/paper-accounting.js';
 import { reconcileWalletExposure } from './modules/reconciliation.js';
 import { resolveWalletAddress, shortenAddress } from './modules/wallet-input.js';
 import { getWalletLeaderboard } from './modules/wallet-analytics.js';
@@ -1292,7 +1295,11 @@ export async function registerRoutes(app: any): Promise<void> {
       orderBy: { createdAt: 'desc' },
     });
     if (!snapshot) throw app.httpErrors.notFound('No analytics snapshot yet');
-    return snapshot;
+    return {
+      ...snapshot,
+      winRateDefinition: 'NET_OF_FEES_PER_CLOSED_POSITION',
+      grossWinRate: Number((snapshot as any).tradeAccuracy ?? snapshot.winRate),
+    };
   });
 
   app.get('/wallets/:id/tracked-performance', async (req: any) => {
@@ -1646,6 +1653,11 @@ export async function registerRoutes(app: any): Promise<void> {
             sessionNetPnl: sessionCurve,
             gap: gapCurve,
           },
+          warnings: comparison.markContaminationWarning
+            ? [
+                'Comparison includes unrealized PnL. Source and session may use different resolution prices for unresolved markets. Prefer realized-only comparison.',
+              ]
+            : [],
         };
       }),
     );
@@ -3214,12 +3226,23 @@ export async function registerRoutes(app: any): Promise<void> {
     });
     if (!row) throw app.httpErrors.notFound('Session not found');
 
-    const [latestSnapshot, openCount, closedRows, positionPnlRows] = await Promise.all([
+    const [
+      latestSnapshot,
+      openRows,
+      closedRows,
+      positionPnlRows,
+      executedTrades,
+      skippedMaxAdverseRows,
+      latestIngestionAudit,
+    ] = await Promise.all([
       db.paperPortfolioSnapshot.findFirst({
         where: { sessionId: row.id },
         orderBy: { timestamp: 'desc' },
       }),
-      db.paperCopyPosition.count({ where: { sessionId: row.id, status: 'OPEN' } }),
+      db.paperCopyPosition.findMany({
+        where: { sessionId: row.id, status: 'OPEN' },
+        select: { netShares: true, currentMarkPrice: true },
+      }),
       db.paperCopyPosition.findMany({
         where: { sessionId: row.id, status: 'CLOSED' },
         select: { realizedPnl: true },
@@ -3227,6 +3250,23 @@ export async function registerRoutes(app: any): Promise<void> {
       db.paperCopyPosition.findMany({
         where: { sessionId: row.id },
         select: { realizedPnl: true, unrealizedPnl: true },
+      }),
+      db.paperCopyTrade.findMany({
+        where: { sessionId: row.id },
+        select: { reasoning: true, feeApplied: true },
+      }),
+      db.paperCopyDecision.findMany({
+        where: {
+          sessionId: row.id,
+          status: 'SKIPPED',
+          reasonCode: 'SKIP_MAX_ADVERSE_MOVE',
+        },
+        select: { sourceShares: true, sourcePrice: true, sizingInputsJson: true },
+      }),
+      prisma.auditLog.findFirst({
+        where: { category: 'INGESTION', entityId: row.trackedWalletId },
+        orderBy: { createdAt: 'desc' },
+        select: { payload: true },
       }),
     ]);
 
@@ -3248,6 +3288,95 @@ export async function registerRoutes(app: any): Promise<void> {
           (sum, p) => sum + Number(p.unrealizedPnl ?? 0),
           0,
         );
+    const totalFees = latestSnapshot
+      ? Number(latestSnapshot.fees)
+      : (executedTrades as Array<Record<string, unknown>>).reduce(
+          (sum, t) => sum + Number(t.feeApplied ?? 0),
+          0,
+        );
+    const netPnl = realizedPnl + unrealizedPnl - totalFees;
+    const realizedFraction = Math.abs(netPnl) > 1e-9 ? realizedPnl / netPnl : null;
+    const unrealizedFraction = Math.abs(netPnl) > 1e-9 ? unrealizedPnl / Math.abs(netPnl) : 0;
+    const openPositionCount = openRows.length;
+    const openPositionGrossExposure = (openRows as Array<Record<string, unknown>>).reduce(
+      (sum, p) => sum + Math.abs(Number(p.netShares ?? 0) * Number(p.currentMarkPrice ?? 0)),
+      0,
+    );
+    const dataQualityWarnings: string[] = [];
+    if (Math.abs(netPnl) > 1e-9 && unrealizedPnl / Math.abs(netPnl) > 0.25) {
+      dataQualityWarnings.push(
+        'More than 25% of net PnL is unrealized. Result is sensitive to current mark prices and may change on resolution.',
+      );
+    }
+
+    const skippedTradeCount = skippedMaxAdverseRows.length;
+    const skippedNotionalForegoone = (
+      skippedMaxAdverseRows as Array<Record<string, unknown>>
+    ).reduce((sum, row) => {
+      const sourceNotional = Number(
+        (row.sizingInputsJson as Record<string, unknown> | null)?.sourceNotional ??
+          Number(row.sourceShares ?? 0) * Number(row.sourcePrice ?? 0),
+      );
+      return sum + Math.abs(Number.isFinite(sourceNotional) ? sourceNotional : 0);
+    }, 0);
+    const maxAdverseMovePercent = Number(
+      (row.slippageConfig as Record<string, unknown> | null)?.maxAdverseMovePercent ?? 0,
+    );
+    const conservativeLowerBoundNetPnl =
+      netPnl - skippedNotionalForegoone * Math.max(0, maxAdverseMovePercent);
+
+    const slippageMeta = (executedTrades as Array<Record<string, unknown>>)
+      .map(
+        (t) =>
+          (t.reasoning as Record<string, unknown> | null)?.slippageResult as
+            | Record<string, unknown>
+            | undefined,
+      )
+      .filter((v): v is Record<string, unknown> => Boolean(v));
+    const liveBookRows = slippageMeta.filter((s) => String(s.priceSource ?? '') === 'LIVE_BOOK');
+    const liveBookCoveragePercent =
+      slippageMeta.length > 0 ? (liveBookRows.length / slippageMeta.length) * 100 : 0;
+    const avgLiveBookGapBps =
+      liveBookRows.length > 0
+        ? liveBookRows.reduce((sum, s) => sum + Number(s.liveBookGapBps ?? 0), 0) /
+          liveBookRows.length
+        : null;
+    const avgSpreadCostBps =
+      slippageMeta.length > 0
+        ? slippageMeta.reduce((sum, s) => sum + Number(s.halfSpreadAdverseBps ?? 0), 0) /
+          slippageMeta.length
+        : null;
+    const priceSourceMode: 'LIVE_BOOK' | 'SOURCE_PRICE' | 'MIXED' =
+      slippageMeta.length === 0
+        ? 'SOURCE_PRICE'
+        : liveBookRows.length === slippageMeta.length
+          ? 'LIVE_BOOK'
+          : liveBookRows.length === 0
+            ? 'SOURCE_PRICE'
+            : 'MIXED';
+    const ingestionSummary =
+      latestIngestionAudit && typeof latestIngestionAudit.payload === 'object'
+        ? ((latestIngestionAudit.payload as Record<string, unknown>).summary as
+            | Record<string, unknown>
+            | undefined)
+        : undefined;
+    const historyTruncated = Boolean(ingestionSummary?.historyTruncated);
+    const markContaminationWarning = unrealizedFraction > 0;
+    const skipRatio =
+      (executedTrades as Array<Record<string, unknown>>).length + skippedTradeCount > 0
+        ? skippedTradeCount /
+          ((executedTrades as Array<Record<string, unknown>>).length + skippedTradeCount)
+        : 0;
+    const overallBiasRating: 'LOW' | 'MEDIUM' | 'HIGH' =
+      liveBookCoveragePercent > 90 &&
+      skippedTradeCount === 0 &&
+      unrealizedFraction < 0.1 &&
+      !historyTruncated &&
+      !markContaminationWarning
+        ? 'LOW'
+        : liveBookCoveragePercent < 50 || skipRatio > 0.05 || unrealizedFraction > 0.5
+          ? 'HIGH'
+          : 'MEDIUM';
     const winCount = (closedRows as Array<Record<string, unknown>>).filter(
       (p) => Number(p.realizedPnl ?? 0) > 0,
     ).length;
@@ -3284,7 +3413,14 @@ export async function registerRoutes(app: any): Promise<void> {
       totalPnl,
       realizedPnl,
       unrealizedPnl,
+      totalFees,
       fees,
+      netPnl,
+      realizedFraction,
+      openPositionCount,
+      openPositionGrossExposure,
+      unrealizedFraction,
+      dataQualityWarnings,
       returnPct,
       winCount,
       lossCount,
@@ -3294,7 +3430,21 @@ export async function registerRoutes(app: any): Promise<void> {
         totalPnl >= 0
           ? `Hypothetically, copying this wallet since session start would have made $${totalPnl.toFixed(2)} (+${returnPct.toFixed(2)}%).`
           : `Hypothetically, copying this wallet since session start would have lost $${Math.abs(totalPnl).toFixed(2)} (${returnPct.toFixed(2)}%).`,
-      stats: { openPositionsCount: openCount },
+      stats: { openPositionsCount: openPositionCount },
+      cumulativeInvariantDrift: getCumulativeInvariantDrift(row.id),
+      simulationBiasReport: {
+        priceSourceMode,
+        liveBookCoveragePercent,
+        avgLiveBookGapBps,
+        avgSpreadCostBps,
+        skippedTradeCount,
+        skippedNotionalForegoone,
+        conservativeLowerBoundNetPnl,
+        historyTruncated,
+        unrealizedFraction,
+        markContaminationWarning,
+        overallBiasRating,
+      },
     };
   });
 
@@ -3348,6 +3498,17 @@ export async function registerRoutes(app: any): Promise<void> {
     return {
       ...result,
       sourceComparison,
+      cumulativeInvariantDrift: getCumulativeInvariantDrift(params.id),
+      realizedPnl: Number((result as any).summary?.realizedPnl ?? 0),
+      unrealizedPnl: Number((result as any).summary?.unrealizedPnl ?? 0),
+      totalFees: Number((result as any).summary?.totalFees ?? 0),
+      netPnl: Number((result as any).summary?.netPnl ?? 0),
+      realizedFraction: (result as any).summary?.realizedFraction ?? null,
+      openPositionCount: Number((result as any).summary?.openPositionCount ?? 0),
+      openPositionGrossExposure: Number((result as any).summary?.openPositionGrossExposure ?? 0),
+      dataQualityWarnings: Array.isArray((result as any).summary?.dataQualityWarnings)
+        ? (result as any).summary.dataQualityWarnings
+        : [],
     };
   });
 
