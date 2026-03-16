@@ -24,6 +24,7 @@ type SessionListItem = {
     startedAt: string | null;
     totalPnl: number;
     fees: number;
+    winRate?: number;
     returnPct: number;
     winRatePct?: number;
 };
@@ -56,6 +57,7 @@ type SessionDetail = {
     } | null;
     winCount: number;
     lossCount: number;
+    winRate?: number;
     winRatePct: number;
     stats?: { openPositionsCount?: number };
 };
@@ -92,6 +94,7 @@ type SourceSummary = {
 type SourcePnlSummary = {
     netPnl: number;
     winRate: number;
+    winRatePct?: number;
     tradeCount: number;
 };
 
@@ -118,6 +121,17 @@ type TrackedPerformance = {
         startingCashKnown: boolean;
         accountValueMode: string;
         feeCoveragePct: number;
+        strictKnownOnly?: boolean;
+        inferredShareEvents?: number;
+        inferredPriceEvents?: number;
+        historyTruncatedByCap?: boolean;
+        scannedEventCount?: number;
+        maxEventCap?: number;
+    };
+    compute?: {
+        historyTruncatedByCap?: boolean;
+        scannedEventCount?: number;
+        maxEventCap?: number;
     };
 };
 
@@ -148,11 +162,20 @@ type SourceVsSessionsResponse = {
     sourceKnowability?: {
         strictKnownOnly?: boolean;
         feeCoveragePct?: number;
+        inferredShareEvents?: number;
+        inferredPriceEvents?: number;
+        scannedEventCount?: number;
+        maxEventCap?: number;
+        historyTruncatedByCap?: boolean;
     };
     compute?: {
         cacheHit?: boolean;
         curveBucket?: 'RAW' | '5M' | '15M' | '1H';
+        scannedEventCount?: number;
+        maxEventCap?: number;
+        historyTruncatedByCap?: boolean;
     };
+    warnings?: Array<{ code: string; message: string; severity?: string }>;
     sessions: SourceSessionComparison[];
 };
 
@@ -298,7 +321,7 @@ export default function SimulationPage() {
     const [sourceTracked, setSourceTracked] = useState<TrackedPerformance | null>(null);
     const [sourceComparisons, setSourceComparisons] = useState<SourceVsSessionsResponse | null>(null);
     const [comparisonAlignment, setComparisonAlignment] = useState<'SESSION_WINDOW' | 'SHARED_WINDOW'>('SESSION_WINDOW');
-    const [comparisonStrictKnownOnly, setComparisonStrictKnownOnly] = useState(false);
+    const [comparisonStrictKnownOnly, setComparisonStrictKnownOnly] = useState(true);
     const [comparisonCurveBucket, setComparisonCurveBucket] = useState<'RAW' | '5M' | '15M' | '1H'>('5M');
 
     const [activeSessionId, setActiveSessionId] = useState('');
@@ -313,6 +336,7 @@ export default function SimulationPage() {
     const [metricPoints, setMetricPoints] = useState<MetricPoint[]>([]);
 
     const [creating, setCreating] = useState(false);
+    const [forceStartOnLowConfidence, setForceStartOnLowConfidence] = useState(false);
     const [err, setErr] = useState('');
     const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null);
     const [nowMs, setNowMs] = useState(Date.now());
@@ -645,7 +669,20 @@ export default function SimulationPage() {
                 return;
             }
             const created = (await createResp.json()) as { id: string };
-            await fetch(`${API}/paper-copy-sessions/${created.id}/start`, { method: 'POST' });
+            const startResp = await fetch(`${API}/paper-copy-sessions/${created.id}/start`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ forceStart: forceStartOnLowConfidence }),
+            }).catch(() => null);
+
+            if (!startResp?.ok) {
+                const body = startResp ? await startResp.text() : 'Unable to start session.';
+                setErr(extractErrorMessage(body));
+                await loadSessions();
+                setActiveSessionId(created.id);
+                return;
+            }
+
             await loadSessions();
             setActiveSessionId(created.id);
             setActiveTab('live');
@@ -820,6 +857,13 @@ export default function SimulationPage() {
     const openValueCanonical = detail
         ? Math.max(0, detail.netLiquidationValue - detail.currentCash)
         : openLotsSummary.totalValue;
+    const sourceHistoryTruncated = Boolean(
+        sourceComparisons?.sourceKnowability?.historyTruncatedByCap ??
+        sourceComparisons?.compute?.historyTruncatedByCap ??
+        sourceTracked?.knowability?.historyTruncatedByCap ??
+        sourceTracked?.compute?.historyTruncatedByCap,
+    );
+    const sourceComparisonWarnings = sourceComparisons?.warnings ?? [];
     const filteredMetricPoints = useMemo(() => {
         if (metricPoints.length === 0) return [] as MetricPoint[];
         if (pnlRange === 'ALL') return metricPoints;
@@ -990,6 +1034,14 @@ export default function SimulationPage() {
                         )}
 
                         <div className="flex-1"></div>
+                        <label className="inline-flex h-10 items-center gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 text-xs text-amber-200">
+                            <input
+                                type="checkbox"
+                                checked={forceStartOnLowConfidence}
+                                onChange={(e) => setForceStartOnLowConfidence(e.target.checked)}
+                            />
+                            Force Start (override confidence gate)
+                        </label>
                         <button className="btn-primary h-10 px-8" disabled={creating} onClick={createAndStart}>
                             {creating ? 'Starting...' : 'Start Copy Trading ->'}
                         </button>
@@ -1001,7 +1053,7 @@ export default function SimulationPage() {
                         <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-6">
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Positions Value</p><p className="text-sm font-semibold text-slate-200">{fmtUsd(sourceSummary.positionsValueUsd, 0)}</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Net PnL (All Time)</p><p className={`text-sm font-semibold ${pnlClass(sourcePnl.netPnl)}`}>{fmtPnl(sourcePnl.netPnl)}</p></div>
-                            <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Win Rate</p><p className="text-sm font-semibold text-slate-200">{sourcePnl.winRate.toFixed(1)}%</p></div>
+                            <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Win Rate</p><p className="text-sm font-semibold text-slate-200">{((sourcePnl.winRatePct ?? sourcePnl.winRate * 100)).toFixed(1)}%</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Trades</p><p className="text-sm font-semibold text-slate-200">{sourcePnl.tradeCount}</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Source Realized (Gross)</p><p className={`text-sm font-semibold ${pnlClass(sourceTracked?.totals.realizedPnlGross ?? 0)}`}>{fmtPnl(sourceTracked?.totals.realizedPnlGross ?? 0)}</p></div>
                             <div className="rounded-lg border border-slate-800/50 bg-slate-900/40 p-3"><p className="text-[10px] uppercase tracking-wider text-slate-500">Source Fee Coverage</p><p className="text-sm font-semibold text-slate-200">{(sourceTracked?.knowability.feeCoveragePct ?? 0).toFixed(1)}%</p></div>
@@ -1026,7 +1078,7 @@ export default function SimulationPage() {
                                         <td className="py-2 text-right text-slate-300">{fmtUsd(s.currentCash, 0)}</td>
                                         <td className={`py-2 text-right font-semibold ${pnlClass(s.totalPnl)}`}>{fmtPnl(s.totalPnl)}</td>
                                         <td className={`py-2 text-right font-semibold ${pnlClass(s.returnPct)}`}>{fmtPct(s.returnPct)}</td>
-                                        <td className="py-2 text-right text-slate-300">{s.winRatePct != null ? `${s.winRatePct.toFixed(1)}%` : '-'}</td>
+                                        <td className="py-2 text-right text-slate-300">{s.winRate != null ? `${(s.winRate * 100).toFixed(1)}%` : s.winRatePct != null ? `${s.winRatePct.toFixed(1)}%` : '-'}</td>
                                         <td className="py-2 text-right text-slate-400">{shortDateTime(s.startedAt)}</td>
                                         <td className="py-2 text-right"><button className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[11px] text-rose-300 hover:bg-rose-500/20" onClick={(e) => { e.stopPropagation(); deleteSession(s.id); }}>x</button></td>
                                     </tr>
@@ -1188,8 +1240,22 @@ export default function SimulationPage() {
                                         <p className="text-[10px] uppercase tracking-wider text-slate-500">Backend Compute</p>
                                         <p className="mt-1">Cache: {sourceComparisons?.compute?.cacheHit ? 'HIT' : 'MISS'}</p>
                                         <p>Fee Coverage: {(sourceComparisons?.sourceKnowability?.feeCoveragePct ?? sourceTracked?.knowability.feeCoveragePct ?? 0).toFixed(1)}%</p>
+                                        <p>Strict Mode: {sourceComparisons?.sourceKnowability?.strictKnownOnly ? 'ON' : 'OFF'}</p>
+                                        <p>Inferred Events: {(sourceComparisons?.sourceKnowability?.inferredShareEvents ?? 0) + (sourceComparisons?.sourceKnowability?.inferredPriceEvents ?? 0)}</p>
+                                        <p>Scan: {sourceComparisons?.sourceKnowability?.scannedEventCount ?? sourceComparisons?.compute?.scannedEventCount ?? 0}/{sourceComparisons?.sourceKnowability?.maxEventCap ?? sourceComparisons?.compute?.maxEventCap ?? 0}</p>
                                     </div>
                                 </div>
+
+                                {(sourceHistoryTruncated || sourceComparisonWarnings.length > 0) && (
+                                    <div className="mb-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                                        {sourceHistoryTruncated && (
+                                            <p>Source history is truncated by event cap. Headline parity metrics may omit older source events.</p>
+                                        )}
+                                        {sourceComparisonWarnings.map((warning) => (
+                                            <p key={`${warning.code}:${warning.message}`}>{warning.message}</p>
+                                        ))}
+                                    </div>
+                                )}
 
                                 <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-6 mb-3">
                                     <div className="rounded border border-slate-700/60 bg-slate-900/45 p-2 text-xs text-slate-300">Source Net: <span className={`font-semibold ${pnlClass(activeComparison.source.netPnl)}`}>{fmtPnl(activeComparison.source.netPnl)}</span></div>

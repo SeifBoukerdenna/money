@@ -57,6 +57,7 @@ export type PnlSummaryResponse = {
   tradeCount: number;
   winCount: number;
   lossCount: number;
+  winRatePct: number;
   winRate: number;
 };
 
@@ -306,7 +307,8 @@ export function registerProfileParityRoutes(
   //   SELL events:           pnl = (sellPrice - wacpAtSell) × shares
   //                          wacp computed from all BUY events for the same market
   //
-  // Returns: netPnl, totalWon, totalLost, tradeCount, winCount, lossCount, winRate
+  // Returns: netPnl, totalWon, totalLost, tradeCount, winCount, lossCount,
+  //          winRate (ratio 0..1) and winRatePct (compatibility percentage)
   // ───────────────────────────────────────────────────────────────────────────
   app.get('/wallets/:id/pnl-summary', async (req: any) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
@@ -979,6 +981,7 @@ export async function calculateWalletPnlSummary(
   }
 
   const netPnl = totalWon - totalLost;
+  const winRate = tradeCount > 0 ? winCount / tradeCount : 0;
   return {
     walletId,
     range,
@@ -992,7 +995,8 @@ export async function calculateWalletPnlSummary(
     tradeCount,
     winCount,
     lossCount,
-    winRate: tradeCount > 0 ? Math.round((winCount / tradeCount) * 10000) / 100 : 0,
+    winRatePct: Math.round(winRate * 10000) / 100,
+    winRate,
   };
 }
 

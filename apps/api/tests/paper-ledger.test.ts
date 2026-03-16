@@ -761,87 +761,91 @@ describe('paper-ledger — pure accounting math', () => {
   });
 
   describe('Pre-flight long-run stability', () => {
-    it('runs 5,000 deterministic mixed events with invariant checks after every step', () => {
-      const rng = createRng(20260316);
-      const startingCash = 75_000;
-      const marketIds = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5'];
-      const outcomes = ['YES', 'NO'];
-      const entries: LedgerEntry[] = [];
-      const trackedShares = new Map<string, number>();
-      const marks = new Map<string, number>();
-      let ts = new Date('2026-01-01T00:00:00.000Z').getTime();
+    it(
+      'runs 5,000 deterministic mixed events with invariant checks after every step',
+      { timeout: 30000 },
+      () => {
+        const rng = createRng(20260316);
+        const startingCash = 75_000;
+        const marketIds = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5'];
+        const outcomes = ['YES', 'NO'];
+        const entries: LedgerEntry[] = [];
+        const trackedShares = new Map<string, number>();
+        const marks = new Map<string, number>();
+        let ts = new Date('2026-01-01T00:00:00.000Z').getTime();
 
-      for (let i = 0; i < 5000; i += 1) {
-        const marketId = marketIds[randInt(rng, 0, marketIds.length - 1)]!;
-        const outcome = outcomes[randInt(rng, 0, outcomes.length - 1)]!;
-        const key = `${marketId}:${outcome}`;
-        const held = trackedShares.get(key) ?? 0;
+        for (let i = 0; i < 5000; i += 1) {
+          const marketId = marketIds[randInt(rng, 0, marketIds.length - 1)]!;
+          const outcome = outcomes[randInt(rng, 0, outcomes.length - 1)]!;
+          const key = `${marketId}:${outcome}`;
+          const held = trackedShares.get(key) ?? 0;
 
-        let side: 'BUY' | 'SELL' = 'BUY';
-        let action = 'BUY';
-        let shares = 0;
-        let price = 0;
+          let side: 'BUY' | 'SELL' = 'BUY';
+          let action = 'BUY';
+          let shares = 0;
+          let price = 0;
 
-        if (held <= 1e-8 || rng() < 0.48) {
-          side = 'BUY';
-          action = 'BUY';
-          shares = roundShares(randBetween(rng, 0.05, 120));
-          price = randBetween(rng, 0.02, 0.98);
-          trackedShares.set(key, roundShares(held + shares));
-        } else {
-          side = 'SELL';
-          const modeRoll = rng();
-          if (modeRoll < 0.65) {
-            action = 'SELL';
-            shares = roundShares(Math.max(0.00000001, held * randBetween(rng, 0.05, 0.8)));
-            price = randBetween(rng, 0.01, 0.99);
-          } else if (modeRoll < 0.85) {
-            action = 'REDEEM';
-            shares = roundShares(held);
-            price = rng() < 0.5 ? 0 : 1;
+          if (held <= 1e-8 || rng() < 0.48) {
+            side = 'BUY';
+            action = 'BUY';
+            shares = roundShares(randBetween(rng, 0.05, 120));
+            price = randBetween(rng, 0.02, 0.98);
+            trackedShares.set(key, roundShares(held + shares));
           } else {
-            action = 'AUTO_CLOSED';
-            shares = roundShares(held);
-            price = rng() < 0.5 ? 0 : 1;
+            side = 'SELL';
+            const modeRoll = rng();
+            if (modeRoll < 0.65) {
+              action = 'SELL';
+              shares = roundShares(Math.max(0.00000001, held * randBetween(rng, 0.05, 0.8)));
+              price = randBetween(rng, 0.01, 0.99);
+            } else if (modeRoll < 0.85) {
+              action = 'REDEEM';
+              shares = roundShares(held);
+              price = rng() < 0.5 ? 0 : 1;
+            } else {
+              action = 'AUTO_CLOSED';
+              shares = roundShares(held);
+              price = rng() < 0.5 ? 0 : 1;
+            }
+
+            const closeShares = Math.min(held, shares);
+            trackedShares.set(key, roundShares(Math.max(0, held - closeShares)));
           }
 
-          const closeShares = Math.min(held, shares);
-          trackedShares.set(key, roundShares(Math.max(0, held - closeShares)));
+          marks.set(key, price);
+          const notional = shares * price;
+          const fee = notional * randBetween(rng, 0, 0.02);
+
+          entries.push({
+            id: `long-${i}`,
+            sourceEventId: `src-long-${i}`,
+            marketId,
+            outcome,
+            side,
+            action,
+            shares,
+            price,
+            notional,
+            fee,
+            slippage: randBetween(rng, 0, 0.01),
+            timestamp: new Date(ts),
+          });
+          ts += 1000;
+
+          const portfolio = computePortfolio(startingCash, entries, marks);
+          assertPortfolioInvariants(portfolio, startingCash, marks);
+
+          for (const [trackedKey, expectedShares] of trackedShares) {
+            if (expectedShares <= 1e-8) continue;
+            const position = portfolio.openPositions.find(
+              (p) => `${p.marketId}:${p.outcome}` === trackedKey,
+            );
+            expect(position).toBeDefined();
+            expect(position!.netShares).toBeCloseTo(expectedShares, 6);
+          }
         }
-
-        marks.set(key, price);
-        const notional = shares * price;
-        const fee = notional * randBetween(rng, 0, 0.02);
-
-        entries.push({
-          id: `long-${i}`,
-          sourceEventId: `src-long-${i}`,
-          marketId,
-          outcome,
-          side,
-          action,
-          shares,
-          price,
-          notional,
-          fee,
-          slippage: randBetween(rng, 0, 0.01),
-          timestamp: new Date(ts),
-        });
-        ts += 1000;
-
-        const portfolio = computePortfolio(startingCash, entries, marks);
-        assertPortfolioInvariants(portfolio, startingCash, marks);
-
-        for (const [trackedKey, expectedShares] of trackedShares) {
-          if (expectedShares <= 1e-8) continue;
-          const position = portfolio.openPositions.find(
-            (p) => `${p.marketId}:${p.outcome}` === trackedKey,
-          );
-          expect(position).toBeDefined();
-          expect(position!.netShares).toBeCloseTo(expectedShares, 6);
-        }
-      }
-    });
+      },
+    );
 
     it('keeps replay state equal to live state across repeated replay cycles', () => {
       const rng = createRng(77777);

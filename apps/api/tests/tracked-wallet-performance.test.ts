@@ -287,6 +287,35 @@ describe('tracked-wallet-performance reducer', () => {
     expect(reduced.warnings.some((w) => w.code === 'INFERENCE_DISABLED_EVENT_SKIPPED')).toBe(true);
   });
 
+  it('uses inferred mode to process otherwise unknown close events', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'infer-buy',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 25,
+          price: 0.4,
+        }),
+        event({
+          id: 'infer-redeem',
+          ts: '2026-03-01T00:10:00.000Z',
+          eventType: 'REDEEM',
+          side: null,
+          effectiveSide: null,
+          shares: null,
+          price: null,
+          notional: 0,
+        }),
+      ],
+      inferMissingFields: true,
+    });
+
+    expect(reduced.positions[0]?.status).toBe('CLOSED');
+    expect(reduced.summary.inferredShareEvents).toBeGreaterThan(0);
+  });
+
   it('buckets timeline using latest cumulative point per bucket', () => {
     const reduced = reduceTrackedWalletEvents({
       events: [
@@ -321,6 +350,195 @@ describe('tracked-wallet-performance reducer', () => {
     expect(bucketed.length).toBe(2);
     expect(bucketed[0]?.eventId).toBe('bkt-2');
     expect(bucketed[1]?.eventId).toBe('bkt-3');
+  });
+
+  it('downgrades confidence and withholds canonical net on truncated history with open positions', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'th-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 20,
+          price: 0.45,
+          fee: 0.1,
+        }),
+      ],
+      markPriceByKey: new Map([['m1:YES', 0.6]]),
+      markMetaByKey: new Map([['m1:YES', { source: 'LIVE', stale: false }]]),
+      hasTruncatedHistory: true,
+    });
+
+    expect(reduced.confidenceModel.confidence).toBe('LOW');
+    expect(reduced.confidenceModel.hasUnknownCostBasis).toBe(true);
+    expect(reduced.canonical.canonicalKnownNetPnl).toBeNull();
+    expect(reduced.debugReport.unknownCostBasisPositions.length).toBeGreaterThan(0);
+  });
+
+  it('records unsupported event types in append-only ledger', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'u-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'TRANSFER',
+          side: null,
+          shares: null,
+          price: null,
+        }),
+      ],
+    });
+
+    expect(reduced.summary.unsupportedEventCount).toBe(1);
+    expect(reduced.ledger.some((row) => row.type === 'UNSUPPORTED')).toBe(true);
+    expect(reduced.confidenceModel.hasUnsupportedEvents).toBe(true);
+  });
+
+  it('treats fallback marks as estimated and excludes unrealized from canonical known net', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'm-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 10,
+          price: 0.2,
+          fee: 0,
+        }),
+      ],
+      markPriceByKey: new Map([['m1:YES', 0.9]]),
+      markMetaByKey: new Map([['m1:YES', { source: 'FALLBACK', stale: true }]]),
+    });
+
+    expect(reduced.unrealizedPnl).toBeCloseTo(7, 8);
+    expect(reduced.canonical.canonicalUnrealizedPnl).toBe(0);
+    expect(reduced.canonical.estimatedNetPnl).toBeCloseTo(7, 8);
+    expect(reduced.confidenceModel.hasEstimatedMarks).toBe(true);
+  });
+
+  it('warns when sell exceeds known open quantity and clamps closed size', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'sq-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 5,
+          price: 0.4,
+        }),
+        event({
+          id: 'sq-2',
+          ts: '2026-03-01T00:01:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 10,
+          price: 0.5,
+        }),
+      ],
+    });
+
+    expect(reduced.warnings.some((w) => w.code === 'SELL_EXCEEDS_HELD_SHARES')).toBe(true);
+    expect(reduced.positions[0]?.status).toBe('CLOSED');
+    expect(reduced.debugReport.impossibleStateTransitions).toBeGreaterThan(0);
+  });
+
+  it('replays out-of-order events by timestamp deterministically', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'ord-sell',
+          ts: '2026-03-01T00:02:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 10,
+          price: 0.7,
+          fee: 0.2,
+        }),
+        event({
+          id: 'ord-buy',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 10,
+          price: 0.4,
+          fee: 0.1,
+        }),
+      ],
+    });
+
+    expect(reduced.realizedPnlGross).toBeCloseTo(3, 8);
+    expect(reduced.timeline[0]?.eventId).toBe('ord-buy');
+    expect(reduced.timeline[1]?.eventId).toBe('ord-sell');
+  });
+
+  it('detects missing fees and avoids authoritative canonical net', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'mf-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 10,
+          price: 0.5,
+          fee: null,
+        }),
+        event({
+          id: 'mf-2',
+          ts: '2026-03-01T00:01:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 10,
+          price: 0.55,
+          fee: null,
+        }),
+      ],
+    });
+
+    expect(reduced.summary.missingFeeEvents).toBe(2);
+    expect(reduced.confidenceModel.hasMissingFees).toBe(true);
+    expect(reduced.canonical.canonicalKnownNetPnl).toBeNull();
+  });
+
+  it('keeps canonical formula consistent and reconciliation debug aligned', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'rc-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 20,
+          price: 0.3,
+          fee: 0.2,
+        }),
+        event({
+          id: 'rc-2',
+          ts: '2026-03-01T00:05:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 8,
+          price: 0.6,
+          fee: 0.1,
+        }),
+      ],
+      markPriceByKey: new Map([['m1:YES', 0.35]]),
+      markMetaByKey: new Map([['m1:YES', { source: 'LIVE', stale: false }]]),
+    });
+
+    const canonicalNet =
+      reduced.canonical.canonicalRealizedPnl +
+      reduced.canonical.canonicalUnrealizedPnl -
+      reduced.canonical.canonicalFees;
+    expect(canonicalNet).toBeCloseTo(reduced.canonical.canonicalKnownNetPnl ?? 0, 8);
+    expect(
+      reduced.debugReport.eventCountsByType.BUY_FILL +
+        reduced.debugReport.eventCountsByType.SELL_FILL +
+        reduced.debugReport.eventCountsByType.FEE,
+    ).toBeGreaterThan(0);
   });
 });
 

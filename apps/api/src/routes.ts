@@ -53,6 +53,7 @@ import {
   type TimelineBucket,
   type TrackedWalletTimelinePoint,
 } from './modules/tracked-wallet-performance.js';
+import { buildSessionSourceComparison } from './modules/session-analytics-contract.js';
 
 const TRACKED_WALLET_CACHE_TTL_MS = 20_000;
 const TRACKED_WALLET_MAX_EVENTS = 25_000;
@@ -318,6 +319,9 @@ async function buildTrackedWalletMarkMap(input: {
   walletAddress: string;
 }) {
   const markMap = new Map<string, number>();
+  const markMetaByKey = new Map<string, { source: 'LIVE' | 'FALLBACK'; stale: boolean }>();
+  let liveMarkCount = 0;
+  let fallbackMarkCount = 0;
 
   try {
     const livePositions = await dataAdapter.getWalletPositions(input.walletAddress, 'OPEN', 500);
@@ -329,7 +333,10 @@ async function buildTrackedWalletMarkMap(input: {
       const price = Number(row.currentPrice ?? row.curPrice ?? row.price ?? row.avgPrice ?? 0);
       if (!marketKey || !outcome || !Number.isFinite(price)) continue;
       const clamped = Math.max(0, Math.min(1, price));
-      markMap.set(`${marketKey}:${outcome}`, clamped);
+      const key = `${marketKey}:${outcome}`;
+      markMap.set(key, clamped);
+      markMetaByKey.set(key, { source: 'LIVE', stale: false });
+      liveMarkCount += 1;
     }
   } catch {
     // Non-fatal. We still build marks from recent event prices below.
@@ -361,10 +368,19 @@ async function buildTrackedWalletMarkMap(input: {
     const key = `${marketKey}:${outcome}`;
     if (!markMap.has(key)) {
       markMap.set(key, Math.max(0, Math.min(1, price)));
+      markMetaByKey.set(key, { source: 'FALLBACK', stale: true });
+      fallbackMarkCount += 1;
     }
   }
 
-  return markMap;
+  return {
+    markPriceByKey: markMap,
+    markMetaByKey,
+    diagnostics: {
+      liveMarkCount,
+      fallbackMarkCount,
+    },
+  };
 }
 
 async function getLatestIngestionDiagnostic(walletId: string) {
@@ -410,6 +426,10 @@ async function computeTrackedWalletPerformance(input: {
     return {
       wallet: cached.wallet,
       reduced: cached.reduced,
+      markDiagnostics: {
+        liveMarkCount: 0,
+        fallbackMarkCount: 0,
+      },
       fromCache: true,
       incrementalRefresh: false,
       hasTruncatedHistory: cached.hasTruncatedHistory,
@@ -529,8 +549,10 @@ async function computeTrackedWalletPerformance(input: {
       eventTimestamp: row.eventTimestamp,
       createdAt: row.createdAt,
     })),
-    markPriceByKey: marks,
+    markPriceByKey: marks.markPriceByKey,
+    markMetaByKey: marks.markMetaByKey,
     inferMissingFields: !strictKnownOnly,
+    hasTruncatedHistory,
   });
 
   trackedWalletReductionCache.set(cacheKey, {
@@ -545,6 +567,7 @@ async function computeTrackedWalletPerformance(input: {
   return {
     wallet,
     reduced,
+    markDiagnostics: marks.diagnostics,
     fromCache: false,
     incrementalRefresh,
     hasTruncatedHistory,
@@ -1280,13 +1303,14 @@ export async function registerRoutes(app: any): Promise<void> {
         to: z.string().datetime().optional(),
         limit: z.coerce.number().int().min(1).max(10000).default(1500),
         bucket: z.enum(['RAW', '5M', '15M', '1H']).default('RAW'),
-        strictKnownOnly: z.coerce.boolean().default(false),
+        strictKnownOnly: z.coerce.boolean().default(true),
       })
       .parse(req.query ?? {});
 
     const {
       wallet,
       reduced,
+      markDiagnostics,
       fromCache,
       incrementalRefresh,
       hasTruncatedHistory,
@@ -1332,6 +1356,15 @@ export async function registerRoutes(app: any): Promise<void> {
       walletId: wallet.id,
       walletAddress: wallet.address,
       walletLabel: wallet.label,
+      canonical: {
+        canonicalKnownNetPnl: reduced.canonical.canonicalKnownNetPnl,
+        canonicalRealizedPnl: reduced.canonical.canonicalRealizedPnl,
+        canonicalUnrealizedPnl: reduced.canonical.canonicalUnrealizedPnl,
+        canonicalFees: reduced.canonical.canonicalFees,
+        estimatedNetPnl: reduced.canonical.estimatedNetPnl,
+      },
+      confidence: reduced.confidenceModel.confidence,
+      confidenceModel: reduced.confidenceModel,
       knowability: {
         startingCashKnown: false,
         accountValueMode: 'RECONSTRUCTED_RELATIVE',
@@ -1341,8 +1374,19 @@ export async function registerRoutes(app: any): Promise<void> {
         inferredShareEvents: reduced.summary.inferredShareEvents,
         inferredPriceEvents: reduced.summary.inferredPriceEvents,
         strictKnownOnly: query.strictKnownOnly,
+        historyTruncatedByCap: hasTruncatedHistory,
+        scannedEventCount,
+        maxEventCap,
+        liveMarkCount: markDiagnostics.liveMarkCount,
+        fallbackMarkCount: markDiagnostics.fallbackMarkCount,
       },
       totals: {
+        // Deprecated compatibility fields. Prefer `canonical` metrics above.
+        canonicalKnownNetPnl: reduced.canonical.canonicalKnownNetPnl,
+        canonicalRealizedPnl: reduced.canonical.canonicalRealizedPnl,
+        canonicalUnrealizedPnl: reduced.canonical.canonicalUnrealizedPnl,
+        canonicalFees: reduced.canonical.canonicalFees,
+        estimatedNetPnl: reduced.canonical.estimatedNetPnl,
         realizedPnlGross: reduced.realizedPnlGross,
         unrealizedPnl: reduced.unrealizedPnl,
         fees: reduced.fees,
@@ -1361,6 +1405,25 @@ export async function registerRoutes(app: any): Promise<void> {
           reduced.netPnl - (reduced.realizedPnlGross + reduced.unrealizedPnl - reduced.fees),
       },
       summary: reduced.summary,
+      debugReport: reduced.debugReport,
+      validationReport: {
+        eventCountsByType: reduced.debugReport.eventCountsByType,
+        firstEventTimestamp: reduced.debugReport.firstEventTimestamp,
+        lastEventTimestamp: reduced.debugReport.lastEventTimestamp,
+        duplicates: reduced.debugReport.duplicateCount,
+        unsupportedCount: reduced.debugReport.unsupportedIgnoredEvents,
+        confidenceFlags: reduced.confidenceModel,
+        realized: reduced.realizedPnlGross,
+        unrealized: reduced.unrealizedPnl,
+        fees: reduced.fees,
+        openPositions: reduced.positions.filter((p) => p.status === 'OPEN').length,
+        unknownCostBasisPositions: reduced.debugReport.unknownCostBasisPositions,
+        reconciliationWarnings: reduced.warnings.map((w) => w.message),
+        notes: [
+          'Source vs session can differ from execution latency, slippage, fees, and unsupported source events.',
+          'Canonical known metrics exclude unknown or estimated components to remain conservative.',
+        ],
+      },
       compute: {
         cacheHit: fromCache,
         incrementalRefresh,
@@ -1369,7 +1432,18 @@ export async function registerRoutes(app: any): Promise<void> {
         historyTruncatedByCap: hasTruncatedHistory,
         bucket: query.bucket,
       },
-      warnings: reduced.warnings,
+      warnings: [
+        ...reduced.warnings,
+        ...(hasTruncatedHistory
+          ? [
+              {
+                code: 'SOURCE_HISTORY_TRUNCATED',
+                eventId: 'SYSTEM',
+                message: `Source history capped at ${maxEventCap} events; only ${scannedEventCount} most recent events were used for reduction.`,
+              },
+            ]
+          : []),
+      ],
       timeline: filteredTimeline,
       positions: reduced.positions,
     };
@@ -1381,7 +1455,7 @@ export async function registerRoutes(app: any): Promise<void> {
       .object({
         sessionIds: z.string().optional(),
         alignment: z.enum(['SESSION_WINDOW', 'SHARED_WINDOW']).default('SESSION_WINDOW'),
-        strictKnownOnly: z.coerce.boolean().default(false),
+        strictKnownOnly: z.coerce.boolean().default(true),
         curveBucket: z.enum(['RAW', '5M', '15M', '1H']).default('RAW'),
       })
       .parse(req.query ?? {});
@@ -1389,6 +1463,7 @@ export async function registerRoutes(app: any): Promise<void> {
     const {
       wallet,
       reduced,
+      markDiagnostics,
       fromCache,
       incrementalRefresh,
       hasTruncatedHistory,
@@ -1527,6 +1602,10 @@ export async function registerRoutes(app: any): Promise<void> {
           windowEnd,
         });
 
+        const conservativeSourceNet = reduced.canonical.canonicalKnownNetPnl;
+        const sourceNetForComparison = conservativeSourceNet ?? comparison.source.netPnl;
+        const conservativeGap = sourceNetForComparison - comparison.session.netPnl;
+
         const sourceCurve = bucketCurvePoints(
           comparison.curves.sourceNetPnl,
           query.curveBucket as TimelineBucket,
@@ -1549,6 +1628,19 @@ export async function registerRoutes(app: any): Promise<void> {
             mode: sharedWindow ? 'SHARED_WINDOW' : 'SESSION_WINDOW',
           },
           ...comparison,
+          source: {
+            ...comparison.source,
+            canonicalKnownNetPnl: conservativeSourceNet,
+            canonicalRealizedPnl: reduced.canonical.canonicalRealizedPnl,
+            canonicalUnrealizedPnl: reduced.canonical.canonicalUnrealizedPnl,
+            canonicalFees: reduced.canonical.canonicalFees,
+            estimatedNetPnl: reduced.canonical.estimatedNetPnl,
+            netPnl: sourceNetForComparison,
+          },
+          gaps: {
+            ...comparison.gaps,
+            netPnlGap: conservativeGap,
+          },
           curves: {
             sourceNetPnl: sourceCurve,
             sessionNetPnl: sessionCurve,
@@ -1567,8 +1659,17 @@ export async function registerRoutes(app: any): Promise<void> {
         startingCashKnown: false,
         accountValueMode: 'RECONSTRUCTED_RELATIVE',
         feeCoveragePct: reduced.summary.feeCoveragePct,
+        inferredShareEvents: reduced.summary.inferredShareEvents,
+        inferredPriceEvents: reduced.summary.inferredPriceEvents,
         strictKnownOnly: query.strictKnownOnly,
+        scannedEventCount,
+        maxEventCap,
+        historyTruncatedByCap: hasTruncatedHistory,
       },
+      confidence: reduced.confidenceModel.confidence,
+      confidenceModel: reduced.confidenceModel,
+      canonical: reduced.canonical,
+      debugReport: reduced.debugReport,
       compute: {
         cacheHit: fromCache,
         incrementalRefresh,
@@ -1576,7 +1677,18 @@ export async function registerRoutes(app: any): Promise<void> {
         maxEventCap,
         historyTruncatedByCap: hasTruncatedHistory,
         curveBucket: query.curveBucket,
+        liveMarkCount: markDiagnostics.liveMarkCount,
+        fallbackMarkCount: markDiagnostics.fallbackMarkCount,
       },
+      warnings: hasTruncatedHistory
+        ? [
+            {
+              code: 'SOURCE_HISTORY_TRUNCATED',
+              message: `Source history capped at ${maxEventCap} events; comparisons are computed on the most recent ${scannedEventCount} events.`,
+              severity: 'warn',
+            },
+          ]
+        : [],
       sessions: comparisons,
     };
   });
@@ -1611,7 +1723,7 @@ export async function registerRoutes(app: any): Promise<void> {
     ]);
 
     const riskTier = computeSimulationRiskTier({
-      winRatePct: pnlAll.winRate,
+      winRatePct: Number(pnlAll.winRatePct ?? pnlAll.winRate * 100),
       netPnl: pnlAll.netPnl,
       tradeCount: pnlAll.tradeCount,
     });
@@ -2147,7 +2259,14 @@ export async function registerRoutes(app: any): Promise<void> {
 
   app.post('/paper-copy-sessions/:id/start', async (req: any) => {
     const params = z.object({ id: z.string().uuid() }).parse(req.params);
-    await startPaperCopySession(params.id);
+    const body = z
+      .object({
+        forceStart: z.boolean().optional(),
+      })
+      .parse(req.body ?? {});
+    await startPaperCopySession(params.id, {
+      forceStart: body.forceStart ?? false,
+    });
     return { started: true };
   });
 
@@ -3045,7 +3164,8 @@ export async function registerRoutes(app: any): Promise<void> {
           (p) => Number(p.realizedPnl ?? 0) > 0,
         ).length;
         const lossCount = closedRows.length - winCount;
-        const winRatePct = winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0;
+        const winRate = winCount + lossCount > 0 ? winCount / (winCount + lossCount) : 0;
+        const winRatePct = winRate * 100;
 
         return {
           id: row.id,
@@ -3077,6 +3197,7 @@ export async function registerRoutes(app: any): Promise<void> {
           netLiquidationValue: latestSnapshot
             ? Number(latestSnapshot.netLiquidationValue)
             : Number(row.currentCash),
+          winRate,
           winRatePct,
           tradesCount: row._count.trades,
           positionsCount: row._count.positions,
@@ -3131,7 +3252,8 @@ export async function registerRoutes(app: any): Promise<void> {
       (p) => Number(p.realizedPnl ?? 0) > 0,
     ).length;
     const lossCount = closedRows.length - winCount;
-    const winRatePct = winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0;
+    const winRate = winCount + lossCount > 0 ? winCount / (winCount + lossCount) : 0;
+    const winRatePct = winRate * 100;
 
     return {
       id: row.id,
@@ -3166,6 +3288,7 @@ export async function registerRoutes(app: any): Promise<void> {
       returnPct,
       winCount,
       lossCount,
+      winRate,
       winRatePct,
       summarySentence:
         totalPnl >= 0
@@ -3214,35 +3337,17 @@ export async function registerRoutes(app: any): Promise<void> {
         })
       : await calculateWalletPnlSummary(prisma, session.trackedWalletId, { range: 'ALL' });
 
-    const paperWins = (closedPositions as Array<Record<string, unknown>>).filter(
-      (p) => Number(p.currentMarkPrice ?? 0) >= 0.95,
-    ).length;
-    const paperWinRate =
-      closedPositions.length > 0 ? (paperWins / closedPositions.length) * 100 : 0;
-    const paperRealizedPnl = (closedPositions as Array<Record<string, unknown>>).reduce(
-      (sum, p) => sum + Number(p.realizedPnl ?? 0),
-      0,
-    );
-    const trackingEfficiencyPct =
-      sourceWindow.netPnl !== 0 ? (paperRealizedPnl / sourceWindow.netPnl) * 100 : 0;
+    const sourceComparison = buildSessionSourceComparison({
+      sourceWinRate: Number(sourceWindow.winRate),
+      sourceNetPnl: sourceWindow.netPnl,
+      closedPositions: closedPositions as Array<{ realizedPnl: unknown }>,
+      startedAt,
+      createdAtIso: new Date(session.createdAt as Date).toISOString(),
+    });
 
     return {
       ...result,
-      sourceComparison: {
-        sourceWinRate: sourceWindow.winRate,
-        paperWinRate,
-        sourceRealizedPnl: sourceWindow.netPnl,
-        paperRealizedPnl,
-        trackingEfficiencyPct,
-        sessionStartDate: startedAt ?? new Date(session.createdAt as Date).toISOString(),
-        periodLabel: `Since ${new Date(
-          startedAt ?? (session.createdAt as Date).toISOString(),
-        ).toLocaleDateString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-        })}`,
-      },
+      sourceComparison,
     };
   });
 

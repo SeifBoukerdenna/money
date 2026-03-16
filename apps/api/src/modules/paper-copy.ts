@@ -1,5 +1,8 @@
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
+import { redis } from '../lib/redis.js';
+import { config } from '../config.js';
+import { randomUUID } from 'node:crypto';
 import { createPolymarketDataAdapter } from './polymarket.js';
 import { materializePaperSessionState } from './paper-accounting.js';
 import {
@@ -13,6 +16,7 @@ import { raiseSystemAlert } from './system-alerts.js';
 import { closeResolvedPositions } from './force-close.js';
 import { processWalletPoll } from './ingestion.js';
 import { paperEndToEndLatency, paperPipelineLatency } from '../lib/metrics.js';
+import { reduceTrackedWalletEvents } from './tracked-wallet-performance.js';
 
 const adapter = createPolymarketDataAdapter();
 const db = prisma as unknown as Record<string, any>;
@@ -34,6 +38,19 @@ const MIN_SNAPSHOT_INTERVAL_MS = 60_000;
 /** Maximum activity events processed per tick. Prevents runaway DB load. */
 const MAX_EVENTS_PER_TICK = 1500;
 const IDLE_MAINTENANCE_INTERVAL_MS = 30_000;
+const SOURCE_START_READINESS_MAX_EVENTS = 25_000;
+const RELEASE_LOCK_IF_OWNER_LUA = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+`;
+const RENEW_LOCK_IF_OWNER_LUA = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('pexpire', KEYS[1], ARGV[2])
+end
+return 0
+`;
 
 /**
  * Per-session in-process lock. Prevents concurrent ticks on the same session
@@ -48,6 +65,137 @@ const _sessionLocks = new Set<string>();
  */
 const _lastSnapshotAt = new Map<string, number>();
 const _lastIdleMaintenanceAt = new Map<string, number>();
+
+async function evaluateSourceStartReadiness(trackedWalletId: string): Promise<{
+  blocked: boolean;
+  reasons: string[];
+}> {
+  const rows = await db.walletActivityEvent.findMany({
+    where: { trackedWalletId },
+    orderBy: [{ eventTimestamp: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+    take: SOURCE_START_READINESS_MAX_EVENTS + 1,
+    select: {
+      id: true,
+      marketId: true,
+      conditionId: true,
+      marketQuestion: true,
+      outcome: true,
+      side: true,
+      effectiveSide: true,
+      eventType: true,
+      price: true,
+      shares: true,
+      notional: true,
+      fee: true,
+      eventTimestamp: true,
+      createdAt: true,
+    },
+  });
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return {
+      blocked: false,
+      reasons: [],
+    };
+  }
+
+  const hasTruncatedHistory = rows.length > SOURCE_START_READINESS_MAX_EVENTS;
+  const eventsForReduction = rows.slice(-SOURCE_START_READINESS_MAX_EVENTS).map((row: any) => ({
+    id: String(row.id),
+    marketId: String(row.marketId),
+    conditionId: row.conditionId ? String(row.conditionId) : null,
+    marketQuestion: row.marketQuestion ? String(row.marketQuestion) : null,
+    outcome: row.outcome ? String(row.outcome) : null,
+    side: row.side ?? null,
+    effectiveSide: row.effectiveSide ?? null,
+    eventType: String(row.eventType),
+    price: row.price !== null ? Number(row.price) : null,
+    shares: row.shares !== null ? Number(row.shares) : null,
+    notional: row.notional !== null ? Number(row.notional) : null,
+    fee: row.fee !== null ? Number(row.fee) : null,
+    eventTimestamp: new Date(row.eventTimestamp),
+    createdAt: new Date(row.createdAt ?? row.eventTimestamp),
+  }));
+
+  const reduced = reduceTrackedWalletEvents({
+    events: eventsForReduction,
+    inferMissingFields: false,
+    hasTruncatedHistory,
+  });
+
+  const reasons: string[] = [];
+  if (reduced.canonical.canonicalKnownNetPnl === null) reasons.push('canonical-net-unavailable');
+  if (reduced.confidenceModel.confidence === 'LOW') reasons.push('low-confidence');
+  if (reduced.confidenceModel.hasMissingFees) reasons.push('missing-fees');
+  if (reduced.confidenceModel.hasUnknownCostBasis) reasons.push('unknown-cost-basis');
+
+  return {
+    blocked: reasons.length > 0,
+    reasons,
+  };
+}
+
+function paperTickLockKey(sessionId: string): string {
+  return `${config.PAPER_TICK_DISTRIBUTED_LOCK_PREFIX}:${sessionId}`;
+}
+
+async function acquireDistributedSessionTickLock(sessionId: string): Promise<string | null> {
+  if (!config.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED) {
+    return null;
+  }
+
+  const token = randomUUID();
+  const ttlMs = Math.max(5_000, config.PAPER_TICK_DISTRIBUTED_LOCK_TTL_MS);
+  const key = paperTickLockKey(sessionId);
+  const acquired = await redis.set(key, token, 'PX', ttlMs, 'NX');
+  return acquired === 'OK' ? token : null;
+}
+
+async function releaseDistributedSessionTickLock(sessionId: string, token: string): Promise<void> {
+  if (!config.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED) {
+    return;
+  }
+
+  const key = paperTickLockKey(sessionId);
+  await redis.eval(RELEASE_LOCK_IF_OWNER_LUA, 1, key, token);
+}
+
+function startDistributedSessionTickLockHeartbeat(sessionId: string, token: string): () => void {
+  if (!config.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED) {
+    return () => undefined;
+  }
+
+  const ttlMs = Math.max(5_000, config.PAPER_TICK_DISTRIBUTED_LOCK_TTL_MS);
+  const key = paperTickLockKey(sessionId);
+  const intervalMs = Math.max(1_000, Math.floor(ttlMs / 3));
+  let renewing = false;
+
+  const timer = setInterval(() => {
+    if (renewing) return;
+    renewing = true;
+    void redis
+      .eval(RENEW_LOCK_IF_OWNER_LUA, 1, key, token, String(ttlMs))
+      .then((result) => {
+        if (Number(result) !== 1) {
+          logger.warn(
+            { sessionId },
+            'distributed paper tick lock heartbeat could not renew ownership',
+          );
+        }
+      })
+      .catch((error) => {
+        logger.warn({ sessionId, error }, 'distributed paper tick lock heartbeat failed');
+      })
+      .finally(() => {
+        renewing = false;
+      });
+  }, intervalMs);
+  timer.unref();
+
+  return () => {
+    clearInterval(timer);
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -105,10 +253,20 @@ export async function createPaperCopySession(input: {
   });
 }
 
-export async function startPaperCopySession(sessionId: string) {
+export async function startPaperCopySession(sessionId: string, options?: { forceStart?: boolean }) {
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error('Session not found');
   if (session.status === 'RUNNING') return;
+
+  const forceStart = options?.forceStart ?? false;
+  if (!forceStart) {
+    const readiness = await evaluateSourceStartReadiness(String(session.trackedWalletId));
+    if (readiness.blocked) {
+      throw new Error(
+        `Session start blocked by source confidence gate: ${readiness.reasons.join(', ')}`,
+      );
+    }
+  }
 
   const startedAt = new Date();
 
@@ -703,12 +861,36 @@ async function _runTick(sessionId: string): Promise<void> {
     logger.debug({ sessionId }, 'paper tick skipped — previous tick still running');
     return;
   }
+
   _sessionLocks.add(sessionId);
+
+  let distributedLockToken: string | null = null;
+  let stopDistributedHeartbeat: (() => void) | null = null;
   try {
+    if (config.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED) {
+      distributedLockToken = await acquireDistributedSessionTickLock(sessionId);
+      if (!distributedLockToken) {
+        logger.debug({ sessionId }, 'paper tick skipped — distributed session lock not acquired');
+        return;
+      }
+      stopDistributedHeartbeat = startDistributedSessionTickLockHeartbeat(
+        sessionId,
+        distributedLockToken,
+      );
+    }
+
     await _runTickUnsafe(sessionId);
   } catch (err) {
     logger.error({ sessionId, err }, 'paper session tick threw unexpectedly');
   } finally {
+    if (stopDistributedHeartbeat) {
+      stopDistributedHeartbeat();
+    }
+    if (distributedLockToken) {
+      await releaseDistributedSessionTickLock(sessionId, distributedLockToken).catch((error) => {
+        logger.warn({ sessionId, error }, 'failed to release distributed paper tick lock');
+      });
+    }
     _sessionLocks.delete(sessionId);
   }
 }

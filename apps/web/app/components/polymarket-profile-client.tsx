@@ -81,6 +81,7 @@ type PnlSummary = {
     tradeCount: number;
     winCount: number;
     lossCount: number;
+    winRatePct?: number;
     winRate: number;
 };
 
@@ -633,7 +634,7 @@ export function PolymarketProfileClient({ walletId }: { walletId: string }) {
                                     </div>
                                     <div className="pm-pnl-summary-tile">
                                         <span className="pm-pnl-summary-label">Win Rate</span>
-                                        <span className="pm-pnl-summary-val">{pnlSummary.winRate.toFixed(1)}%</span>
+                                        <span className="pm-pnl-summary-val">{(pnlSummary.winRatePct ?? pnlSummary.winRate * 100).toFixed(1)}%</span>
                                     </div>
                                     <div className="pm-pnl-summary-tile">
                                         <span className="pm-pnl-summary-label">Trades</span>

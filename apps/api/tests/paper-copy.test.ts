@@ -338,6 +338,10 @@ type SetupResult = {
   adapterMock: {
     getWalletPositions: ReturnType<typeof vi.fn>;
   };
+  redisMock: {
+    set: ReturnType<typeof vi.fn>;
+    eval: ReturnType<typeof vi.fn>;
+  };
   forceCloseMock: ReturnType<typeof vi.fn>;
   paperCopy: typeof import('../src/modules/paper-copy.js');
 };
@@ -355,6 +359,10 @@ async function setup(): Promise<SetupResult> {
     totalCashReturned: 0,
     closedMarkets: [],
   }));
+  const redisMock = {
+    set: vi.fn(async () => null),
+    eval: vi.fn(async () => 1),
+  };
 
   vi.doMock('../src/lib/prisma.js', () => ({
     prisma: createPrismaMock(state),
@@ -368,9 +376,12 @@ async function setup(): Promise<SetupResult> {
   vi.doMock('../src/modules/force-close.js', () => ({
     closeResolvedPositions: forceCloseMock,
   }));
+  vi.doMock('../src/lib/redis.js', () => ({
+    redis: redisMock,
+  }));
 
   const paperCopy = await import('../src/modules/paper-copy.js');
-  return { state, adapterMock, forceCloseMock, paperCopy };
+  return { state, adapterMock, redisMock, forceCloseMock, paperCopy };
 }
 
 function createActivityEvent(input: {
@@ -927,6 +938,109 @@ describe('paper copy engine (mocked)', () => {
     expect(state.metrics.length).toBe(beforeMetrics + 1);
   });
 
+  it('blocks session start when source confidence gate fails', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const baseTs = new Date('2026-03-16T00:00:00.000Z');
+    state.activityEvents.push(
+      {
+        id: 'src-buy-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.4,
+        shares: 10,
+        notional: 4,
+        fee: null,
+        eventTimestamp: new Date(baseTs),
+        createdAt: new Date(baseTs),
+      },
+      {
+        id: 'src-sell-1',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.6,
+        shares: 10,
+        notional: 6,
+        fee: null,
+        eventTimestamp: new Date(baseTs.getTime() + 60_000),
+        createdAt: new Date(baseTs.getTime() + 60_000),
+      },
+    );
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+
+    await expect(paperCopy.startPaperCopySession(session.id)).rejects.toThrow(
+      /source confidence gate/i,
+    );
+  });
+
+  it('allows forced session start override when confidence gate fails', async () => {
+    const { state, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+    const baseTs = new Date('2026-03-16T00:00:00.000Z');
+    state.activityEvents.push(
+      {
+        id: 'src-buy-2',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'BUY',
+        effectiveSide: 'BUY',
+        eventType: 'BUY',
+        price: 0.4,
+        shares: 10,
+        notional: 4,
+        fee: null,
+        eventTimestamp: new Date(baseTs),
+        createdAt: new Date(baseTs),
+      },
+      {
+        id: 'src-sell-2',
+        trackedWalletId: 'wallet-1',
+        marketId: 'm1',
+        conditionId: 'm1',
+        marketQuestion: 'Q',
+        outcome: 'YES',
+        side: 'SELL',
+        effectiveSide: 'SELL',
+        eventType: 'SELL',
+        price: 0.6,
+        shares: 10,
+        notional: 6,
+        fee: null,
+        eventTimestamp: new Date(baseTs.getTime() + 60_000),
+        createdAt: new Date(baseTs.getTime() + 60_000),
+      },
+    );
+
+    const session = await paperCopy.createPaperCopySession({ trackedWalletId: 'wallet-1' });
+
+    await expect(
+      paperCopy.startPaperCopySession(session.id, {
+        forceStart: true,
+      }),
+    ).resolves.toBeUndefined();
+
+    const updated = state.sessions.find((s) => s.id === session.id);
+    expect(updated?.status).toBe('RUNNING');
+  });
+
   it('snapshot equity uses cash + open mark-to-market value (no double-count)', async () => {
     const { state, paperCopy } = await setup();
 
@@ -1003,5 +1117,52 @@ describe('paper copy engine (mocked)', () => {
 
     expect(state.snapshots.length).toBeGreaterThan(beforeSnapshots);
     expect(forceCloseMock).toHaveBeenCalled();
+  });
+
+  it('skips tick when distributed lock cannot be acquired', async () => {
+    process.env.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED = 'true';
+    try {
+      const { state, redisMock, paperCopy } = await setup();
+      state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+
+      const session = await paperCopy.createPaperCopySession({
+        trackedWalletId: 'wallet-1',
+        startingCash: 1000,
+      });
+      await paperCopy.resumePaperCopySession(session.id);
+
+      const beforeDecisions = state.decisions.length;
+      const beforeTrades = state.trades.length;
+      await paperCopy.processPaperSessionTick(session.id);
+
+      expect(redisMock.set).toHaveBeenCalled();
+      expect(redisMock.eval).not.toHaveBeenCalled();
+      expect(state.decisions.length).toBe(beforeDecisions);
+      expect(state.trades.length).toBe(beforeTrades);
+    } finally {
+      delete process.env.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED;
+    }
+  });
+
+  it('releases distributed lock after tick run', async () => {
+    process.env.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED = 'true';
+    try {
+      const { state, redisMock, paperCopy } = await setup();
+      redisMock.set.mockResolvedValue('OK');
+
+      state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+      const session = await paperCopy.createPaperCopySession({
+        trackedWalletId: 'wallet-1',
+        startingCash: 1000,
+      });
+      await paperCopy.resumePaperCopySession(session.id);
+
+      await paperCopy.processPaperSessionTick(session.id);
+
+      expect(redisMock.set).toHaveBeenCalled();
+      expect(redisMock.eval).toHaveBeenCalled();
+    } finally {
+      delete process.env.PAPER_TICK_DISTRIBUTED_LOCK_ENABLED;
+    }
   });
 });

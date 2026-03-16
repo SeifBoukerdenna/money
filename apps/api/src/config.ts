@@ -52,6 +52,12 @@ const envSchema = z.object({
   MARKET_INTELLIGENCE_INTERVAL_MS: z.coerce.number().default(120000),
   PAPER_TICK_INTERVAL_MS: z.coerce.number().default(3000),
   TURBO_PAPER_TICK_INTERVAL_MS: z.coerce.number().default(1500),
+  PAPER_TICK_DISTRIBUTED_LOCK_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  PAPER_TICK_DISTRIBUTED_LOCK_TTL_MS: z.coerce.number().default(120000),
+  PAPER_TICK_DISTRIBUTED_LOCK_PREFIX: z.string().default('copytrader:paper:tick:lock'),
   RECONCILIATION_INTERVAL_MS: z.coerce.number().default(600000),
   OPS_MEMORY_SAMPLE_INTERVAL_MS: z.coerce.number().default(30000),
   PORTFOLIO_SNAPSHOT_RETENTION_ROWS: z.coerce.number().default(2000),
