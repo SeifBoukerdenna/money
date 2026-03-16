@@ -33,6 +33,11 @@ export interface SlippageConfig {
     useLatencyBuckets?: boolean;
     useSizeBuckets?: boolean;
   };
+  latencyDrift?: {
+    enabled: boolean;
+    bpsPerSecond: number;
+    maxBps?: number;
+  };
   maxAdverseMovePercent?: number;
   seed?: number | string;
 }
@@ -49,6 +54,10 @@ export interface SlippageResult {
   originalPrice: number;
   slippagePercent: number;
   slippageBps: number;
+  driftPercent: number;
+  driftBps: number;
+  totalAdversePercent: number;
+  totalAdverseBps: number;
   slippageModeUsed: SlippageMode;
   isSkipped: boolean;
   latencyApplied?: number;
@@ -69,6 +78,10 @@ export function calculateSlippage(
     originalPrice: sourcePrice,
     slippagePercent: 0,
     slippageBps: 0,
+    driftPercent: 0,
+    driftBps: 0,
+    totalAdversePercent: 0,
+    totalAdverseBps: 0,
     slippageModeUsed: 'NONE',
     isSkipped: false,
     sizeApplied: notional,
@@ -78,11 +91,12 @@ export function calculateSlippage(
     noSlippageResult.latencyApplied = latencyMs;
   }
 
-  if (!config || !config.enabled || config.mode === 'NONE') {
+  if (!config || !config.enabled) {
     return noSlippageResult;
   }
 
   let adverseSlippagePercent = 0;
+  let adverseDriftPercent = 0;
   let isSkipped = false;
   let skipReason: string | undefined = undefined;
 
@@ -122,23 +136,36 @@ export function calculateSlippage(
     if (config.combined?.useSizeBuckets) {
       combinedPct += getSizeSlippage(notional, config.sizeBuckets);
     }
-    
+
     adverseSlippagePercent = combinedPct;
   }
 
+  if (config.latencyDrift?.enabled) {
+    const latencySeconds = Math.max(0, (latencyMs ?? 0) / 1000);
+    const bpsPerSecond = Math.max(0, Number(config.latencyDrift.bpsPerSecond ?? 0));
+    const maxBps = Math.max(0, Number(config.latencyDrift.maxBps ?? Number.POSITIVE_INFINITY));
+    const driftBps = Math.min(maxBps, latencySeconds * bpsPerSecond);
+    adverseDriftPercent = driftBps / 10000;
+  }
+
+  const totalAdversePercent = adverseSlippagePercent + adverseDriftPercent;
+
   // Enforce Max Adverse Move skipping
-  if (config.maxAdverseMovePercent !== undefined && adverseSlippagePercent > config.maxAdverseMovePercent) {
+  if (
+    config.maxAdverseMovePercent !== undefined &&
+    totalAdversePercent > config.maxAdverseMovePercent
+  ) {
     isSkipped = true;
-    skipReason = `Trade skipped: adverse slippage ${(adverseSlippagePercent * 100).toFixed(3)}% exceeds max allowed ${(config.maxAdverseMovePercent * 100).toFixed(3)}%`;
+    skipReason = `Trade skipped: adverse move ${(totalAdversePercent * 100).toFixed(3)}% exceeds max allowed ${(config.maxAdverseMovePercent * 100).toFixed(3)}%`;
   }
 
   // Calculate actual fill price
   let fillPrice = sourcePrice;
   if (!isSkipped) {
     if (side === 'BUY') {
-      fillPrice = sourcePrice * (1 + adverseSlippagePercent);
+      fillPrice = sourcePrice * (1 + totalAdversePercent);
     } else {
-      fillPrice = sourcePrice * (1 - adverseSlippagePercent);
+      fillPrice = sourcePrice * (1 - totalAdversePercent);
     }
     // Prevent price out of bounds for Polymarket (0.0001 to 0.9999 usually, but we clamp aggressively to 0)
     fillPrice = Math.max(0.0001, fillPrice);
@@ -149,6 +176,10 @@ export function calculateSlippage(
     originalPrice: sourcePrice,
     slippagePercent: adverseSlippagePercent,
     slippageBps: adverseSlippagePercent * 10000,
+    driftPercent: adverseDriftPercent,
+    driftBps: adverseDriftPercent * 10000,
+    totalAdversePercent,
+    totalAdverseBps: totalAdversePercent * 10000,
     slippageModeUsed: mode,
     isSkipped,
     sizeApplied: notional,
@@ -164,9 +195,12 @@ export function calculateSlippage(
   return result as SlippageResult;
 }
 
-function getLatencySlippage(latencyMs: number | undefined, buckets: LatencyBucket[] | undefined): { val: number, skipped: boolean } {
+function getLatencySlippage(
+  latencyMs: number | undefined,
+  buckets: LatencyBucket[] | undefined,
+): { val: number; skipped: boolean } {
   if (!latencyMs || !buckets || buckets.length === 0) return { val: 0, skipped: false };
-  
+
   // Sort buckets ascending by maxMs just in case
   const sorted = [...buckets].sort((a, b) => {
     if (a.maxMs === null) return 1;
@@ -197,6 +231,6 @@ function getSizeSlippage(notional: number, buckets: SizeBucket[] | undefined): n
       return b.slippagePercent;
     }
   }
-  
+
   return 0;
 }

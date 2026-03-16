@@ -168,7 +168,18 @@ export async function updatePaperCopySessionGuardrails(
 }
 
 export async function getPaperCopySessionAnalytics(sessionId: string) {
-  const [session, decisions, trades, positions, latestSnapshot] = await Promise.all([
+  const [
+    session,
+    decisions,
+    trades,
+    positions,
+    latestSnapshot,
+    totalTradeCount,
+    totalDecisionCount,
+    buyTradeCount,
+    sellTradeCount,
+    redeemDecisionCount,
+  ] = await Promise.all([
     db.paperCopySession.findUnique({ where: { id: sessionId } }),
     db.paperCopyDecision.findMany({
       where: { sessionId },
@@ -185,6 +196,17 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
       where: { sessionId },
       orderBy: { timestamp: 'desc' },
       select: { netLiquidationValue: true },
+    }),
+    db.paperCopyTrade.count({ where: { sessionId } }),
+    db.paperCopyDecision.count({ where: { sessionId } }),
+    db.paperCopyTrade.count({ where: { sessionId, side: 'BUY' } }),
+    db.paperCopyTrade.count({ where: { sessionId, side: 'SELL' } }),
+    db.paperCopyDecision.count({
+      where: {
+        sessionId,
+        status: 'EXECUTED',
+        notes: 'REDEEM',
+      },
     }),
   ]);
 
@@ -245,6 +267,55 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
   const nlv = latestSnapshot
     ? Number(latestSnapshot.netLiquidationValue)
     : Number(session.currentCash);
+  const startedAtMs = session.startedAt ? new Date(session.startedAt).getTime() : null;
+  const endedAtMs = session.endedAt ? new Date(session.endedAt).getTime() : null;
+  const runtimeSeconds =
+    startedAtMs === null
+      ? 0
+      : Math.max(0, Math.floor(((endedAtMs ?? Date.now()) - startedAtMs) / 1000));
+
+  const executedWithSlippage = decisions.filter((d: any) => {
+    if (String(d.status) !== 'EXECUTED') return false;
+    const sr = (d?.sizingInputsJson as Record<string, any> | null)?.slippageResult;
+    return sr && typeof sr === 'object';
+  });
+
+  const frictionTotals = executedWithSlippage.reduce(
+    (
+      acc: {
+        count: number;
+        latencyMs: number;
+        slippageBps: number;
+        driftBps: number;
+        totalAdverseBps: number;
+      },
+      d: any,
+    ) => {
+      const sr = (d?.sizingInputsJson as Record<string, any>).slippageResult as Record<string, any>;
+      acc.count += 1;
+      acc.latencyMs += Number(sr.latencyApplied ?? 0);
+      acc.slippageBps += Number(sr.slippageBps ?? 0);
+      acc.driftBps += Number(sr.driftBps ?? 0);
+      acc.totalAdverseBps += Number(sr.totalAdverseBps ?? sr.slippageBps ?? 0);
+      return acc;
+    },
+    { count: 0, latencyMs: 0, slippageBps: 0, driftBps: 0, totalAdverseBps: 0 },
+  );
+
+  const frictionAverages =
+    frictionTotals.count > 0
+      ? {
+          avgLatencyMs: frictionTotals.latencyMs / frictionTotals.count,
+          avgSlippageBps: frictionTotals.slippageBps / frictionTotals.count,
+          avgDriftBps: frictionTotals.driftBps / frictionTotals.count,
+          avgTotalAdverseBps: frictionTotals.totalAdverseBps / frictionTotals.count,
+        }
+      : {
+          avgLatencyMs: 0,
+          avgSlippageBps: 0,
+          avgDriftBps: 0,
+          avgTotalAdverseBps: 0,
+        };
 
   return {
     sessionId,
@@ -252,10 +323,21 @@ export async function getPaperCopySessionAnalytics(sessionId: string) {
       startingCash: Number(session.startingCash),
       currentNlv: nlv,
       totalPnl: nlv - Number(session.startingCash),
-      trades: trades.length,
-      decisions: decisions.length,
+      trades: totalTradeCount,
+      decisions: totalDecisionCount,
       openPositions: positions.filter((row: any) => row.status === 'OPEN').length,
       closedPositions: positions.filter((row: any) => row.status === 'CLOSED').length,
+      runtimeSeconds,
+      tradeHistory: {
+        buys: buyTradeCount,
+        sells: sellTradeCount,
+        redeems: redeemDecisionCount,
+        totalTrades: totalTradeCount,
+      },
+      executionFriction: {
+        samples: frictionTotals.count,
+        ...frictionAverages,
+      },
     },
     decisionBreakdown,
     executionStatusBreakdown: statusBreakdown,

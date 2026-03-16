@@ -1379,6 +1379,7 @@ export async function registerRoutes(app: any): Promise<void> {
         autoPauseOnHealthDegradation: z.boolean().optional(),
         feeBps: z.number().nonnegative().max(500).optional(),
         slippageBps: z.number().nonnegative().max(500).optional(),
+        slippageConfig: z.any().nullable().optional(),
       })
       .parse(req.body ?? {});
 
@@ -1406,6 +1407,7 @@ export async function registerRoutes(app: any): Promise<void> {
         : {}),
       ...(body.feeBps !== undefined ? { feeBps: body.feeBps } : {}),
       ...(body.slippageBps !== undefined ? { slippageBps: body.slippageBps } : {}),
+      ...(body.slippageConfig !== undefined ? { slippageConfig: body.slippageConfig } : {}),
     });
   });
 
@@ -1978,6 +1980,14 @@ export async function registerRoutes(app: any): Promise<void> {
         const outcome = event.outcome ? String(event.outcome).toUpperCase() : null;
         const key = outcome ? `${marketId}:${outcome}` : null;
         const decision = decisionBySourceId.get(String(event.id));
+        const sizingInputs =
+          decision?.sizingInputsJson && typeof decision.sizingInputsJson === 'object'
+            ? (decision.sizingInputsJson as Record<string, unknown>)
+            : null;
+        const slippageResult =
+          sizingInputs?.slippageResult && typeof sizingInputs.slippageResult === 'object'
+            ? (sizingInputs.slippageResult as Record<string, unknown>)
+            : null;
         const decisionStatus = decision?.status ? String(decision.status) : null;
         const decisionType = decision?.decisionType ? String(decision.decisionType) : null;
         const decisionTrades =
@@ -2032,6 +2042,13 @@ export async function registerRoutes(app: any): Promise<void> {
               : latestTrade?.simulatedShares != null
                 ? Number(latestTrade.simulatedShares)
                 : null,
+          ourLatencyMs:
+            slippageResult?.latencyApplied != null ? Number(slippageResult.latencyApplied) : null,
+          ourSlippageBps:
+            slippageResult?.slippageBps != null ? Number(slippageResult.slippageBps) : null,
+          ourDriftBps: slippageResult?.driftBps != null ? Number(slippageResult.driftBps) : null,
+          ourTotalAdverseBps:
+            slippageResult?.totalAdverseBps != null ? Number(slippageResult.totalAdverseBps) : null,
           skipReason:
             ourAction === 'SKIPPED'
               ? decision?.humanReason
@@ -2313,7 +2330,7 @@ export async function registerRoutes(app: any): Promise<void> {
     });
     if (!row) throw app.httpErrors.notFound('Session not found');
 
-    const [latestSnapshot, openCount, closedRows] = await Promise.all([
+    const [latestSnapshot, openCount, closedRows, positionPnlRows] = await Promise.all([
       db.paperPortfolioSnapshot.findFirst({
         where: { sessionId: row.id },
         orderBy: { timestamp: 'desc' },
@@ -2323,6 +2340,10 @@ export async function registerRoutes(app: any): Promise<void> {
         where: { sessionId: row.id, status: 'CLOSED' },
         select: { realizedPnl: true },
       }),
+      db.paperCopyPosition.findMany({
+        where: { sessionId: row.id },
+        select: { realizedPnl: true, unrealizedPnl: true },
+      }),
     ]);
 
     const nlv = latestSnapshot
@@ -2330,6 +2351,19 @@ export async function registerRoutes(app: any): Promise<void> {
       : Number(row.currentCash);
     const totalPnl = latestSnapshot ? Number(latestSnapshot.totalPnl) : 0;
     const returnPct = latestSnapshot ? Number(latestSnapshot.returnPct) : 0;
+    const fees = latestSnapshot ? Number(latestSnapshot.fees) : 0;
+    const realizedPnl = latestSnapshot
+      ? Number(latestSnapshot.realizedPnl)
+      : (positionPnlRows as Array<Record<string, unknown>>).reduce(
+          (sum, p) => sum + Number(p.realizedPnl ?? 0),
+          0,
+        );
+    const unrealizedPnl = latestSnapshot
+      ? Number(latestSnapshot.unrealizedPnl)
+      : (positionPnlRows as Array<Record<string, unknown>>).reduce(
+          (sum, p) => sum + Number(p.unrealizedPnl ?? 0),
+          0,
+        );
     const winCount = (closedRows as Array<Record<string, unknown>>).filter(
       (p) => Number(p.realizedPnl ?? 0) > 0,
     ).length;
@@ -2360,8 +2394,13 @@ export async function registerRoutes(app: any): Promise<void> {
         ? Number(row.estimatedSourceExposure)
         : null,
       copyRatio: row.copyRatio ? Number(row.copyRatio) : null,
+      slippageBps: Number(row.slippageBps ?? 0),
+      slippageConfig: row.slippageConfig ?? null,
       netLiquidationValue: nlv,
       totalPnl,
+      realizedPnl,
+      unrealizedPnl,
+      fees,
       returnPct,
       winCount,
       lossCount,

@@ -5,7 +5,7 @@ describe('Slippage Engine unit tests', () => {
   it('handles NONE mode correctly', () => {
     const res = calculateSlippage(
       { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
-      { enabled: true, mode: 'NONE' }
+      { enabled: true, mode: 'NONE' },
     );
     expect(res.fillPrice).toBe(0.5);
     expect(res.slippageModeUsed).toBe('NONE');
@@ -16,7 +16,7 @@ describe('Slippage Engine unit tests', () => {
     it('applies fixed percent slippage to BUY (worse fill = higher price)', () => {
       const res = calculateSlippage(
         { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
-        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.01 }
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.01 },
       );
       expect(res.fillPrice).toBe(0.505);
       expect(res.isSkipped).toBe(false);
@@ -25,7 +25,7 @@ describe('Slippage Engine unit tests', () => {
     it('applies fixed percent slippage to SELL (worse fill = lower price)', () => {
       const res = calculateSlippage(
         { side: 'SELL', sourcePrice: 0.5, simulatedShares: 100 },
-        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.01 }
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.01 },
       );
       expect(res.fillPrice).toBe(0.495);
       expect(res.isSkipped).toBe(false);
@@ -36,7 +36,7 @@ describe('Slippage Engine unit tests', () => {
     it('applies fixed bps slippage to BUY', () => {
       const res = calculateSlippage(
         { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
-        { enabled: true, mode: 'FIXED_BPS', fixedBps: 100 } // 100 bps = 1%
+        { enabled: true, mode: 'FIXED_BPS', fixedBps: 100 }, // 100 bps = 1%
       );
       expect(res.fillPrice).toBe(0.505);
       expect(res.isSkipped).toBe(false);
@@ -51,13 +51,19 @@ describe('Slippage Engine unit tests', () => {
         randomRange: { min: 0.005, max: 0.015 },
         seed: 42,
       };
-      
-      const res1 = calculateSlippage({ side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 }, config);
-      const res2 = calculateSlippage({ side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 }, config);
-      
+
+      const res1 = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
+        config,
+      );
+      const res2 = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
+        config,
+      );
+
       expect(res1.fillPrice).toBe(res2.fillPrice);
       expect(res1.fillPrice).toBeGreaterThanOrEqual(0.5025); // 0.5 * 1.005
-      expect(res1.fillPrice).toBeLessThanOrEqual(0.5075);    // 0.5 * 1.015
+      expect(res1.fillPrice).toBeLessThanOrEqual(0.5075); // 0.5 * 1.015
     });
   });
 
@@ -74,18 +80,27 @@ describe('Slippage Engine unit tests', () => {
     };
 
     it('uses first bucket (1s)', () => {
-      const res = calculateSlippage({ side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 500 }, config);
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 500 },
+        config,
+      );
       expect(res.fillPrice).toBe(0.501); // 0.2%
       expect(res.isSkipped).toBe(false);
     });
 
     it('uses second bucket (3s)', () => {
-      const res = calculateSlippage({ side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 2000 }, config);
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 2000 },
+        config,
+      );
       expect(res.fillPrice).toBe(0.5025); // 0.5%
     });
 
     it('skips trade if bucket has skipTrade', () => {
-      const res = calculateSlippage({ side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 6000 }, config);
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 6000 },
+        config,
+      );
       expect(res.isSkipped).toBe(true);
       expect(res.skipReason).toContain('latency bucket skip policy');
     });
@@ -104,13 +119,19 @@ describe('Slippage Engine unit tests', () => {
 
     it('uses <50 bucket', () => {
       // Notional = 100 * 0.4 = 40
-      const res = calculateSlippage({ side: 'SELL', sourcePrice: 0.4, simulatedShares: 100 }, config);
+      const res = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.4, simulatedShares: 100 },
+        config,
+      );
       expect(res.fillPrice).toBe(0.3992); // 0.4 * (1 - 0.002)
     });
 
     it('uses >200 bucket', () => {
       // Notional = 1000 * 0.5 = 500
-      const res = calculateSlippage({ side: 'SELL', sourcePrice: 0.5, simulatedShares: 1000 }, config);
+      const res = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.5, simulatedShares: 1000 },
+        config,
+      );
       expect(res.fillPrice).toBe(0.494); // 0.5 * (1 - 0.012)
     });
   });
@@ -120,8 +141,14 @@ describe('Slippage Engine unit tests', () => {
       const config: SlippageConfig = {
         enabled: true,
         mode: 'COMBINED',
-        latencyBuckets: [{ maxMs: 1000, slippagePercent: 0.002 }, { maxMs: null, slippagePercent: 0.01 }],
-        sizeBuckets: [{ maxNotional: 100, slippagePercent: 0.003 }, { maxNotional: null, slippagePercent: 0.005 }],
+        latencyBuckets: [
+          { maxMs: 1000, slippagePercent: 0.002 },
+          { maxMs: null, slippagePercent: 0.01 },
+        ],
+        sizeBuckets: [
+          { maxNotional: 100, slippagePercent: 0.003 },
+          { maxNotional: null, slippagePercent: 0.005 },
+        ],
         combined: { basePercent: 0.001, useLatencyBuckets: true, useSizeBuckets: true },
       };
 
@@ -129,7 +156,10 @@ describe('Slippage Engine unit tests', () => {
       // Size = 200 * 0.5 = 100 -> 0.003
       // Base = 0.001
       // Total = 0.006
-      const res = calculateSlippage({ side: 'BUY', sourcePrice: 0.5, simulatedShares: 200, latencyMs: 500 }, config);
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 200, latencyMs: 500 },
+        config,
+      );
       expect(res.slippagePercent).toBeCloseTo(0.006, 5);
       expect(res.fillPrice).toBe(0.503);
     });
@@ -139,7 +169,7 @@ describe('Slippage Engine unit tests', () => {
     it('skips trade if slippage exceeds maxAdverseMovePercent', () => {
       const res = calculateSlippage(
         { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
-        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.03, maxAdverseMovePercent: 0.02 }
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.03, maxAdverseMovePercent: 0.02 },
       );
       expect(res.isSkipped).toBe(true);
       expect(res.skipReason).toContain('exceeds max allowed');
@@ -148,7 +178,7 @@ describe('Slippage Engine unit tests', () => {
     it('allows trade if slippage is exactly maxAdverseMovePercent', () => {
       const res = calculateSlippage(
         { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100 },
-        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.02, maxAdverseMovePercent: 0.02 }
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 0.02, maxAdverseMovePercent: 0.02 },
       );
       expect(res.isSkipped).toBe(false);
     });
@@ -158,9 +188,57 @@ describe('Slippage Engine unit tests', () => {
     it('clamps BUY so price does not exceed bounds (polymarket prices are usually 0.0001-0.9999, but we just want to ensure it doesnt go negative or weird long tails)', () => {
       const res = calculateSlippage(
         { side: 'SELL', sourcePrice: 0.01, simulatedShares: 100 },
-        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 2.0 } // -200% drop
+        { enabled: true, mode: 'FIXED_PERCENT', fixedPercent: 2.0 }, // -200% drop
       );
       expect(res.fillPrice).toBe(0.0001); // bounded above 0
+    });
+  });
+
+  describe('LATENCY_DRIFT', () => {
+    it('applies adverse drift for BUY as latency increases', () => {
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 2000 },
+        {
+          enabled: true,
+          mode: 'NONE',
+          latencyDrift: { enabled: true, bpsPerSecond: 5, maxBps: 50 },
+        },
+      );
+
+      // 2s * 5 bps/s = 10 bps => 0.1% adverse on BUY
+      expect(res.driftBps).toBeCloseTo(10, 6);
+      expect(res.totalAdverseBps).toBeCloseTo(10, 6);
+      expect(res.fillPrice).toBeCloseTo(0.5005, 8);
+    });
+
+    it('applies adverse drift for SELL as latency increases', () => {
+      const res = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 3000 },
+        {
+          enabled: true,
+          mode: 'NONE',
+          latencyDrift: { enabled: true, bpsPerSecond: 4, maxBps: 30 },
+        },
+      );
+
+      // 3s * 4 bps/s = 12 bps => 0.12% adverse on SELL
+      expect(res.driftBps).toBeCloseTo(12, 6);
+      expect(res.fillPrice).toBeCloseTo(0.4994, 8);
+    });
+
+    it('caps drift at configured maxBps', () => {
+      const res = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 100, latencyMs: 20000 },
+        {
+          enabled: true,
+          mode: 'NONE',
+          latencyDrift: { enabled: true, bpsPerSecond: 10, maxBps: 25 },
+        },
+      );
+
+      expect(res.driftBps).toBeCloseTo(25, 6);
+      expect(res.totalAdverseBps).toBeCloseTo(25, 6);
+      expect(res.fillPrice).toBeCloseTo(0.50125, 8);
     });
   });
 });

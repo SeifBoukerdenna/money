@@ -463,7 +463,17 @@ export function evaluatePaperEventDecision(input: {
   const minNotional = Number(session.minNotionalThreshold);
   const maxTotalExposure = Number(session.maxTotalExposure);
 
-  const slippageConfig = (session.slippageConfig ?? null) as SlippageConfig | null;
+  const explicitSlippageConfig = (session.slippageConfig ?? null) as SlippageConfig | null;
+  const legacySlippageBps = Number(session.slippageBps ?? 0);
+  const slippageConfig: SlippageConfig | null = explicitSlippageConfig
+    ? explicitSlippageConfig
+    : legacySlippageBps > 0
+      ? {
+          enabled: true,
+          mode: 'FIXED_BPS',
+          fixedBps: legacySlippageBps,
+        }
+      : null;
 
   let simulatedShares = sourceShares * copyRatio;
   let latencyMs: number | undefined = undefined;

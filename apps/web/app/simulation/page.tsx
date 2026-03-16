@@ -33,11 +33,48 @@ type SessionDetail = {
     currentCash: number;
     startedAt: string | null;
     totalPnl: number;
+    netLiquidationValue: number;
+    realizedPnl: number;
+    unrealizedPnl: number;
     fees: number;
     returnPct: number;
+    slippageBps?: number;
+    slippageConfig?: {
+        enabled?: boolean;
+        mode?: string;
+        fixedBps?: number;
+        fixedPercent?: number;
+        randomRange?: { min: number; max: number };
+        latencyDrift?: {
+            enabled?: boolean;
+            bpsPerSecond?: number;
+            maxBps?: number;
+        };
+        maxAdverseMovePercent?: number;
+    } | null;
     winCount: number;
     lossCount: number;
     winRatePct: number;
+    stats?: { openPositionsCount?: number };
+};
+
+type SessionAnalytics = {
+    summary: {
+        runtimeSeconds: number;
+        tradeHistory: {
+            buys: number;
+            sells: number;
+            redeems: number;
+            totalTrades: number;
+        };
+        executionFriction: {
+            samples: number;
+            avgLatencyMs: number;
+            avgSlippageBps: number;
+            avgDriftBps: number;
+            avgTotalAdverseBps: number;
+        };
+    };
 };
 
 type SourceSummary = {
@@ -61,6 +98,10 @@ type LiveFeedItem = {
     ourAction: 'COPIED' | 'SKIPPED' | 'AUTO_CLOSED' | 'OPEN' | null;
     ourPnl: number | null;
     ourAmountUsd?: number | null;
+    ourLatencyMs?: number | null;
+    ourSlippageBps?: number | null;
+    ourDriftBps?: number | null;
+    ourTotalAdverseBps?: number | null;
     skipReason: string | null;
 };
 
@@ -94,17 +135,59 @@ type TabKey = 'live' | 'positions' | 'history' | 'market-history';
 type PositionSortKey = 'market' | 'outcome' | 'shares' | 'entry' | 'mark' | 'value' | 'pnl' | 'since';
 type SortDir = 'asc' | 'desc';
 
-const fmtUsd = (n?: number | null, dp = 2) =>
-    `$${(n ?? 0).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
-
-// FIX: Epsilon-based normalization so +$0.00 / -$0.00 never appear
 const normMoney = (v?: number | null) => (Math.abs(v ?? 0) < 1e-9 ? 0 : (v ?? 0));
+const fmtUsd = (n?: number | null, dp = 2) =>
+    `$${normMoney(n).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
+
 const fmtPnl = (n?: number | null) => {
     const v = normMoney(n);
     if (v > 0) return `+${fmtUsd(v)}`;
     if (v < 0) return `-${fmtUsd(Math.abs(v))}`;
     return `${fmtUsd(0)}`;
 };
+
+function formatDuration(seconds: number): string {
+    const safe = Math.max(0, Math.floor(seconds));
+    const days = Math.floor(safe / 86_400);
+    const hours = Math.floor((safe % 86_400) / 3_600);
+    const mins = Math.floor((safe % 3_600) / 60);
+    const secs = safe % 60;
+    if (days > 0) return `${days}d ${hours}h ${mins}m`;
+    if (hours > 0) return `${hours}h ${mins}m ${secs}s`;
+    if (mins > 0) return `${mins}m ${secs}s`;
+    return `${secs}s`;
+}
+
+function slippageLabel(detail: SessionDetail): string {
+    const cfg = detail.slippageConfig;
+    const driftLabel =
+        cfg?.latencyDrift?.enabled && typeof cfg.latencyDrift.bpsPerSecond === 'number'
+            ? ` + DRIFT(${cfg.latencyDrift.bpsPerSecond}bps/s${typeof cfg.latencyDrift.maxBps === 'number' ? ` cap ${cfg.latencyDrift.maxBps}bps` : ''})`
+            : '';
+    if (cfg && cfg.enabled && cfg.mode) {
+        if (cfg.mode === 'FIXED_BPS' && typeof cfg.fixedBps === 'number') {
+            return `FIXED_BPS (${cfg.fixedBps} bps)${driftLabel}`;
+        }
+        if (cfg.mode === 'FIXED_PERCENT' && typeof cfg.fixedPercent === 'number') {
+            return `FIXED_PERCENT (${(cfg.fixedPercent * 100).toFixed(3)}%)${driftLabel}`;
+        }
+        if (
+            cfg.mode === 'RANDOM_RANGE' &&
+            cfg.randomRange &&
+            typeof cfg.randomRange.min === 'number' &&
+            typeof cfg.randomRange.max === 'number'
+        ) {
+            return `RANDOM_RANGE (${(cfg.randomRange.min * 100).toFixed(3)}% - ${(cfg.randomRange.max * 100).toFixed(3)}%)${driftLabel}`;
+        }
+        return `${cfg.mode}${driftLabel}`;
+    }
+
+    const legacyBps = Number(detail.slippageBps ?? 0);
+    if (legacyBps > 0) {
+        return `FIXED_BPS (${legacyBps} bps)`;
+    }
+    return 'NONE';
+}
 
 const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 const shortDateTime = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : '-');
@@ -146,12 +229,16 @@ export default function SimulationPage() {
     const [slippageValue1, setSlippageValue1] = useState('20');
     const [slippageValue2, setSlippageValue2] = useState('');
     const [maxAdverse, setMaxAdverse] = useState('');
+    const [driftEnabled, setDriftEnabled] = useState(true);
+    const [driftBpsPerSecond, setDriftBpsPerSecond] = useState('4');
+    const [driftMaxBps, setDriftMaxBps] = useState('40');
 
     const [sourceSummary, setSourceSummary] = useState<SourceSummary | null>(null);
     const [sourcePnl, setSourcePnl] = useState<SourcePnlSummary | null>(null);
 
     const [activeSessionId, setActiveSessionId] = useState('');
     const [detail, setDetail] = useState<SessionDetail | null>(null);
+    const [analytics, setAnalytics] = useState<SessionAnalytics | null>(null);
     const [activeTab, setActiveTab] = useState<TabKey>('live');
     const [feedLimit, setFeedLimit] = useState(50);
 
@@ -206,6 +293,14 @@ export default function SimulationPage() {
         const r = await fetch(`${API}/paper-copy-sessions/${sid}`).catch(() => null);
         if (!r?.ok) return;
         setDetail((await r.json()) as SessionDetail);
+        setLastUpdatedAt(Date.now());
+    }, []);
+
+    const loadAnalytics = useCallback(async (sid: string) => {
+        if (!sid) return;
+        const r = await fetch(`${API}/paper-copy-sessions/${sid}/analytics`).catch(() => null);
+        if (!r?.ok) return;
+        setAnalytics((await r.json()) as SessionAnalytics);
         setLastUpdatedAt(Date.now());
     }, []);
 
@@ -272,6 +367,7 @@ export default function SimulationPage() {
     useEffect(() => {
         if (!activeSessionId) return;
         loadDetail(activeSessionId);
+        loadAnalytics(activeSessionId);
         loadClosedPositions(activeSessionId);
         if (activeTab === 'live') loadLiveFeed(activeSessionId, feedLimit);
         if (activeTab === 'positions') {
@@ -283,6 +379,7 @@ export default function SimulationPage() {
         activeTab,
         feedLimit,
         loadDetail,
+        loadAnalytics,
         loadLiveFeed,
         loadOpenPositions,
         loadTrades,
@@ -291,9 +388,12 @@ export default function SimulationPage() {
 
     useEffect(() => {
         if (!activeSessionId) return;
-        const timer = setInterval(() => loadDetail(activeSessionId), 60_000);
+        const timer = setInterval(() => {
+            loadDetail(activeSessionId);
+            loadAnalytics(activeSessionId);
+        }, 60_000);
         return () => clearInterval(timer);
-    }, [activeSessionId, loadDetail]);
+    }, [activeSessionId, loadDetail, loadAnalytics]);
 
     useEffect(() => {
         if (!activeSessionId) return;
@@ -337,15 +437,36 @@ export default function SimulationPage() {
 
         setCreating(true);
         try {
+            const driftBpsPerSecNum = Math.max(0, Number(driftBpsPerSecond) || 0);
+            const driftMaxBpsNum = Math.max(0, Number(driftMaxBps) || 0);
+            const hasBaseSlippage = slippageMode !== 'NONE';
+            const hasLatencyDrift = driftEnabled && driftBpsPerSecNum > 0;
+
             let slippageConfig = null;
-            if (slippageMode !== 'NONE') {
+            if (hasBaseSlippage || hasLatencyDrift) {
                 slippageConfig = {
                     enabled: true,
                     mode: slippageMode,
                     maxAdverseMovePercent: maxAdverse ? Number(maxAdverse) / 100 : undefined,
                     ...(slippageMode === 'FIXED_PERCENT' ? { fixedPercent: Number(slippageValue1) / 100 } : {}),
                     ...(slippageMode === 'FIXED_BPS' ? { fixedBps: Number(slippageValue1) } : {}),
-                    ...(slippageMode === 'RANDOM_RANGE' ? { randomRange: { min: Number(slippageValue1) / 100, max: Number(slippageValue2) / 100 } } : {})
+                    ...(slippageMode === 'RANDOM_RANGE'
+                        ? {
+                            randomRange: {
+                                min: Number(slippageValue1) / 100,
+                                max: Number(slippageValue2) / 100,
+                            },
+                        }
+                        : {}),
+                    ...(hasLatencyDrift
+                        ? {
+                            latencyDrift: {
+                                enabled: true,
+                                bpsPerSecond: driftBpsPerSecNum,
+                                maxBps: driftMaxBpsNum > 0 ? driftMaxBpsNum : undefined,
+                            },
+                        }
+                        : {}),
                 };
             }
 
@@ -381,7 +502,7 @@ export default function SimulationPage() {
         if (!activeSessionId) return;
         await fetch(`${API}/paper-copy-sessions/${activeSessionId}/${action}`, { method: 'POST' });
         await loadSessions();
-        await loadDetail(activeSessionId);
+        await Promise.all([loadDetail(activeSessionId), loadAnalytics(activeSessionId)]);
     };
 
     const deleteSession = async (id: string) => {
@@ -408,6 +529,7 @@ export default function SimulationPage() {
             loadClosedPositions(activeSessionId),
             loadTrades(activeSessionId),
             loadDetail(activeSessionId),
+            loadAnalytics(activeSessionId),
         ]);
     };
 
@@ -586,6 +708,29 @@ export default function SimulationPage() {
     const lastUpdatedSeconds = lastUpdatedAt
         ? Math.max(0, Math.floor((nowMs - lastUpdatedAt) / 1000))
         : null;
+    const runtimeSeconds = analytics?.summary?.runtimeSeconds ??
+        (detail?.startedAt ? Math.max(0, Math.floor((nowMs - new Date(detail.startedAt).getTime()) / 1000)) : 0);
+    const tradeHistory = analytics?.summary?.tradeHistory ?? {
+        buys: 0,
+        sells: 0,
+        redeems: 0,
+        totalTrades: 0,
+    };
+    const friction = analytics?.summary?.executionFriction ?? {
+        samples: 0,
+        avgLatencyMs: 0,
+        avgSlippageBps: 0,
+        avgDriftBps: 0,
+        avgTotalAdverseBps: 0,
+    };
+    const accountValue = detail?.netLiquidationValue ?? detail?.currentCash ?? 0;
+    const realizedValue = detail?.realizedPnl ?? realizedPnlSummary;
+    const unrealizedValue = detail?.unrealizedPnl ?? openLotsSummary.totalUnrealizedPnl;
+    const feesPaid = Math.abs(detail?.fees ?? 0);
+    const openCount = detail?.stats?.openPositionsCount ?? openLots.length;
+    const openValueCanonical = detail
+        ? Math.max(0, detail.netLiquidationValue - detail.currentCash)
+        : openLotsSummary.totalValue;
 
     return (
         <LayoutShell>
@@ -628,7 +773,7 @@ export default function SimulationPage() {
                                 <option value="RANDOM_RANGE">Random Range</option>
                             </select>
                         </div>
-                        
+
                         {slippageMode === 'FIXED_BPS' && (
                             <div className="w-32">
                                 <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Penalty (BPS)</label>
@@ -658,6 +803,41 @@ export default function SimulationPage() {
                             <label className="text-[10px] font-semibold uppercase tracking-wider text-amber-500/80">Max Adverse Skip (%)</label>
                             <input className="input mt-1 bg-slate-950/50 border-amber-500/20 focus:border-amber-500/50 placeholder-slate-600" value={maxAdverse} onChange={(e) => setMaxAdverse(e.target.value)} placeholder="Optional (e.g. 2.0)" />
                         </div>
+
+                        <div className="w-44">
+                            <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Latency Drift</label>
+                            <select
+                                className="input mt-1 bg-slate-950/50"
+                                value={driftEnabled ? 'ON' : 'OFF'}
+                                onChange={(e) => setDriftEnabled(e.target.value === 'ON')}
+                            >
+                                <option value="ON">Enabled</option>
+                                <option value="OFF">Disabled</option>
+                            </select>
+                        </div>
+
+                        {driftEnabled && (
+                            <>
+                                <div className="w-36">
+                                    <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Drift Bps/Sec</label>
+                                    <input
+                                        className="input mt-1 bg-slate-950/50"
+                                        value={driftBpsPerSecond}
+                                        onChange={(e) => setDriftBpsPerSecond(e.target.value)}
+                                        placeholder="e.g. 4"
+                                    />
+                                </div>
+                                <div className="w-36">
+                                    <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Max Drift Bps</label>
+                                    <input
+                                        className="input mt-1 bg-slate-950/50"
+                                        value={driftMaxBps}
+                                        onChange={(e) => setDriftMaxBps(e.target.value)}
+                                        placeholder="e.g. 40"
+                                    />
+                                </div>
+                            </>
+                        )}
 
                         <div className="flex-1"></div>
                         <button className="btn-primary h-10 px-8" disabled={creating} onClick={createAndStart}>
@@ -710,6 +890,8 @@ export default function SimulationPage() {
                             <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
                                 <div>
                                     <p className="text-lg font-semibold text-slate-100">{detail.trackedWalletLabel} | Started {shortDateTime(detail.startedAt)}</p>
+                                    <p className="text-xs text-slate-400">Running for {formatDuration(runtimeSeconds)}</p>
+                                    <p className="text-xs text-slate-400">Active Slippage: <span className="text-slate-200">{slippageLabel(detail)}</span></p>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${statusPill(detail.status)}`}>{detail.status}</span>
@@ -718,11 +900,11 @@ export default function SimulationPage() {
                                     {detail.status !== 'COMPLETED' && <button className="btn-muted text-xs text-rose-300" onClick={() => sessionAction('stop')}>Stop</button>}
                                 </div>
                             </div>
-                            
+
                             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8 mb-2">
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Account Value</p>
-                                    <p className="mt-1 text-sm font-semibold text-slate-200">{fmtUsd(detail.currentCash + openLotsSummary.totalValue, 2)}</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">{fmtUsd(accountValue, 2)}</p>
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Cash</p>
@@ -730,7 +912,7 @@ export default function SimulationPage() {
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Open</p>
-                                    <p className="mt-1 text-sm font-semibold text-slate-200">{openLots.length} lots</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-200">{openCount} positions</p>
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Net P&amp;L</p>
@@ -740,20 +922,34 @@ export default function SimulationPage() {
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Unrealized</p>
-                                    <p className={`mt-1 text-sm font-semibold ${pnlClass(openLotsSummary.totalUnrealizedPnl)}`}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</p>
+                                    <p className={`mt-1 text-sm font-semibold ${pnlClass(unrealizedValue)}`}>{fmtPnl(unrealizedValue)}</p>
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Realized</p>
-                                    <p className={`mt-1 text-sm font-semibold ${pnlClass(realizedPnlSummary)}`}>{fmtPnl(realizedPnlSummary)}</p>
+                                    <p className={`mt-1 text-sm font-semibold ${pnlClass(realizedValue)}`}>{fmtPnl(realizedValue)}</p>
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Fees</p>
-                                    <p className="mt-1 text-sm font-semibold text-slate-400">-{fmtUsd(detail.fees)}</p>
+                                    <p className="mt-1 text-sm font-semibold text-slate-300">{fmtUsd(feesPaid)}</p>
                                 </div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/40 p-3">
                                     <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Win Rate</p>
                                     <p className="mt-1 text-sm font-semibold text-slate-200">{closedWinRatePct.toFixed(1)}%</p>
                                 </div>
+                            </div>
+                            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-5">
+                                <div className="rounded border border-slate-700/50 bg-slate-800/30 p-2 text-xs text-slate-300">Total Trades: <span className="font-semibold text-slate-100">{tradeHistory.totalTrades}</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/30 p-2 text-xs text-slate-300">Buys: <span className="font-semibold text-emerald-300">{tradeHistory.buys}</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/30 p-2 text-xs text-slate-300">Sells: <span className="font-semibold text-amber-300">{tradeHistory.sells}</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/30 p-2 text-xs text-slate-300">Redeems: <span className="font-semibold text-sky-300">{tradeHistory.redeems}</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/30 p-2 text-xs text-slate-300">Uptime: <span className="font-semibold text-slate-100">{formatDuration(runtimeSeconds)}</span></div>
+                            </div>
+                            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+                                <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Friction Samples: <span className="font-semibold text-slate-100">{friction.samples}</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Latency: <span className="font-semibold text-slate-100">{friction.avgLatencyMs.toFixed(0)} ms</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Slippage: <span className="font-semibold text-amber-300">{friction.avgSlippageBps.toFixed(2)} bps</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Drift: <span className="font-semibold text-sky-300">{friction.avgDriftBps.toFixed(2)} bps</span></div>
+                                <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Total Adverse: <span className="font-semibold text-rose-300">{friction.avgTotalAdverseBps.toFixed(2)} bps</span></div>
                             </div>
                             <p className="mt-2 text-[11px] text-slate-500">Last updated: {lastUpdatedSeconds != null ? `${lastUpdatedSeconds}s ago` : '-'}</p>
                         </div>
@@ -788,6 +984,11 @@ export default function SimulationPage() {
                                                                     our fill: {fmtUsd(item.ourAmountUsd)}
                                                                 </p>
                                                             )}
+                                                            {item.ourAction === 'COPIED' && (
+                                                                <p className="mt-1 text-[10px] text-slate-500">
+                                                                    latency: {item.ourLatencyMs != null ? `${item.ourLatencyMs.toFixed(0)}ms` : 'n/a'} | slippage: {item.ourSlippageBps != null ? `${item.ourSlippageBps.toFixed(2)}bps` : 'n/a'} | drift: {item.ourDriftBps != null ? `${item.ourDriftBps.toFixed(2)}bps` : 'n/a'} | total adverse: {item.ourTotalAdverseBps != null ? `${item.ourTotalAdverseBps.toFixed(2)}bps` : 'n/a'}
+                                                                </p>
+                                                            )}
                                                             {item.ourAction === 'SKIPPED' && item.skipReason && (
                                                                 <p className="mt-1 max-w-[260px] truncate text-[10px] text-amber-300/90" title={item.skipReason}>
                                                                     {item.skipReason}
@@ -808,7 +1009,7 @@ export default function SimulationPage() {
                                             <p className="py-8 text-center text-sm text-slate-500">No open positions.</p>
                                         ) : (
                                             <>
-                                                <p className="mb-2 text-xs text-slate-400">{openLots.length} open lots — Value: {fmtUsd(openLotsSummary.totalValue)} — Unrealized: <span className={pnlClass(openLotsSummary.totalUnrealizedPnl)}>{fmtPnl(openLotsSummary.totalUnrealizedPnl)}</span></p>
+                                                <p className="mb-2 text-xs text-slate-400">{openCount} open positions — Value: {fmtUsd(openValueCanonical)} — Unrealized: <span className={pnlClass(unrealizedValue)}>{fmtPnl(unrealizedValue)}</span></p>
                                                 <table className="w-full text-xs">
                                                     <thead>
                                                         <tr className="border-b border-slate-800/50 text-[10px] uppercase tracking-wider text-slate-500">
