@@ -154,6 +154,24 @@ function findOpenPositionForCloseEvent(
   outcome: string,
   positionStateByKey: Map<string, ProjectedPositionState>,
 ): { position: ProjectedPositionState; resolvedOutcome: string; matchMethod: string } | null {
+  const pickBestCandidate = (
+    candidates: Array<{ key: string; position: ProjectedPositionState }>,
+  ): { position: ProjectedPositionState; resolvedOutcome: string } | null => {
+    if (candidates.length === 0) return null;
+
+    // Deterministic tie-breaker avoids map-insertion-order dependence.
+    candidates.sort((a, b) => {
+      if (b.position.netShares !== a.position.netShares) {
+        return b.position.netShares - a.position.netShares;
+      }
+      return a.key.localeCompare(b.key);
+    });
+
+    const chosen = candidates[0]!;
+    const selected = chosen.position;
+    return { position: selected, resolvedOutcome: selected.outcome };
+  };
+
   // 1. Exact key match (marketId:outcome)
   if (marketId) {
     const exactKey = `${marketId}:${outcome}`;
@@ -168,12 +186,13 @@ function findOpenPositionForCloseEvent(
     id: string,
   ): { position: ProjectedPositionState; resolvedOutcome: string } | null => {
     const prefix = `${id}:`;
+    const candidates: Array<{ key: string; position: ProjectedPositionState }> = [];
     for (const [k, p] of positionStateByKey) {
       if (k.startsWith(prefix) && p.netShares > 0) {
-        return { position: p, resolvedOutcome: p.outcome };
+        candidates.push({ key: k, position: p });
       }
     }
-    return null;
+    return pickBestCandidate(candidates);
   };
 
   // 2. marketId prefix scan (for null outcome → "UNKNOWN")
@@ -251,11 +270,14 @@ function findOpenPositionForCloseEvent(
   const eventQuestion =
     typeof event.marketQuestion === 'string' ? event.marketQuestion.trim() : null;
   if (eventQuestion && eventQuestion.length > 5) {
+    const candidates: Array<{ key: string; position: ProjectedPositionState }> = [];
     for (const [, p] of positionStateByKey) {
       if (p.netShares > 0 && p.marketQuestion && p.marketQuestion.trim() === eventQuestion) {
-        return { position: p, resolvedOutcome: p.outcome, matchMethod: 'market_question' };
+        candidates.push({ key: `${p.marketId}:${p.outcome}`, position: p });
       }
     }
+    const best = pickBestCandidate(candidates);
+    if (best) return { ...best, matchMethod: 'market_question' };
   }
 
   return null;
@@ -267,6 +289,7 @@ export function evaluatePaperEventDecision(input: {
     | 'maxAllocationPerMarket'
     | 'maxTotalExposure'
     | 'minNotionalThreshold'
+    | 'feeBps'
     | 'slippageBps'
     | 'copyRatio'
     | 'startedAt'
@@ -517,7 +540,33 @@ export function evaluatePaperEventDecision(input: {
   }
 
   if (effectiveSide === 'BUY') {
-    const availableCashCap = Math.min(projectedCash, maxPerMarket);
+    const feeRate = Math.max(0, Number(session.feeBps ?? 0)) / 10_000;
+    const cashCapExFees = projectedCash > 0 ? projectedCash / (1 + feeRate) : 0;
+    const existingMarketExposure =
+      position && position.netShares > 0
+        ? position.netShares * Math.max(position.avgEntryPrice, intendedFillPrice)
+        : 0;
+    const remainingMarketCap = Math.max(0, maxPerMarket - existingMarketExposure);
+
+    if (remainingMarketCap <= 0) {
+      return skipDecision({
+        marketId,
+        marketQuestion,
+        outcome,
+        side: 'BUY',
+        sourceShares,
+        sourcePrice,
+        copyRatio,
+        reasonCode: PAPER_REASON_CODES.SKIP_OVER_MARKET_CAP,
+        humanReason: 'Existing copied exposure already reached per-market allocation cap.',
+        riskChecksJson: {
+          maxPerMarket,
+          existingMarketExposure,
+        },
+      });
+    }
+
+    const availableCashCap = Math.min(cashCapExFees, maxPerMarket);
     if (availableCashCap <= 0) {
       return skipDecision({
         marketId,
@@ -529,12 +578,18 @@ export function evaluatePaperEventDecision(input: {
         copyRatio,
         reasonCode: PAPER_REASON_CODES.SKIP_NO_AVAILABLE_CASH,
         humanReason: 'Insufficient available cash for buy-side copy execution.',
-        riskChecksJson: { projectedCash, perMarketCap: maxPerMarket },
+        riskChecksJson: {
+          projectedCash,
+          projectedCashExcludingFees: cashCapExFees,
+          perMarketCap: maxPerMarket,
+          feeBps: Number(session.feeBps ?? 0),
+        },
       });
     }
 
-    if (notional > availableCashCap) {
-      simulatedShares = availableCashCap / intendedFillPrice;
+    const executableCap = Math.min(availableCashCap, remainingMarketCap);
+    if (notional > executableCap) {
+      simulatedShares = executableCap / intendedFillPrice;
       notional = simulatedShares * intendedFillPrice;
     }
 
@@ -549,7 +604,12 @@ export function evaluatePaperEventDecision(input: {
         copyRatio,
         reasonCode: PAPER_REASON_CODES.SKIP_OVER_MARKET_CAP,
         humanReason: 'Proposed buy would exceed maximum total exposure guardrail.',
-        riskChecksJson: { projectedGrossExposure, requestedNotional: notional, maxTotalExposure },
+        riskChecksJson: {
+          projectedGrossExposure,
+          requestedNotional: notional,
+          requestedAllInCost: notional * (1 + feeRate),
+          maxTotalExposure,
+        },
       });
     }
   } else {

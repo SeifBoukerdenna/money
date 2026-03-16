@@ -22,6 +22,28 @@ export type TradeAttribution = {
   feeByTradeId: Map<string, number>;
 };
 
+export function resolveAttributionPositionKey(input: {
+  marketId: unknown;
+  sourceOutcome?: unknown;
+  decisionOutcome?: unknown;
+  tradeOutcome?: unknown;
+}): string | null {
+  const marketId = String(input.marketId ?? '').trim();
+  if (!marketId) return null;
+
+  const outcomeCandidates = [input.sourceOutcome, input.decisionOutcome, input.tradeOutcome];
+  let outcome: string | null = null;
+  for (const candidate of outcomeCandidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0) {
+      outcome = candidate.trim().toUpperCase();
+      break;
+    }
+  }
+
+  if (!outcome) return null;
+  return `${marketId}:${outcome}`;
+}
+
 export function buildTradeAttribution(trades: TradeAttributionInput[]): TradeAttribution {
   const eventRealizedPnlGrossByTradeId = new Map<string, number>();
   const cumulativeRealizedPnlGrossByPositionKey = new Map<string, number>();

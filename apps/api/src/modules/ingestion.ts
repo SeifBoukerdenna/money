@@ -23,6 +23,7 @@ import { publishEvent } from './event-stream.js';
 import { decisionQueue, ingestQueue } from './queue.js';
 import { buildActivityDedupeKey, isTradeLikeActivity } from './activity.js';
 import { incrementDuplicatePollSkip } from './runtime-ops.js';
+import { isTurboModeEnabled } from './latency-profile.js';
 
 const dataAdapter = createPolymarketDataAdapter();
 const SOURCE_NAME = 'POLYMARKET_DATA_API';
@@ -271,6 +272,15 @@ function isRecentlyActive(lastTradeAt: Date | null): boolean {
 }
 
 function computeNextPollIntervalMs(active: boolean): number {
+  if (isTurboModeEnabled()) {
+    if (active) {
+      return Math.max(300, config.TURBO_ACTIVE_WALLET_POLL_MS);
+    }
+    const min = Math.max(1000, config.TURBO_INACTIVE_WALLET_POLL_MIN_MS);
+    const max = Math.max(min, config.TURBO_INACTIVE_WALLET_POLL_MAX_MS);
+    return min + Math.floor(Math.random() * Math.max(1, max - min));
+  }
+
   if (active) {
     return config.ACTIVE_WALLET_POLL_MS;
   }
@@ -308,8 +318,13 @@ export async function scheduleWalletPolls(): Promise<void> {
     },
   });
 
-  for (let index = 0; index < wallets.length; index += MAX_MONITOR_CONCURRENCY) {
-    const batch = wallets.slice(index, index + MAX_MONITOR_CONCURRENCY);
+  const turboMode = isTurboModeEnabled();
+  const batchConcurrency = turboMode
+    ? Math.max(MAX_MONITOR_CONCURRENCY, config.TURBO_SCHEDULE_BATCH_CONCURRENCY)
+    : MAX_MONITOR_CONCURRENCY;
+
+  for (let index = 0; index < wallets.length; index += batchConcurrency) {
+    const batch = wallets.slice(index, index + batchConcurrency);
     await Promise.all(
       batch.map(async (wallet) => {
         if (!(await shouldPollWalletNow(wallet.id))) {
@@ -330,7 +345,10 @@ export async function scheduleWalletPolls(): Promise<void> {
             removeOnComplete: 1000,
             removeOnFail: 5000,
             attempts: 5,
-            backoff: { type: 'exponential', delay: 500 },
+            backoff: {
+              type: 'exponential',
+              delay: turboMode ? config.TURBO_INGEST_BACKOFF_MS : 500,
+            },
           },
         );
       }),
@@ -694,7 +712,10 @@ export async function processWalletPoll(walletId: string, address: string): Prom
                 removeOnComplete: 1000,
                 removeOnFail: 5000,
                 attempts: 5,
-                backoff: { type: 'exponential', delay: 500 },
+                backoff: {
+                  type: 'exponential',
+                  delay: isTurboModeEnabled() ? config.TURBO_DECISION_BACKOFF_MS : 500,
+                },
               },
             );
           } catch (error) {

@@ -26,6 +26,7 @@ import {
 import { createPortfolioSnapshots } from './modules/snapshots.js';
 import { refreshWalletAnalyticsSnapshots } from './modules/wallet-analytics.js';
 import { createApp } from './app.js';
+import { isTurboModeEnabled } from './modules/latency-profile.js';
 
 // ---------------------------------------------------------------------------
 // Overlap guard for paper session tick
@@ -36,6 +37,8 @@ let _paperTickInFlight = false;
 let _runtimeStarted = false;
 const _instanceId = randomUUID();
 let _holdsSchedulerLease = false;
+let _lastWalletSchedulerRunAt = 0;
+let _lastPaperTickRunAt = 0;
 
 async function safePaperTick() {
   if (_paperTickInFlight) {
@@ -128,23 +131,60 @@ async function main() {
   });
 
   const app = await createApp();
+  const ingestSchedulerBaseMs = 1000;
+  const paperTickSchedulerBaseMs = 1000;
+
+  const getIngestLoopIntervalMs = () => {
+    if (isTurboModeEnabled()) {
+      return Math.max(
+        500,
+        Math.min(config.INGEST_POLL_INTERVAL_MS, config.TURBO_INGEST_POLL_INTERVAL_MS),
+      );
+    }
+    return config.INGEST_POLL_INTERVAL_MS;
+  };
+
+  const getPaperTickIntervalMs = () => {
+    if (isTurboModeEnabled()) {
+      return Math.max(
+        750,
+        Math.min(config.PAPER_TICK_INTERVAL_MS, config.TURBO_PAPER_TICK_INTERVAL_MS),
+      );
+    }
+    return config.PAPER_TICK_INTERVAL_MS;
+  };
 
   // BullMQ workers
   const workers = [
-    createWorker('ingest', async (job: Job) => {
-      const { walletId, address } = job.data as { walletId: string; address: string };
-      await processWalletPoll(walletId, address);
-    }),
+    createWorker(
+      'ingest',
+      async (job: Job) => {
+        const { walletId, address } = job.data as { walletId: string; address: string };
+        await processWalletPoll(walletId, address);
+      },
+      { concurrency: config.INGEST_WORKER_CONCURRENCY },
+    ),
 
-    createWorker('decision', async (job: Job) => {
-      const { strategyId, tradeEventId } = job.data as { strategyId: string; tradeEventId: string };
-      await processDecision(strategyId, tradeEventId);
-    }),
+    createWorker(
+      'decision',
+      async (job: Job) => {
+        const { strategyId, tradeEventId } = job.data as {
+          strategyId: string;
+          tradeEventId: string;
+        };
+        await processDecision(strategyId, tradeEventId);
+      },
+      { concurrency: config.DECISION_WORKER_CONCURRENCY },
+    ),
 
-    createWorker('execution', async (job: Job) => {
-      const { strategyId, decisionId } = job.data as { strategyId: string; decisionId: string };
-      await processExecution(strategyId, decisionId);
-    }),
+    createWorker(
+      'execution',
+      async (job: Job) => {
+        const { strategyId, decisionId } = job.data as { strategyId: string; decisionId: string };
+        await processExecution(strategyId, decisionId);
+      },
+      { concurrency: config.EXECUTION_WORKER_CONCURRENCY },
+    ),
   ];
 
   for (const worker of workers) {
@@ -154,7 +194,14 @@ async function main() {
 
   // Wallet ingestion scheduler
   const ingestTimer = setInterval(async () => {
-    await runLoopWithLease('wallet-poll-scheduler', config.INGEST_POLL_INTERVAL_MS, async () => {
+    const loopInterval = getIngestLoopIntervalMs();
+    const now = Date.now();
+    if (now - _lastWalletSchedulerRunAt < loopInterval) {
+      return;
+    }
+    _lastWalletSchedulerRunAt = now;
+
+    await runLoopWithLease('wallet-poll-scheduler', loopInterval, async () => {
       await scheduleWalletPolls();
       const [ingestWaiting, decisionWaiting, executionWaiting] = await Promise.all([
         ingestQueue.getWaitingCount(),
@@ -165,7 +212,7 @@ async function main() {
       queueBacklogGauge.set({ queue: 'decision' }, decisionWaiting);
       queueBacklogGauge.set({ queue: 'execution' }, executionWaiting);
     });
-  }, config.INGEST_POLL_INTERVAL_MS).unref();
+  }, ingestSchedulerBaseMs).unref();
 
   // Portfolio snapshots
   const portfolioTimer = setInterval(async () => {
@@ -198,10 +245,17 @@ async function main() {
 
   // Paper session tick — uses overlap guard to prevent concurrent runs
   const paperTimer = setInterval(async () => {
-    await runLoopWithLease('paper-session-tick', config.PAPER_TICK_INTERVAL_MS, async () => {
+    const loopInterval = getPaperTickIntervalMs();
+    const now = Date.now();
+    if (now - _lastPaperTickRunAt < loopInterval) {
+      return;
+    }
+    _lastPaperTickRunAt = now;
+
+    await runLoopWithLease('paper-session-tick', loopInterval, async () => {
       await safePaperTick();
     });
-  }, config.PAPER_TICK_INTERVAL_MS).unref();
+  }, paperTickSchedulerBaseMs).unref();
 
   // Reconciliation (infrequent)
   const reconcileTimer = setInterval(async () => {
@@ -222,6 +276,16 @@ async function main() {
       sampleMemoryUsage();
     });
   }, config.OPS_MEMORY_SAMPLE_INTERVAL_MS).unref();
+
+  // Kick off once at startup to avoid waiting for first interval boundary.
+  await Promise.allSettled([
+    runLoopWithLease('wallet-poll-scheduler', getIngestLoopIntervalMs(), async () => {
+      await scheduleWalletPolls();
+    }),
+    runLoopWithLease('paper-session-tick', getPaperTickIntervalMs(), async () => {
+      await safePaperTick();
+    }),
+  ]);
 
   // Graceful shutdown — clears all timers so the process exits cleanly
   const shutdown = async (signal: string) => {

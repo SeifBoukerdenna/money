@@ -241,4 +241,75 @@ describe('Slippage Engine unit tests', () => {
       expect(res.fillPrice).toBeCloseTo(0.50125, 8);
     });
   });
+
+  describe('Pre-flight friction boundaries', () => {
+    it('keeps zero-bps friction neutral for both sides', () => {
+      const buy = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.43, simulatedShares: 120 },
+        { enabled: true, mode: 'FIXED_BPS', fixedBps: 0 },
+      );
+      const sell = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.43, simulatedShares: 120 },
+        { enabled: true, mode: 'FIXED_BPS', fixedBps: 0 },
+      );
+
+      expect(buy.fillPrice).toBeCloseTo(0.43, 12);
+      expect(sell.fillPrice).toBeCloseTo(0.43, 12);
+      expect(buy.totalAdverseBps).toBe(0);
+      expect(sell.totalAdverseBps).toBe(0);
+    });
+
+    it('applies large friction in adverse direction only', () => {
+      const buy = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 1000, latencyMs: 4000 },
+        {
+          enabled: true,
+          mode: 'COMBINED',
+          latencyBuckets: [{ maxMs: null, slippagePercent: 0.06 }],
+          sizeBuckets: [{ maxNotional: null, slippagePercent: 0.09 }],
+          combined: { basePercent: 0.03, useLatencyBuckets: true, useSizeBuckets: true },
+          latencyDrift: { enabled: true, bpsPerSecond: 25, maxBps: 40 },
+        },
+      );
+      const sell = calculateSlippage(
+        { side: 'SELL', sourcePrice: 0.5, simulatedShares: 1000, latencyMs: 4000 },
+        {
+          enabled: true,
+          mode: 'COMBINED',
+          latencyBuckets: [{ maxMs: null, slippagePercent: 0.06 }],
+          sizeBuckets: [{ maxNotional: null, slippagePercent: 0.09 }],
+          combined: { basePercent: 0.03, useLatencyBuckets: true, useSizeBuckets: true },
+          latencyDrift: { enabled: true, bpsPerSecond: 25, maxBps: 40 },
+        },
+      );
+
+      expect(buy.fillPrice).toBeGreaterThan(0.5);
+      expect(sell.fillPrice).toBeLessThan(0.5);
+      expect(buy.totalAdverseBps).toBeCloseTo(sell.totalAdverseBps, 8);
+    });
+
+    it('honors drift cap boundary exactly', () => {
+      const atCap = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 1, latencyMs: 10_000 },
+        {
+          enabled: true,
+          mode: 'NONE',
+          latencyDrift: { enabled: true, bpsPerSecond: 2, maxBps: 20 },
+        },
+      );
+
+      const aboveCap = calculateSlippage(
+        { side: 'BUY', sourcePrice: 0.5, simulatedShares: 1, latencyMs: 300_000 },
+        {
+          enabled: true,
+          mode: 'NONE',
+          latencyDrift: { enabled: true, bpsPerSecond: 2, maxBps: 20 },
+        },
+      );
+
+      expect(atCap.driftBps).toBeCloseTo(20, 8);
+      expect(aboveCap.driftBps).toBeCloseTo(20, 8);
+      expect(aboveCap.fillPrice).toBeCloseTo(atCap.fillPrice, 8);
+    });
+  });
 });

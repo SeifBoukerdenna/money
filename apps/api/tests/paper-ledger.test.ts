@@ -8,6 +8,7 @@ import {
   scaleShares,
   unrealizedPnl,
   type LedgerEntry,
+  type PortfolioState,
   type ReducedPosition,
 } from '../src/lib/paper-ledger.js';
 
@@ -41,6 +42,52 @@ function entry(
 // ---------------------------------------------------------------------------
 
 describe('paper-ledger — pure accounting math', () => {
+  function createRng(seed: number): () => number {
+    let x = seed >>> 0;
+    return () => {
+      x = (1664525 * x + 1013904223) >>> 0;
+      return x / 0x100000000;
+    };
+  }
+
+  function randBetween(rng: () => number, min: number, max: number): number {
+    return min + (max - min) * rng();
+  }
+
+  function randInt(rng: () => number, min: number, maxInclusive: number): number {
+    return Math.floor(randBetween(rng, min, maxInclusive + 1));
+  }
+
+  function assertPortfolioInvariants(
+    portfolio: PortfolioState,
+    startingCash: number,
+    marks: Map<string, number>,
+  ) {
+    const openValue = portfolio.openPositions.reduce((sum, pos) => {
+      const key = `${pos.marketId}:${pos.outcome}`;
+      const mark = marks.get(key) ?? pos.avgEntryPrice;
+      return sum + pos.netShares * mark;
+    }, 0);
+
+    expect(portfolio.netLiquidationValue).toBeCloseTo(portfolio.cash + openValue, 6);
+    expect(portfolio.netPnl).toBeCloseTo(
+      portfolio.totalRealizedPnl + portfolio.totalUnrealizedPnl - portfolio.totalFees,
+      6,
+    );
+    expect(startingCash + portfolio.netPnl).toBeCloseTo(portfolio.netLiquidationValue, 6);
+    expect(portfolio.totalPnl).toBeCloseTo(portfolio.netPnl, 8);
+
+    expect(portfolio.positions.every((p) => p.netShares >= -1e-8)).toBe(true);
+    expect(portfolio.openPositions.every((p) => p.netShares > 1e-8 && p.status === 'OPEN')).toBe(
+      true,
+    );
+    expect(
+      portfolio.closedPositions.every(
+        (p) => Math.abs(p.netShares) <= 1e-8 && p.status === 'CLOSED',
+      ),
+    ).toBe(true);
+  }
+
   // ────────────────────────────────────────────────────────────────────
   // CASE 1: Multiple buys, partial sell → net shares
   // ────────────────────────────────────────────────────────────────────
@@ -580,6 +627,338 @@ describe('paper-ledger — pure accounting math', () => {
       expect(portfolio.cash).toBe(1000);
       expect(portfolio.positions).toHaveLength(0);
       expect(portfolio.totalFees).toBe(0);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Adversarial randomized invariants
+  // ────────────────────────────────────────────────────────────────────
+  describe('Adversarial randomized invariants', () => {
+    it('preserves accounting identities across randomized BUY/SELL/REDEEM-like streams', () => {
+      const runs = 120;
+      const startingCash = 25_000;
+      const marketIds = ['m-a', 'm-b', 'm-c', 'm-d'];
+      const outcomes = ['YES', 'NO'];
+
+      for (let run = 0; run < runs; run += 1) {
+        const rng = createRng(10_000 + run * 31);
+        const entries: LedgerEntry[] = [];
+        const trackedShares = new Map<string, number>();
+        const seenKeys = new Set<string>();
+        let ts = new Date('2026-01-01T00:00:00.000Z').getTime();
+
+        const steps = randInt(rng, 35, 85);
+        for (let i = 0; i < steps; i += 1) {
+          const marketId = marketIds[randInt(rng, 0, marketIds.length - 1)]!;
+          const outcome = outcomes[randInt(rng, 0, outcomes.length - 1)]!;
+          const key = `${marketId}:${outcome}`;
+          const held = trackedShares.get(key) ?? 0;
+          const openShareTotal = Array.from(trackedShares.values()).reduce((a, b) => a + b, 0);
+
+          let side: 'BUY' | 'SELL';
+          if (openShareTotal <= 1e-8) {
+            side = 'BUY';
+          } else {
+            side = rng() < 0.58 ? 'BUY' : 'SELL';
+          }
+
+          let shares: number;
+          let price: number;
+          let action = side;
+
+          if (side === 'BUY') {
+            shares = roundShares(randBetween(rng, 1, 220));
+            price = randBetween(rng, 0.03, 0.97);
+            trackedShares.set(key, roundShares(held + shares));
+            seenKeys.add(key);
+          } else {
+            // Keep random sequences economically valid: SELL never exceeds held.
+            shares = roundShares(Math.max(0.00000001, held * randBetween(rng, 0.1, 1)));
+
+            // Randomly simulate REDEEM-like closes at terminal prices 0/1.
+            if (rng() < 0.2) {
+              action = 'REDEEM';
+              price = rng() < 0.5 ? 0 : 1;
+            } else {
+              price = randBetween(rng, 0, 1);
+            }
+
+            const closeShares = Math.min(held, shares);
+            trackedShares.set(key, roundShares(Math.max(0, held - closeShares)));
+            seenKeys.add(key);
+          }
+
+          const notional = shares * price;
+          const feeRate = randBetween(rng, 0, 0.03);
+          const fee = notional * feeRate;
+
+          entries.push({
+            id: `rand-${run}-${i}`,
+            sourceEventId: `src-rand-${run}-${i}`,
+            marketId,
+            outcome,
+            side,
+            action,
+            shares,
+            price,
+            notional,
+            fee,
+            slippage: 0,
+            timestamp: new Date(ts),
+          });
+
+          ts += randInt(rng, 1, 20) * 1000;
+        }
+
+        const marks = new Map<string, number>();
+        for (const key of seenKeys) {
+          marks.set(key, randBetween(rng, 0, 1));
+        }
+
+        const live = computePortfolio(startingCash, entries, marks);
+        const replay = computePortfolio(startingCash, entries, marks);
+
+        const recomposedOpenValue = live.openPositions.reduce((sum, pos) => {
+          const k = `${pos.marketId}:${pos.outcome}`;
+          const mark = marks.get(k) ?? pos.avgEntryPrice;
+          return sum + pos.netShares * mark;
+        }, 0);
+
+        expect(live.netLiquidationValue).toBeCloseTo(live.cash + recomposedOpenValue, 6);
+        expect(live.netPnl).toBeCloseTo(
+          live.totalRealizedPnl + live.totalUnrealizedPnl - live.totalFees,
+          6,
+        );
+        expect(startingCash + live.netPnl).toBeCloseTo(live.netLiquidationValue, 6);
+        expect(live.totalPnl).toBeCloseTo(live.netPnl, 8);
+
+        expect(
+          live.openPositions.every((p) => p.netShares > 0 && p.status === 'OPEN'),
+        ).toBeTruthy();
+        expect(
+          live.closedPositions.every((p) => Math.abs(p.netShares) <= 1e-8 && p.status === 'CLOSED'),
+        ).toBeTruthy();
+        expect(live.closedPositions.every((p) => unrealizedPnl(p, 0.77) === 0)).toBeTruthy();
+
+        const reconcileResult = reconcile(
+          startingCash,
+          entries,
+          live.cash,
+          live.openPositions.map((p) => ({
+            marketId: p.marketId,
+            outcome: p.outcome,
+            netShares: p.netShares,
+          })),
+        );
+        expect(reconcileResult.valid).toBe(true);
+
+        expect(replay.cash).toBeCloseTo(live.cash, 8);
+        expect(replay.totalRealizedPnl).toBeCloseTo(live.totalRealizedPnl, 8);
+        expect(replay.totalUnrealizedPnl).toBeCloseTo(live.totalUnrealizedPnl, 8);
+        expect(replay.netLiquidationValue).toBeCloseTo(live.netLiquidationValue, 8);
+      }
+    });
+  });
+
+  describe('Pre-flight long-run stability', () => {
+    it('runs 5,000 deterministic mixed events with invariant checks after every step', () => {
+      const rng = createRng(20260316);
+      const startingCash = 75_000;
+      const marketIds = ['m0', 'm1', 'm2', 'm3', 'm4', 'm5'];
+      const outcomes = ['YES', 'NO'];
+      const entries: LedgerEntry[] = [];
+      const trackedShares = new Map<string, number>();
+      const marks = new Map<string, number>();
+      let ts = new Date('2026-01-01T00:00:00.000Z').getTime();
+
+      for (let i = 0; i < 5000; i += 1) {
+        const marketId = marketIds[randInt(rng, 0, marketIds.length - 1)]!;
+        const outcome = outcomes[randInt(rng, 0, outcomes.length - 1)]!;
+        const key = `${marketId}:${outcome}`;
+        const held = trackedShares.get(key) ?? 0;
+
+        let side: 'BUY' | 'SELL' = 'BUY';
+        let action = 'BUY';
+        let shares = 0;
+        let price = 0;
+
+        if (held <= 1e-8 || rng() < 0.48) {
+          side = 'BUY';
+          action = 'BUY';
+          shares = roundShares(randBetween(rng, 0.05, 120));
+          price = randBetween(rng, 0.02, 0.98);
+          trackedShares.set(key, roundShares(held + shares));
+        } else {
+          side = 'SELL';
+          const modeRoll = rng();
+          if (modeRoll < 0.65) {
+            action = 'SELL';
+            shares = roundShares(Math.max(0.00000001, held * randBetween(rng, 0.05, 0.8)));
+            price = randBetween(rng, 0.01, 0.99);
+          } else if (modeRoll < 0.85) {
+            action = 'REDEEM';
+            shares = roundShares(held);
+            price = rng() < 0.5 ? 0 : 1;
+          } else {
+            action = 'AUTO_CLOSED';
+            shares = roundShares(held);
+            price = rng() < 0.5 ? 0 : 1;
+          }
+
+          const closeShares = Math.min(held, shares);
+          trackedShares.set(key, roundShares(Math.max(0, held - closeShares)));
+        }
+
+        marks.set(key, price);
+        const notional = shares * price;
+        const fee = notional * randBetween(rng, 0, 0.02);
+
+        entries.push({
+          id: `long-${i}`,
+          sourceEventId: `src-long-${i}`,
+          marketId,
+          outcome,
+          side,
+          action,
+          shares,
+          price,
+          notional,
+          fee,
+          slippage: randBetween(rng, 0, 0.01),
+          timestamp: new Date(ts),
+        });
+        ts += 1000;
+
+        const portfolio = computePortfolio(startingCash, entries, marks);
+        assertPortfolioInvariants(portfolio, startingCash, marks);
+
+        for (const [trackedKey, expectedShares] of trackedShares) {
+          if (expectedShares <= 1e-8) continue;
+          const position = portfolio.openPositions.find(
+            (p) => `${p.marketId}:${p.outcome}` === trackedKey,
+          );
+          expect(position).toBeDefined();
+          expect(position!.netShares).toBeCloseTo(expectedShares, 6);
+        }
+      }
+    });
+
+    it('keeps replay state equal to live state across repeated replay cycles', () => {
+      const rng = createRng(77777);
+      const startingCash = 50_000;
+      const entries: LedgerEntry[] = [];
+      const marks = new Map<string, number>();
+      let ts = new Date('2026-01-02T00:00:00.000Z').getTime();
+      const heldByKey = new Map<string, number>();
+
+      for (let i = 0; i < 2500; i += 1) {
+        const marketId = `r-${randInt(rng, 0, 4)}`;
+        const outcome = rng() < 0.5 ? 'YES' : 'NO';
+        const key = `${marketId}:${outcome}`;
+        const held = heldByKey.get(key) ?? 0;
+        const side: 'BUY' | 'SELL' = held <= 1e-8 || rng() < 0.55 ? 'BUY' : 'SELL';
+        const price = randBetween(rng, 0.03, 0.97);
+        let shares = roundShares(randBetween(rng, 0.01, 80));
+        if (side === 'SELL') {
+          shares = roundShares(Math.min(shares, held));
+          heldByKey.set(key, roundShares(Math.max(0, held - shares)));
+        } else {
+          heldByKey.set(key, roundShares(held + shares));
+        }
+
+        marks.set(key, price);
+        entries.push({
+          id: `replay-${i}`,
+          sourceEventId: `src-replay-${i}`,
+          marketId,
+          outcome,
+          side,
+          action: side,
+          shares,
+          price,
+          notional: shares * price,
+          fee: shares * price * 0.005,
+          slippage: 0,
+          timestamp: new Date(ts),
+        });
+        ts += 500;
+      }
+
+      const live = computePortfolio(startingCash, entries, marks);
+      assertPortfolioInvariants(live, startingCash, marks);
+
+      for (let replayCycle = 0; replayCycle < 200; replayCycle += 1) {
+        const replay = computePortfolio(startingCash, entries, marks);
+        expect(replay.cash).toBeCloseTo(live.cash, 8);
+        expect(replay.totalRealizedPnl).toBeCloseTo(live.totalRealizedPnl, 8);
+        expect(replay.totalUnrealizedPnl).toBeCloseTo(live.totalUnrealizedPnl, 8);
+        expect(replay.totalFees).toBeCloseTo(live.totalFees, 8);
+        expect(replay.netLiquidationValue).toBeCloseTo(live.netLiquidationValue, 8);
+
+        const replayOpen = replay.openPositions
+          .map((p) => `${p.marketId}:${p.outcome}:${p.netShares.toFixed(8)}`)
+          .sort();
+        const liveOpen = live.openPositions
+          .map((p) => `${p.marketId}:${p.outcome}:${p.netShares.toFixed(8)}`)
+          .sort();
+        expect(replayOpen).toEqual(liveOpen);
+      }
+    });
+
+    it('eliminates dust after repeated tiny partial closes', () => {
+      const startingCash = 1000;
+      const entries: LedgerEntry[] = [];
+      const marks = new Map<string, number>([['dust-market:YES', 0.5]]);
+      const initialShares = 0.00012345;
+
+      entries.push(
+        entry({
+          side: 'BUY',
+          marketId: 'dust-market',
+          outcome: 'YES',
+          shares: initialShares,
+          price: 0.5,
+          fee: 0,
+        }),
+      );
+
+      let remaining = initialShares;
+      for (let i = 0; i < 12; i += 1) {
+        const close = roundShares(Math.max(0.00000001, remaining * 0.37));
+        entries.push(
+          entry({
+            side: 'SELL',
+            marketId: 'dust-market',
+            outcome: 'YES',
+            shares: close,
+            price: 0.55,
+            fee: 0,
+          }),
+        );
+        remaining = roundShares(Math.max(0, remaining - Math.min(remaining, close)));
+      }
+
+      if (remaining > 0) {
+        entries.push(
+          entry({
+            side: 'SELL',
+            marketId: 'dust-market',
+            outcome: 'YES',
+            shares: remaining,
+            price: 0.55,
+            action: 'REDEEM',
+            fee: 0,
+          }),
+        );
+      }
+
+      const portfolio = computePortfolio(startingCash, entries, marks);
+      assertPortfolioInvariants(portfolio, startingCash, marks);
+      const dustPos = portfolio.positions.find((p) => p.marketId === 'dust-market');
+      expect(dustPos).toBeDefined();
+      expect(Math.abs(dustPos!.netShares)).toBeLessThanOrEqual(1e-8);
+      expect(dustPos!.status).toBe('CLOSED');
+      expect(portfolio.openPositions.some((p) => p.marketId === 'dust-market')).toBe(false);
     });
   });
 });

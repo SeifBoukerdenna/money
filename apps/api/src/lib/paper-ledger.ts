@@ -243,7 +243,11 @@ export function computeCash(startingCash: number, entries: LedgerEntry[]): numbe
       const closeShares = Math.min(held, entry.shares);
       if (closeShares <= EPSILON) continue;
 
-      cash += closeShares * entry.price - entry.fee;
+      // If an oversell row is present, only apply fee on the executed slice.
+      const feeScale = entry.shares > EPSILON ? closeShares / entry.shares : 1;
+      const executedFee = entry.fee * feeScale;
+
+      cash += closeShares * entry.price - executedFee;
       positionShares.set(key, roundShares(Math.max(0, held - closeShares)));
     }
   }
@@ -600,11 +604,13 @@ export function computeMarketSummaries(entries: LedgerEntry[]): MarketPerformanc
         buyCount++;
       } else {
         const closeShares = Math.min(posTracker, entry.shares);
+        const feeScale = entry.shares > EPSILON ? closeShares / entry.shares : 1;
+        const executedFee = entry.fee * feeScale;
         if (closeShares > EPSILON) {
-          totalReturned += closeShares * entry.price - entry.fee;
+          totalReturned += closeShares * entry.price - executedFee;
           posTracker = roundShares(Math.max(0, posTracker - closeShares));
         }
-        fees += entry.fee;
+        fees += executedFee;
         sellCount++;
       }
     }

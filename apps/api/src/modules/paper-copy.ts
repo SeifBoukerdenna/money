@@ -12,6 +12,7 @@ import { calculateSlippage, type SlippageConfig } from './slippage.js';
 import { raiseSystemAlert } from './system-alerts.js';
 import { closeResolvedPositions } from './force-close.js';
 import { processWalletPoll } from './ingestion.js';
+import { paperEndToEndLatency, paperPipelineLatency } from '../lib/metrics.js';
 
 const adapter = createPolymarketDataAdapter();
 const db = prisma as unknown as Record<string, any>;
@@ -32,6 +33,7 @@ const MIN_SNAPSHOT_INTERVAL_MS = 60_000;
 
 /** Maximum activity events processed per tick. Prevents runaway DB load. */
 const MAX_EVENTS_PER_TICK = 1500;
+const IDLE_MAINTENANCE_INTERVAL_MS = 30_000;
 
 /**
  * Per-session in-process lock. Prevents concurrent ticks on the same session
@@ -45,6 +47,7 @@ const _sessionLocks = new Set<string>();
  * Used to throttle snapshot writes without an extra DB query.
  */
 const _lastSnapshotAt = new Map<string, number>();
+const _lastIdleMaintenanceAt = new Map<string, number>();
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -711,14 +714,17 @@ async function _runTick(sessionId: string): Promise<void> {
 }
 
 async function _runTickUnsafe(sessionId: string): Promise<void> {
+  const tickStartedMs = Date.now();
   const session = await db.paperCopySession.findUnique({ where: { id: sessionId } });
   if (!session || session.status !== 'RUNNING') return;
 
   // Pull fresh source activity through the same ingestion pipeline used by Wallet Tracker
   // so paper sessions always consume the latest normalized activity feed.
+  const pollStartedMs = Date.now();
   await processWalletPoll(session.trackedWalletId, session.trackedWalletAddress).catch((err) =>
     logger.warn({ sessionId, err }, 'wallet poll from paper tick failed (non-fatal)'),
   );
+  paperPipelineLatency.observe({ stage: 'wallet_poll' }, Date.now() - pollStartedMs);
 
   const wallet = await db.watchedWallet.findUnique({
     where: { id: session.trackedWalletId },
@@ -768,6 +774,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   //     for worthless positions ($0 payout). These STILL need to close the position.
   // Phase 3: fetch all event types and record explicit SKIP decisions for
   // unsupported/non-copy events rather than silently dropping them.
+  const eventFetchStartedMs = Date.now();
   const newEvents: Array<Record<string, any>> = await db.walletActivityEvent.findMany({
     where: {
       trackedWalletId: session.trackedWalletId,
@@ -775,18 +782,43 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
       // Dedupe safety is guaranteed by per-event decision upsert keyed by sourceActivityEventId.
       eventTimestamp: { gte: overlapStart },
     },
-    orderBy: { eventTimestamp: 'asc' },
+    orderBy: [{ eventTimestamp: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
     take: MAX_EVENTS_PER_TICK,
   });
+  paperPipelineLatency.observe({ stage: 'event_fetch' }, Date.now() - eventFetchStartedMs);
 
   if (newEvents.length === 0) {
+    const lastMaintenance = _lastIdleMaintenanceAt.get(sessionId) ?? 0;
+    const nowMs = Date.now();
+    if (nowMs - lastMaintenance < IDLE_MAINTENANCE_INTERVAL_MS) {
+      const autoCloseResult = await closeResolvedPositions(sessionId).catch((err) => {
+        logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)');
+        return null;
+      });
+      if (autoCloseResult && Number(autoCloseResult.closed) > 0) {
+        await _writeSnapshot(sessionId, { force: true });
+      }
+      paperPipelineLatency.observe({ stage: 'tick_total' }, nowMs - tickStartedMs);
+      return;
+    }
+
+    _lastIdleMaintenanceAt.set(sessionId, nowMs);
+    const maintenanceStartedMs = Date.now();
     await materializePaperSessionState(sessionId);
     await _writeSnapshot(sessionId);
-    await closeResolvedPositions(sessionId).catch((err) =>
-      logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)'),
-    );
+    const autoCloseResult = await closeResolvedPositions(sessionId).catch((err) => {
+      logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)');
+      return null;
+    });
+    if (autoCloseResult && Number(autoCloseResult.closed) > 0) {
+      await _writeSnapshot(sessionId, { force: true });
+    }
+    paperPipelineLatency.observe({ stage: 'idle_maintenance' }, Date.now() - maintenanceStartedMs);
+    paperPipelineLatency.observe({ stage: 'tick_total' }, Date.now() - tickStartedMs);
     return;
   }
+
+  _lastIdleMaintenanceAt.set(sessionId, Date.now());
 
   const reducedBefore = await materializePaperSessionState(sessionId);
 
@@ -887,20 +919,53 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
   let projectedCash = reducedBefore.cash;
   let projectedGrossExposure = reducedBefore.grossExposure;
 
+  const eventIds = newEvents.map((event) => String(event.id));
+  const [existingDecisions, existingExecutions] = await Promise.all([
+    db.paperCopyDecision.findMany({
+      where: {
+        sessionId,
+        sourceActivityEventId: { in: eventIds },
+      },
+      select: {
+        id: true,
+        sourceActivityEventId: true,
+        status: true,
+        reasonCode: true,
+      },
+    }),
+    db.paperCopyTrade.findMany({
+      where: {
+        sessionId,
+        sourceActivityEventId: { in: eventIds },
+      },
+      select: {
+        id: true,
+        sourceActivityEventId: true,
+      },
+    }),
+  ]);
+
+  const decisionByEventId = new Map<string, any>(
+    existingDecisions.map((decision: any) => [String(decision.sourceActivityEventId), decision]),
+  );
+  const executionByEventId = new Map(
+    existingExecutions.map((trade: any) => [String(trade.sourceActivityEventId), trade.id]),
+  );
+
   let lastEventTs: Date | null = session.lastProcessedEventAt;
+  const advanceWatermark = (candidate: Date | null | undefined) => {
+    if (!candidate) return;
+    if (!lastEventTs || candidate.getTime() > lastEventTs.getTime()) {
+      lastEventTs = candidate;
+    }
+  };
   let consecutiveFailures = Number(session.consecutiveDecisionFailures ?? 0);
   let autoPausedByFailure = false;
 
+  const decisionLoopStartedMs = Date.now();
   for (const event of newEvents) {
-    const alreadyProcessedDecision = await db.paperCopyDecision.findUnique({
-      where: {
-        sessionId_sourceActivityEventId: {
-          sessionId,
-          sourceActivityEventId: event.id,
-        },
-      },
-      select: { id: true, status: true, reasonCode: true },
-    });
+    const eventId = String(event.id);
+    const alreadyProcessedDecision = decisionByEventId.get(eventId) ?? null;
 
     const retriableReasonCodes = new Set<string>([
       PAPER_REASON_CODES.SKIP_INVALID_SOURCE_SIZE,
@@ -914,12 +979,12 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
       retriableReasonCodes.has(String(alreadyProcessedDecision.reasonCode ?? ''));
 
     if (alreadyProcessedDecision?.status === 'EXECUTED') {
-      lastEventTs = event.eventTimestamp;
+      advanceWatermark(event.eventTimestamp);
       continue;
     }
 
     if (alreadyProcessedDecision?.status === 'SKIPPED' && !canRetrySkippedDecision) {
-      lastEventTs = event.eventTimestamp;
+      advanceWatermark(event.eventTimestamp);
       continue;
     }
 
@@ -990,7 +1055,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
           },
         });
 
-        lastEventTs = event.eventTimestamp;
+        advanceWatermark(event.eventTimestamp);
         consecutiveFailures = 0;
         continue;
       }
@@ -1062,7 +1127,27 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
       });
 
       if (decision.status === 'SKIPPED') {
-        lastEventTs = event.eventTimestamp;
+        advanceWatermark(event.eventTimestamp);
+        consecutiveFailures = 0;
+        continue;
+      }
+
+      const existingExecutionId = executionByEventId.get(eventId) ?? null;
+
+      if (existingExecutionId) {
+        await db.paperCopyDecision.update({
+          where: { id: decision.id },
+          data: {
+            status: 'EXECUTED',
+            executionError: null,
+          },
+        });
+        decisionByEventId.set(eventId, {
+          ...decision,
+          status: 'EXECUTED',
+          reasonCode: decision.reasonCode,
+        });
+        advanceWatermark(event.eventTimestamp);
         consecutiveFailures = 0;
         continue;
       }
@@ -1094,6 +1179,33 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         consecutiveFailures = 0;
       }
 
+      if (execution.status === 'EXECUTED') {
+        executionByEventId.set(eventId, execution.tradeId ?? `executed:${eventId}`);
+        decisionByEventId.set(eventId, {
+          ...decision,
+          status: 'EXECUTED',
+          reasonCode: execution.reasonCode,
+        });
+
+        const sourceAtMs =
+          event.eventTimestamp instanceof Date ? event.eventTimestamp.getTime() : NaN;
+        const detectedAtMs = event.detectedAt instanceof Date ? event.detectedAt.getTime() : NaN;
+        const executedAtMs = Date.now();
+
+        if (Number.isFinite(sourceAtMs)) {
+          paperEndToEndLatency.observe(
+            { segment: 'source_to_execution' },
+            Math.max(0, executedAtMs - sourceAtMs),
+          );
+        }
+        if (Number.isFinite(detectedAtMs)) {
+          paperEndToEndLatency.observe(
+            { segment: 'detection_to_execution' },
+            Math.max(0, executedAtMs - detectedAtMs),
+          );
+        }
+      }
+
       if (consecutiveFailures >= 5) {
         autoPausedByFailure = true;
         await db.paperCopySession.update({
@@ -1118,7 +1230,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
             threshold: 5,
           },
         });
-        lastEventTs = event.eventTimestamp;
+        advanceWatermark(event.eventTimestamp);
         break;
       }
 
@@ -1143,7 +1255,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         projectedGrossExposure = Math.max(0, projectedGrossExposure);
       }
 
-      lastEventTs = event.eventTimestamp;
+      advanceWatermark(event.eventTimestamp);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown decision/execution error';
       await db.paperCopyDecision
@@ -1218,6 +1330,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
       }
     }
   }
+  paperPipelineLatency.observe({ stage: 'decision_loop' }, Date.now() - decisionLoopStartedMs);
 
   // Flush accumulated cash + watermark in one update
   await db.paperCopySession.update({
@@ -1234,9 +1347,14 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
 
   await materializePaperSessionState(sessionId);
   await _writeSnapshot(sessionId);
-  await closeResolvedPositions(sessionId).catch((err) =>
-    logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)'),
-  );
+  const autoCloseResult = await closeResolvedPositions(sessionId).catch((err) => {
+    logger.warn({ sessionId, err }, 'auto-close-resolved failed (non-fatal)');
+    return null;
+  });
+  if (autoCloseResult && Number(autoCloseResult.closed) > 0) {
+    await _writeSnapshot(sessionId, { force: true });
+  }
+  paperPipelineLatency.observe({ stage: 'tick_total' }, Date.now() - tickStartedMs);
 }
 
 // ---------------------------------------------------------------------------

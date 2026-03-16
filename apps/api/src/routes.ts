@@ -7,6 +7,7 @@ import { metricsRegistry } from './lib/metrics.js';
 import { prisma } from './lib/prisma.js';
 import { eventBus, loadRecentEvents } from './modules/event-stream.js';
 import { getRuntimeOpsSnapshot } from './modules/runtime-ops.js';
+import { getLatencyProfileState, setLatencyProfile } from './modules/latency-profile.js';
 import { scheduleWalletPolls } from './modules/ingestion.js';
 import { getLatestMarketIntelligence } from './modules/market-intelligence.js';
 import { processWalletPoll } from './modules/ingestion.js';
@@ -40,7 +41,11 @@ import {
 } from './modules/profile-parity-routes.js';
 import { buildProfileSummary } from './modules/profile-parity.js';
 import { registerPaperSessionMarketRoutes } from './paper-session-market-routes.js';
-import { buildTradeAttribution, toNullableNumber } from './modules/paper-api-mappers.js';
+import {
+  buildTradeAttribution,
+  resolveAttributionPositionKey,
+  toNullableNumber,
+} from './modules/paper-api-mappers.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -75,6 +80,10 @@ const smartConfigSchema = z.object({
   topRankedWalletsOnly: z.boolean().optional(),
   topRankMinWinRate: z.number().nullable().optional(),
   topRankMinSharpeLike: z.number().nullable().optional(),
+});
+
+const latencyProfileUpdateSchema = z.object({
+  profile: z.enum(['NORMAL', 'TURBO']),
 });
 
 const dataAdapter = createPolymarketDataAdapter();
@@ -297,6 +306,15 @@ export async function registerRoutes(app: any): Promise<void> {
   app.get('/metrics', async (_: any, reply: any) => {
     reply.header('content-type', metricsRegistry.contentType);
     return metricsRegistry.metrics();
+  });
+
+  app.get('/admin/latency-profile', async () => {
+    return getLatencyProfileState();
+  });
+
+  app.post('/admin/latency-profile', async (req: any) => {
+    const body = latencyProfileUpdateSchema.parse(req.body ?? {});
+    return setLatencyProfile(body.profile);
   });
 
   app.get('/alerts/system', async (req: any) => {
@@ -1993,7 +2011,6 @@ export async function registerRoutes(app: any): Promise<void> {
         const eventTs = event.eventTimestamp as Date;
         const marketId = String(event.marketId ?? '');
         const outcome = event.outcome ? String(event.outcome).toUpperCase() : null;
-        const key = outcome ? `${marketId}:${outcome}` : null;
         const decision = decisionBySourceId.get(String(event.id));
         const sizingInputs =
           decision?.sizingInputsJson && typeof decision.sizingInputsJson === 'object'
@@ -2009,6 +2026,12 @@ export async function registerRoutes(app: any): Promise<void> {
           (decision?.trades as Array<Record<string, unknown>> | undefined) ?? [];
         const latestTrade = decisionTrades[0];
         const tradeAction = latestTrade?.action ? String(latestTrade.action) : '';
+        const key = resolveAttributionPositionKey({
+          marketId,
+          sourceOutcome: outcome,
+          decisionOutcome: decision?.outcome,
+          tradeOutcome: latestTrade?.outcome,
+        });
 
         let ourAction: 'COPIED' | 'SKIPPED' | 'AUTO_CLOSED' | 'OPEN' | null = null;
         if (decisionStatus === 'SKIPPED') {

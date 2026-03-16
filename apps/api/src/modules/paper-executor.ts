@@ -3,6 +3,17 @@ import type { PaperCopySession } from '@prisma/client';
 import { prisma } from '../lib/prisma.js';
 import { PAPER_REASON_CODES } from './paper-decisioning.js';
 
+function isDuplicateSourceEventConflict(error: unknown): boolean {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code ?? '')
+      : '';
+  if (code !== 'P2002') return false;
+
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('sessionId') && message.includes('sourceActivityEventId');
+}
+
 export type PaperExecutionResult = {
   status: 'EXECUTED' | 'FAILED' | 'SKIPPED';
   reasonCode: string;
@@ -100,9 +111,9 @@ export class PaperLedgerExecutor implements PaperExecutorPort {
           notional,
           feeApplied,
           slippageApplied:
-            decision.sourcePrice !== null
+            decision.sourcePrice !== null && decision.sourcePrice !== undefined
               ? fillPrice - Number(decision.sourcePrice)
-              : Number(session.slippageBps) / 10_000,
+              : 0,
           eventTimestamp: decision.sourceEventTimestamp ?? now,
           processedAt: now,
           reasoning: {
@@ -130,6 +141,31 @@ export class PaperLedgerExecutor implements PaperExecutorPort {
         errorMessage: null,
       };
     } catch (error) {
+      if (decision.sourceActivityEventId && isDuplicateSourceEventConflict(error)) {
+        const existing = await prisma.paperCopyTrade.findFirst({
+          where: {
+            sessionId: session.id,
+            sourceActivityEventId: String(decision.sourceActivityEventId),
+          },
+          select: { id: true },
+        });
+
+        if (existing) {
+          // Idempotent replay: the ledger row already exists, so converge to EXECUTED
+          // without re-applying projected deltas.
+          return {
+            status: 'EXECUTED',
+            reasonCode: decision.reasonCode,
+            humanReason: decision.humanReason,
+            cashDelta: 0,
+            fillShares: 0,
+            fillPrice,
+            tradeId: existing.id,
+            errorMessage: null,
+          };
+        }
+      }
+
       const errorMessage = error instanceof Error ? error.message : 'Unknown insert failure';
       return {
         status: 'FAILED',

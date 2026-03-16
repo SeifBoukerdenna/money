@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildTradeAttribution, toNullableNumber } from '../src/modules/paper-api-mappers.js';
+import {
+  buildTradeAttribution,
+  resolveAttributionPositionKey,
+  toNullableNumber,
+} from '../src/modules/paper-api-mappers.js';
 
 describe('paper-api-mappers', () => {
   it('preserves legitimate zero numeric values', () => {
@@ -71,5 +75,24 @@ describe('paper-api-mappers', () => {
 
     expect(attribution.eventRealizedPnlGrossByTradeId.get('s1')).toBeCloseTo(-10, 8);
     expect(attribution.cumulativeRealizedPnlGrossByPositionKey.get('m2:NO')).toBeCloseTo(-10, 8);
+  });
+
+  it('builds attribution key from decision/trade outcome when source outcome is null', () => {
+    expect(
+      resolveAttributionPositionKey({
+        marketId: 'm3',
+        sourceOutcome: null,
+        decisionOutcome: 'yes',
+      }),
+    ).toBe('m3:YES');
+
+    expect(
+      resolveAttributionPositionKey({
+        marketId: 'm4',
+        sourceOutcome: null,
+        decisionOutcome: null,
+        tradeOutcome: 'no',
+      }),
+    ).toBe('m4:NO');
   });
 });

@@ -97,6 +97,23 @@ function createPrismaMock(state: MockState) {
         Object.assign(row, data, { updatedAt: new Date() });
         return row;
       }),
+      findUnique: vi.fn(async ({ where, select }) => {
+        const key = where?.sessionId_sourceActivityEventId;
+        if (!key) return null;
+        const row =
+          state.decisions.find(
+            (d) =>
+              d.sessionId === key.sessionId &&
+              d.sourceActivityEventId === key.sourceActivityEventId,
+          ) ?? null;
+        if (!row || !select) return row;
+
+        const selected: Record<string, any> = {};
+        for (const [k, v] of Object.entries(select)) {
+          if (v) selected[k] = row[k];
+        }
+        return selected;
+      }),
       findMany: vi.fn(async ({ where }) => {
         return state.decisions.filter((row) => {
           if (where?.sessionId && row.sessionId !== where.sessionId) return false;
@@ -233,6 +250,11 @@ function createPrismaMock(state: MockState) {
         return (
           state.trades.find((row) => {
             if (where?.sessionId && row.sessionId !== where.sessionId) return false;
+            if (
+              where?.sourceActivityEventId !== undefined &&
+              row.sourceActivityEventId !== where.sourceActivityEventId
+            )
+              return false;
             if (where?.marketId && row.marketId !== where.marketId) return false;
             if (where?.outcome && row.outcome !== where.outcome) return false;
             if (where?.action && row.action !== where.action) return false;
@@ -246,6 +268,9 @@ function createPrismaMock(state: MockState) {
         return state.activityEvents
           .filter((event) => {
             if (event.trackedWalletId !== where.trackedWalletId) {
+              return false;
+            }
+            if (where.eventTimestamp?.gte && event.eventTimestamp < where.eventTimestamp.gte) {
               return false;
             }
             if (where.eventTimestamp?.gt && event.eventTimestamp <= where.eventTimestamp.gt) {
@@ -288,6 +313,9 @@ function createPrismaMock(state: MockState) {
         return rows[0] ?? null;
       }),
     },
+    walletAnalyticsSnapshot: {
+      findFirst: vi.fn(async () => null),
+    },
     paperPortfolioSnapshot: {
       create: vi.fn(async ({ data }) => {
         const row = { id: `snap-${state.snapshots.length + 1}`, ...data };
@@ -310,6 +338,7 @@ type SetupResult = {
   adapterMock: {
     getWalletPositions: ReturnType<typeof vi.fn>;
   };
+  forceCloseMock: ReturnType<typeof vi.fn>;
   paperCopy: typeof import('../src/modules/paper-copy.js');
 };
 
@@ -319,6 +348,13 @@ async function setup(): Promise<SetupResult> {
   const adapterMock = {
     getWalletPositions: vi.fn(async () => []),
   };
+  const forceCloseMock = vi.fn(async () => ({
+    checked: 0,
+    closed: 0,
+    totalRealizedPnl: 0,
+    totalCashReturned: 0,
+    closedMarkets: [],
+  }));
 
   vi.doMock('../src/lib/prisma.js', () => ({
     prisma: createPrismaMock(state),
@@ -329,9 +365,12 @@ async function setup(): Promise<SetupResult> {
   vi.doMock('../src/modules/polymarket.js', () => ({
     createPolymarketDataAdapter: () => adapterMock,
   }));
+  vi.doMock('../src/modules/force-close.js', () => ({
+    closeResolvedPositions: forceCloseMock,
+  }));
 
   const paperCopy = await import('../src/modules/paper-copy.js');
-  return { state, adapterMock, paperCopy };
+  return { state, adapterMock, forceCloseMock, paperCopy };
 }
 
 function createActivityEvent(input: {
@@ -641,6 +680,233 @@ describe('paper copy engine (mocked)', () => {
     expect(updated.status).toBe('RUNNING');
   });
 
+  it('treats pre-existing execution for same source event as idempotent (no duplicate trade)', async () => {
+    const { state, adapterMock, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+    adapterMock.getWalletPositions.mockResolvedValue([]);
+
+    const session = await paperCopy.createPaperCopySession({
+      trackedWalletId: 'wallet-1',
+      startingCash: 10000,
+      feeBps: 10,
+      slippageBps: 8,
+      minNotionalThreshold: 1,
+    });
+
+    await paperCopy.startPaperCopySession(session.id);
+
+    const started = state.sessions.find((s) => s.id === session.id)!;
+    const eventTs = new Date(started.startedAt.getTime() + 1000);
+
+    state.activityEvents.push(
+      createActivityEvent({
+        id: 'evt-dup',
+        trackedWalletId: 'wallet-1',
+        side: 'BUY',
+        marketId: 'dup-market',
+        outcome: 'YES',
+        shares: 10,
+        price: 0.5,
+        eventTimestamp: eventTs,
+      }),
+    );
+
+    state.decisions.push({
+      id: 'decision-dup',
+      sessionId: session.id,
+      sourceActivityEventId: 'evt-dup',
+      status: 'PENDING',
+      reasonCode: 'COPY_APPROVED',
+      humanReason: 'pending replay recovery',
+      decisionType: 'COPY',
+      marketId: 'dup-market',
+      marketQuestion: 'Will BTC close above 70k?',
+      outcome: 'YES',
+      side: 'BUY',
+      sourceShares: 10,
+      simulatedShares: 10,
+      sourcePrice: 0.5,
+      intendedFillPrice: 0.5,
+      copyRatio: 1,
+      sizingInputsJson: {},
+      riskChecksJson: {},
+      notes: null,
+      executionError: 'old transient error',
+      createdAt: eventTs,
+      updatedAt: eventTs,
+    });
+
+    state.trades.push({
+      id: 'trade-dup',
+      sessionId: session.id,
+      trackedWalletId: 'wallet-1',
+      walletAddress: '0xwallet',
+      sourceType: 'WALLET_ACTIVITY',
+      sourceEventTimestamp: eventTs,
+      sourceTxHash: null,
+      executorType: 'PAPER_EXECUTOR',
+      isBootstrap: false,
+      sourceActivityEventId: 'evt-dup',
+      decisionId: 'decision-dup',
+      marketId: 'dup-market',
+      marketQuestion: 'Will BTC close above 70k?',
+      outcome: 'YES',
+      side: 'BUY',
+      action: 'COPY',
+      sourcePrice: 0.5,
+      simulatedPrice: 0.5,
+      sourceShares: 10,
+      simulatedShares: 10,
+      notional: 5,
+      feeApplied: 0.005,
+      slippageApplied: 0,
+      eventTimestamp: eventTs,
+      processedAt: eventTs,
+      reasoning: {},
+    });
+
+    const beforeTradeCount = state.trades.length;
+    await paperCopy.processPaperSessionTick(session.id);
+
+    expect(state.trades.length).toBe(beforeTradeCount);
+    const decisionsForEvent = state.decisions.filter((d) => d.sourceActivityEventId === 'evt-dup');
+    expect(decisionsForEvent.length).toBeGreaterThan(0);
+    expect(decisionsForEvent.some((d) => d.status === 'FAILED')).toBe(false);
+  });
+
+  it('does not double-execute when the same source event appears twice in one overlapped batch', async () => {
+    const { state, adapterMock, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+    adapterMock.getWalletPositions.mockResolvedValue([]);
+
+    const session = await paperCopy.createPaperCopySession({
+      trackedWalletId: 'wallet-1',
+      startingCash: 10000,
+      feeBps: 10,
+      slippageBps: 0,
+      minNotionalThreshold: 1,
+    });
+
+    await paperCopy.startPaperCopySession(session.id);
+    const started = state.sessions.find((s) => s.id === session.id)!;
+    const ts = new Date(started.startedAt.getTime() + 1000);
+
+    const duplicateEvent = createActivityEvent({
+      id: 'evt-overlap-dup',
+      trackedWalletId: 'wallet-1',
+      side: 'BUY',
+      marketId: 'dup-batch-market',
+      outcome: 'YES',
+      shares: 20,
+      price: 0.5,
+      eventTimestamp: ts,
+    });
+
+    // Simulate overlap-window duplication from polling where same logical source
+    // row is fetched twice in a single tick payload.
+    state.activityEvents.push(duplicateEvent, { ...duplicateEvent });
+
+    await paperCopy.processPaperSessionTick(session.id);
+
+    const executedForEvent = state.trades.filter(
+      (t) => t.sourceActivityEventId === 'evt-overlap-dup' && t.action !== 'BOOTSTRAP',
+    );
+    expect(executedForEvent.length).toBeLessThanOrEqual(1);
+
+    const decisionsForEvent = state.decisions.filter(
+      (d) => d.sourceActivityEventId === 'evt-overlap-dup',
+    );
+    expect(decisionsForEvent.length).toBeGreaterThan(0);
+    expect(decisionsForEvent.filter((d) => d.status === 'EXECUTED').length).toBeLessThanOrEqual(1);
+  });
+
+  it('remains idempotent under high-volume duplicate ingestion with metadata variance', async () => {
+    const { state, adapterMock, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+    adapterMock.getWalletPositions.mockResolvedValue([]);
+
+    const session = await paperCopy.createPaperCopySession({
+      trackedWalletId: 'wallet-1',
+      startingCash: 500000,
+      feeBps: 10,
+      slippageBps: 0,
+      minNotionalThreshold: 0,
+    });
+
+    await paperCopy.startPaperCopySession(session.id);
+    const started = state.sessions.find((s) => s.id === session.id)!;
+    const base = started.startedAt.getTime();
+
+    const uniqueEventIds: string[] = [];
+    for (let i = 0; i < 250; i += 1) {
+      const id = `evt-hv-${i}`;
+      uniqueEventIds.push(id);
+      const ts = new Date(base + (i + 1) * 1000);
+      const canonical = createActivityEvent({
+        id,
+        trackedWalletId: 'wallet-1',
+        side: 'BUY',
+        marketId: `market-${i % 7}`,
+        outcome: i % 2 === 0 ? 'YES' : 'NO',
+        shares: 10 + (i % 4),
+        price: 0.3 + (i % 5) * 0.05,
+        eventTimestamp: ts,
+      });
+      const duplicateWithDifferentMetadata = {
+        ...canonical,
+        shares: canonical.shares + 1,
+        price: canonical.price + 0.01,
+      };
+      state.activityEvents.push(canonical, duplicateWithDifferentMetadata);
+    }
+
+    await paperCopy.processPaperSessionTick(session.id);
+
+    const nonBootstrap = state.trades.filter(
+      (t) => t.sessionId === session.id && t.action !== 'BOOTSTRAP',
+    );
+    const executedEventIds = new Set(
+      nonBootstrap.map((t) => String(t.sourceActivityEventId)).filter((id) => id !== 'null'),
+    );
+
+    expect(executedEventIds.size).toBeLessThanOrEqual(uniqueEventIds.length);
+    expect(nonBootstrap.length).toBeLessThanOrEqual(uniqueEventIds.length);
+
+    const tradeCountAfterFirstPass = nonBootstrap.length;
+    const cashAfterFirstPass = Number(state.sessions.find((s) => s.id === session.id)!.currentCash);
+
+    for (let i = 0; i < 6; i += 1) {
+      await paperCopy.processPaperSessionTick(session.id);
+    }
+
+    const nonBootstrapAfterReplay = state.trades.filter(
+      (t) => t.sessionId === session.id && t.action !== 'BOOTSTRAP',
+    );
+    const cashAfterReplay = Number(state.sessions.find((s) => s.id === session.id)!.currentCash);
+
+    expect(nonBootstrapAfterReplay.length).toBe(tradeCountAfterFirstPass);
+    expect(cashAfterReplay).toBeCloseTo(cashAfterFirstPass, 8);
+
+    const executedPerSource = state.decisions
+      .filter((d) => d.sessionId === session.id)
+      .reduce((acc, d) => {
+        const key = String(d.sourceActivityEventId ?? 'null');
+        const prev = acc.get(key) ?? 0;
+        if (d.status === 'EXECUTED') {
+          acc.set(key, prev + 1);
+        }
+        return acc;
+      }, new Map<string, number>());
+
+    for (const count of executedPerSource.values()) {
+      expect(count).toBeLessThanOrEqual(1);
+    }
+
+    const sessionPositions = state.positions.filter((p) => p.sessionId === session.id);
+    const uniquePositionKeys = new Set(sessionPositions.map((p) => `${p.marketId}:${p.outcome}`));
+    expect(uniquePositionKeys.size).toBe(sessionPositions.length);
+  });
+
   it('stopping a session sets COMPLETED and writes a final snapshot/metric point', async () => {
     const { state, adapterMock, paperCopy } = await setup();
     state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
@@ -711,5 +977,31 @@ describe('paper copy engine (mocked)', () => {
     expect(Number(snapshot!.netLiquidationValue)).toBeCloseTo(10000, 8);
     expect(Number(snapshot!.totalPnl)).toBeCloseTo(0, 8);
     expect(Number(snapshot!.returnPct)).toBeCloseTo(0, 8);
+  });
+
+  it('forces a fresh snapshot when auto-close closes positions in no-event ticks', async () => {
+    const { state, adapterMock, forceCloseMock, paperCopy } = await setup();
+    state.watchedWallets.push({ id: 'wallet-1', address: '0xwallet' });
+    adapterMock.getWalletPositions.mockResolvedValue([]);
+
+    const session = await paperCopy.createPaperCopySession({
+      trackedWalletId: 'wallet-1',
+      startingCash: 1000,
+    });
+    await paperCopy.startPaperCopySession(session.id);
+
+    forceCloseMock.mockResolvedValueOnce({
+      checked: 1,
+      closed: 1,
+      totalRealizedPnl: 0,
+      totalCashReturned: 0,
+      closedMarkets: ['m1:YES'],
+    });
+
+    const beforeSnapshots = state.snapshots.length;
+    await paperCopy.processPaperSessionTick(session.id);
+
+    expect(state.snapshots.length).toBeGreaterThan(beforeSnapshots);
+    expect(forceCloseMock).toHaveBeenCalled();
   });
 });

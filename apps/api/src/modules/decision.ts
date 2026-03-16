@@ -1,11 +1,13 @@
 import { decideCopyOrder } from '@copytrader/risk-engine';
 
 import { decisionsCounter, skippedReasonCounter } from '../lib/metrics.js';
+import { config } from '../config.js';
 import { prisma } from '../lib/prisma.js';
 import { logger } from '../lib/logger.js';
 import { createPolymarketDataAdapter } from './polymarket.js';
 import { executionQueue } from './queue.js';
 import { evaluateSmartCopyFilters } from './smart-copy.js';
+import { isTurboModeEnabled } from './latency-profile.js';
 
 const dataAdapter = createPolymarketDataAdapter();
 
@@ -160,7 +162,10 @@ export async function processDecision(strategyId: string, tradeEventId: string):
         removeOnComplete: 1000,
         removeOnFail: 5000,
         attempts: 5,
-        backoff: { type: 'exponential', delay: 1000 },
+        backoff: {
+          type: 'exponential',
+          delay: isTurboModeEnabled() ? config.TURBO_EXECUTION_BACKOFF_MS : 1000,
+        },
       },
     );
   }

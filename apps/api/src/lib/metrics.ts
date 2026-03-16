@@ -45,6 +45,22 @@ export const copyLatency = new Histogram({
   registers: [metricsRegistry],
 });
 
+export const paperPipelineLatency = new Histogram({
+  name: 'copytrader_paper_pipeline_latency_ms',
+  help: 'Paper copy pipeline stage latency in milliseconds',
+  labelNames: ['stage'],
+  buckets: [10, 25, 50, 100, 250, 500, 1000, 3000, 5000, 10000, 30000],
+  registers: [metricsRegistry],
+});
+
+export const paperEndToEndLatency = new Histogram({
+  name: 'copytrader_paper_end_to_end_latency_ms',
+  help: 'Paper copy end-to-end latency segments in milliseconds',
+  labelNames: ['segment'],
+  buckets: [100, 500, 1000, 3000, 5000, 10000, 20000, 40000],
+  registers: [metricsRegistry],
+});
+
 export const decisionsCounter = new Counter({
   name: 'copytrader_decisions_total',
   help: 'Count of copy decisions by action',

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { LayoutShell } from '../components/layout-shell';
 import { MarketHistoryView } from '../components/position-history';
+import { TrendLine } from '../components/trend-line';
 
 const API = process.env.NEXT_PUBLIC_WEB_API_URL ?? 'http://localhost:4000';
 
@@ -77,6 +78,12 @@ type SessionAnalytics = {
     };
 };
 
+type LatencyProfileState = {
+    profile: 'NORMAL' | 'TURBO';
+    turboEnabled: boolean;
+    updatedAt: string;
+};
+
 type SourceSummary = {
     positionsValueUsd: number;
 };
@@ -85,6 +92,15 @@ type SourcePnlSummary = {
     netPnl: number;
     winRate: number;
     tradeCount: number;
+};
+
+type MetricPoint = {
+    timestamp: string;
+    totalPnl: number;
+    realizedPnl: number;
+    unrealizedPnl: number;
+    netLiquidationValue: number;
+    openPositionsCount: number;
 };
 
 type LiveFeedItem = {
@@ -122,6 +138,7 @@ type Position = {
 };
 
 type TabKey = 'live' | 'positions' | 'history' | 'market-history';
+type PnlRange = '1H' | '6H' | '24H' | 'ALL';
 type PositionSortKey = 'market' | 'outcome' | 'shares' | 'entry' | 'mark' | 'value' | 'pnl' | 'since';
 type SortDir = 'asc' | 'desc';
 
@@ -235,6 +252,7 @@ export default function SimulationPage() {
     const [liveFeed, setLiveFeed] = useState<LiveFeedItem[]>([]);
     const [openPositions, setOpenPositions] = useState<Position[]>([]);
     const [closedPositions, setClosedPositions] = useState<Position[]>([]);
+    const [metricPoints, setMetricPoints] = useState<MetricPoint[]>([]);
 
     const [creating, setCreating] = useState(false);
     const [err, setErr] = useState('');
@@ -242,6 +260,9 @@ export default function SimulationPage() {
     const [nowMs, setNowMs] = useState(Date.now());
     const [positionSortBy, setPositionSortBy] = useState<PositionSortKey>('since');
     const [positionSortDir, setPositionSortDir] = useState<SortDir>('desc');
+    const [pnlRange, setPnlRange] = useState<PnlRange>('24H');
+    const [latencyProfile, setLatencyProfile] = useState<LatencyProfileState | null>(null);
+    const [latencyProfileSaving, setLatencyProfileSaving] = useState(false);
 
     const loadWallets = useCallback(async () => {
         const r = await fetch(`${API}/wallets`).catch(() => null);
@@ -250,6 +271,13 @@ export default function SimulationPage() {
         const enabled = d.filter((w) => w.enabled);
         setWallets(enabled);
         setWalletId((cur) => cur || enabled[0]?.id || '');
+    }, []);
+
+    const loadLatencyProfile = useCallback(async () => {
+        const r = await fetch(`${API}/admin/latency-profile`).catch(() => null);
+        if (!r?.ok) return;
+        const d = (await r.json()) as LatencyProfileState;
+        setLatencyProfile(d);
     }, []);
 
     const loadSessions = useCallback(async () => {
@@ -324,10 +352,20 @@ export default function SimulationPage() {
         setLastUpdatedAt(Date.now());
     }, []);
 
+    const loadMetrics = useCallback(async (sid: string) => {
+        if (!sid) return;
+        const r = await fetch(`${API}/paper-copy-sessions/${sid}/metrics?limit=400`).catch(() => null);
+        if (!r?.ok) return;
+        const points = (await r.json()) as MetricPoint[];
+        setMetricPoints(points);
+        setLastUpdatedAt(Date.now());
+    }, []);
+
     useEffect(() => {
         loadWallets();
         loadSessions();
-    }, [loadWallets, loadSessions]);
+        loadLatencyProfile();
+    }, [loadWallets, loadSessions, loadLatencyProfile]);
 
     useEffect(() => {
         const timer = setInterval(() => {
@@ -335,6 +373,13 @@ export default function SimulationPage() {
         }, 10_000);
         return () => clearInterval(timer);
     }, [loadSessions]);
+
+    useEffect(() => {
+        const timer = setInterval(() => {
+            loadLatencyProfile();
+        }, 15_000);
+        return () => clearInterval(timer);
+    }, [loadLatencyProfile]);
 
     useEffect(() => {
         loadSourceStrip(walletId);
@@ -350,6 +395,7 @@ export default function SimulationPage() {
         loadDetail(activeSessionId);
         loadAnalytics(activeSessionId);
         loadClosedPositions(activeSessionId);
+        loadMetrics(activeSessionId);
         if (activeTab === 'live') loadLiveFeed(activeSessionId, feedLimit);
         if (activeTab === 'positions') {
             loadOpenPositions(activeSessionId);
@@ -363,6 +409,7 @@ export default function SimulationPage() {
         loadLiveFeed,
         loadOpenPositions,
         loadClosedPositions,
+        loadMetrics,
     ]);
 
     useEffect(() => {
@@ -370,9 +417,16 @@ export default function SimulationPage() {
         const timer = setInterval(() => {
             loadDetail(activeSessionId);
             loadAnalytics(activeSessionId);
+            loadMetrics(activeSessionId);
         }, 60_000);
         return () => clearInterval(timer);
-    }, [activeSessionId, loadDetail, loadAnalytics]);
+    }, [activeSessionId, loadDetail, loadAnalytics, loadMetrics]);
+
+    useEffect(() => {
+        if (!activeSessionId) return;
+        const timer = setInterval(() => loadMetrics(activeSessionId), 10_000);
+        return () => clearInterval(timer);
+    }, [activeSessionId, loadMetrics]);
 
     useEffect(() => {
         if (!activeSessionId) return;
@@ -472,6 +526,27 @@ export default function SimulationPage() {
             setFeedLimit(50);
         } finally {
             setCreating(false);
+        }
+    };
+
+    const setLatencyProfileMode = async (profile: 'NORMAL' | 'TURBO') => {
+        setErr('');
+        setLatencyProfileSaving(true);
+        try {
+            const r = await fetch(`${API}/admin/latency-profile`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ profile }),
+            }).catch(() => null);
+            if (!r?.ok) {
+                const body = r ? await r.text() : 'Unable to update latency profile.';
+                setErr(extractErrorMessage(body));
+                return;
+            }
+            const d = (await r.json()) as LatencyProfileState;
+            setLatencyProfile(d);
+        } finally {
+            setLatencyProfileSaving(false);
         }
     };
 
@@ -615,6 +690,34 @@ export default function SimulationPage() {
     const openValueCanonical = detail
         ? Math.max(0, detail.netLiquidationValue - detail.currentCash)
         : openLotsSummary.totalValue;
+    const filteredMetricPoints = useMemo(() => {
+        if (metricPoints.length === 0) return [] as MetricPoint[];
+        if (pnlRange === 'ALL') return metricPoints;
+
+        const now = Date.now();
+        const rangeMs =
+            pnlRange === '1H' ? 60 * 60 * 1000 : pnlRange === '6H' ? 6 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+        const cutoff = now - rangeMs;
+        const rows = metricPoints.filter((p) => {
+            const ts = new Date(p.timestamp).getTime();
+            return Number.isFinite(ts) && ts >= cutoff;
+        });
+        return rows.length > 1 ? rows : metricPoints;
+    }, [metricPoints, pnlRange]);
+
+    const pnlTrendPoints = useMemo(
+        () =>
+            filteredMetricPoints.map((p) => ({
+                t: p.timestamp,
+                v: Number(p.totalPnl ?? 0),
+            })),
+        [filteredMetricPoints],
+    );
+    const pnlTrendDelta =
+        pnlTrendPoints.length >= 2
+            ? (pnlTrendPoints[pnlTrendPoints.length - 1]?.v ?? 0) - (pnlTrendPoints[0]?.v ?? 0)
+            : detail?.totalPnl ?? 0;
+    const pnlTrendPositive = pnlTrendDelta >= 0;
 
     return (
         <LayoutShell>
@@ -645,6 +748,39 @@ export default function SimulationPage() {
                             <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Min Notional</label>
                             <input className="input mt-1" value={minNotional} onChange={(e) => setMinNotional(e.target.value)} placeholder="0" />
                         </div>
+                    </div>
+
+                    <div className="mt-4 flex flex-wrap items-center gap-3 rounded border border-slate-800/50 bg-slate-900/30 p-3">
+                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Latency Profile</p>
+                        <span
+                            className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold ${latencyProfile?.profile === 'TURBO'
+                                    ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                                    : 'border-slate-700 bg-slate-800/60 text-slate-300'
+                                }`}
+                        >
+                            {latencyProfile?.profile ?? 'UNKNOWN'}
+                        </span>
+                        <div className="flex items-center gap-2">
+                            <button
+                                className="btn-muted text-xs"
+                                disabled={latencyProfileSaving || latencyProfile?.profile === 'NORMAL'}
+                                onClick={() => setLatencyProfileMode('NORMAL')}
+                            >
+                                Normal
+                            </button>
+                            <button
+                                className="btn-primary h-8 px-3 text-xs"
+                                disabled={latencyProfileSaving || latencyProfile?.profile === 'TURBO'}
+                                onClick={() => setLatencyProfileMode('TURBO')}
+                            >
+                                Turbo
+                            </button>
+                        </div>
+                        <p className="text-xs text-slate-500">
+                            {latencyProfile
+                                ? `Updated ${shortDateTime(latencyProfile.updatedAt)}`
+                                : 'Profile status unavailable'}
+                        </p>
                     </div>
 
                     <div className="mt-4 flex flex-wrap items-end gap-3 rounded border border-slate-800/50 bg-slate-900/30 p-4">
@@ -834,6 +970,34 @@ export default function SimulationPage() {
                                 <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Slippage: <span className="font-semibold text-amber-300">{friction.avgSlippageBps.toFixed(2)} bps</span></div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Drift: <span className="font-semibold text-sky-300">{friction.avgDriftBps.toFixed(2)} bps</span></div>
                                 <div className="rounded border border-slate-700/50 bg-slate-800/20 p-2 text-xs text-slate-300">Avg Total Adverse: <span className="font-semibold text-rose-300">{friction.avgTotalAdverseBps.toFixed(2)} bps</span></div>
+                            </div>
+                            <div className="mt-3 rounded border border-slate-700/50 bg-slate-900/40 p-3">
+                                <div className="mb-2 flex items-center justify-between">
+                                    <div>
+                                        <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Net P&amp;L Progress</p>
+                                        <p className={`text-sm font-semibold ${pnlClass(pnlTrendDelta)}`}>
+                                            {fmtPnl(detail.totalPnl)}
+                                            <span className="ml-2 text-[11px] font-normal text-slate-400">
+                                                ({filteredMetricPoints.length} points, trend {pnlTrendPositive ? 'up' : 'down'} {fmtPnl(pnlTrendDelta)})
+                                            </span>
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <div className="flex overflow-hidden rounded border border-slate-700/60 bg-slate-900/50 text-[10px]">
+                                            {(['1H', '6H', '24H', 'ALL'] as PnlRange[]).map((range) => (
+                                                <button
+                                                    key={range}
+                                                    className={`px-2 py-1 ${pnlRange === range ? 'bg-slate-700 text-slate-100' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+                                                    onClick={() => setPnlRange(range)}
+                                                >
+                                                    {range}
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <p className="text-[10px] text-slate-500">Auto-refresh: 10s</p>
+                                    </div>
+                                </div>
+                                <TrendLine points={pnlTrendPoints} isPositive={pnlTrendPositive} />
                             </div>
                             <p className="mt-2 text-[11px] text-slate-500">Last updated: {lastUpdatedSeconds != null ? `${lastUpdatedSeconds}s ago` : '-'}</p>
                         </div>

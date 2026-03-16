@@ -27,8 +27,20 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   LIVE_TRADING_CONFIRMATION_TOKEN: z.string().default('I_UNDERSTAND_LIVE_TRADING_RISK'),
   POLYMARKET_API_BASE: z.string().url().default('https://clob.polymarket.com'),
+  LATENCY_TURBO_MODE: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
   INGEST_POLL_INTERVAL_MS: z.coerce.number().default(3000),
+  TURBO_INGEST_POLL_INTERVAL_MS: z.coerce.number().default(1000),
   INGEST_POLL_MAX_INTERVAL_MS: z.coerce.number().default(30000),
+  INGEST_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(4),
+  DECISION_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(2),
+  EXECUTION_WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(2),
+  TURBO_INGEST_BACKOFF_MS: z.coerce.number().default(200),
+  TURBO_DECISION_BACKOFF_MS: z.coerce.number().default(200),
+  TURBO_EXECUTION_BACKOFF_MS: z.coerce.number().default(300),
+  TURBO_SCHEDULE_BATCH_CONCURRENCY: z.coerce.number().int().min(1).max(128).default(60),
   RUNTIME_SCHEDULER_ENABLED: z
     .string()
     .default('true')
@@ -38,7 +50,8 @@ const envSchema = z.object({
   PORTFOLIO_SNAPSHOT_INTERVAL_MS: z.coerce.number().default(60000),
   WALLET_ANALYTICS_INTERVAL_MS: z.coerce.number().default(300000),
   MARKET_INTELLIGENCE_INTERVAL_MS: z.coerce.number().default(120000),
-  PAPER_TICK_INTERVAL_MS: z.coerce.number().default(5000),
+  PAPER_TICK_INTERVAL_MS: z.coerce.number().default(3000),
+  TURBO_PAPER_TICK_INTERVAL_MS: z.coerce.number().default(1500),
   RECONCILIATION_INTERVAL_MS: z.coerce.number().default(600000),
   OPS_MEMORY_SAMPLE_INTERVAL_MS: z.coerce.number().default(30000),
   PORTFOLIO_SNAPSHOT_RETENTION_ROWS: z.coerce.number().default(2000),
@@ -49,6 +62,9 @@ const envSchema = z.object({
   ACTIVE_WALLET_POLL_MS: z.coerce.number().default(5000),
   INACTIVE_WALLET_POLL_MIN_MS: z.coerce.number().default(30000),
   INACTIVE_WALLET_POLL_MAX_MS: z.coerce.number().default(60000),
+  TURBO_ACTIVE_WALLET_POLL_MS: z.coerce.number().default(1500),
+  TURBO_INACTIVE_WALLET_POLL_MIN_MS: z.coerce.number().default(10000),
+  TURBO_INACTIVE_WALLET_POLL_MAX_MS: z.coerce.number().default(20000),
   ACTIVE_WALLET_WINDOW_MINUTES: z.coerce.number().default(30),
   INGEST_OVERLAP_WINDOW_SEC: z.coerce.number().default(180),
   INGEST_BACKFILL_LOOKBACK_DAYS: z.coerce.number().default(30),
