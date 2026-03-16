@@ -280,20 +280,22 @@ describe('paper-ledger — pure accounting math', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────
-  // Fees affect realized PnL and cash
+  // Fees are separate from realized PnL
   // ────────────────────────────────────────────────────────────────────
   describe('Fee accounting', () => {
-    it('fees reduce realized pnl on sells', () => {
+    it('realized pnl stays gross while fees remain separate', () => {
       const entries: LedgerEntry[] = [
         entry({ side: 'BUY', shares: 100, price: 0.5, fee: 1.0 }),
         entry({ side: 'SELL', shares: 100, price: 0.6, fee: 1.2 }),
       ];
 
       const pos = reducePosition('market-1', 'YES', entries);
-      // Raw PnL: 100 * (0.60 - 0.50) = 10.0
-      // Sell fee: -1.2
-      // Realized PnL = 10.0 - 1.2 = 8.8
-      expect(pos.realizedPnl).toBeCloseTo(8.8, 6);
+      expect(pos.realizedPnl).toBeCloseTo(10.0, 6);
+
+      const portfolio = computePortfolio(1000, entries, new Map());
+      expect(portfolio.totalFees).toBeCloseTo(2.2, 6);
+      expect(portfolio.totalRealizedPnl).toBeCloseTo(10.0, 6);
+      expect(portfolio.totalPnl).toBeCloseTo(7.8, 6);
     });
 
     it('fees reduce cash balance on both buy and sell', () => {
@@ -307,6 +309,63 @@ describe('paper-ledger — pure accounting math', () => {
       // Sell: +(60 - 1.2) = +58.8
       // Cash = 1000 - 51 + 58.8 = 1007.8
       expect(cash).toBeCloseTo(1007.8, 6);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // BUY/SELL with slippage-like fill prices
+  // ────────────────────────────────────────────────────────────────────
+  describe('Fill-price accounting', () => {
+    it('BUY uses fill price for cost basis and cash', () => {
+      const entries: LedgerEntry[] = [entry({ side: 'BUY', shares: 100, price: 0.525, fee: 0.52 })];
+
+      const pos = reducePosition('market-1', 'YES', entries);
+      expect(pos.avgEntryPrice).toBeCloseTo(0.525, 8);
+
+      const portfolio = computePortfolio(1000, entries, new Map([['market-1:YES', 0.525]]));
+      expect(portfolio.cash).toBeCloseTo(946.98, 6);
+      expect(portfolio.totalFees).toBeCloseTo(0.52, 6);
+    });
+
+    it('SELL realizes only sold portion; repeated partial sells do not drift', () => {
+      const entries: LedgerEntry[] = [
+        entry({ side: 'BUY', shares: 100, price: 0.5 }),
+        entry({ side: 'SELL', shares: 40, price: 0.6, fee: 0.24 }),
+        entry({ side: 'SELL', shares: 30, price: 0.7, fee: 0.21 }),
+      ];
+
+      const pos = reducePosition('market-1', 'YES', entries);
+      expect(pos.netShares).toBeCloseTo(30, 6);
+      expect(pos.avgEntryPrice).toBeCloseTo(0.5, 8);
+      expect(pos.realizedPnl).toBeCloseTo(40 * 0.1 + 30 * 0.2, 6);
+
+      const portfolio = computePortfolio(1000, entries, new Map([['market-1:YES', 0.55]]));
+      expect(portfolio.totalFees).toBeCloseTo(0.45, 6);
+      expect(portfolio.totalPnl).toBeCloseTo(
+        portfolio.totalRealizedPnl + portfolio.totalUnrealizedPnl - portfolio.totalFees,
+        8,
+      );
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // REDEEM / close at zero should remain valid
+  // ────────────────────────────────────────────────────────────────────
+  describe('Zero-price close', () => {
+    it('SELL at zero closes position and keeps accounting finite', () => {
+      const entries: LedgerEntry[] = [
+        entry({ side: 'BUY', shares: 50, price: 0.2, fee: 0.1 }),
+        entry({ side: 'SELL', shares: 50, price: 0, action: 'REDEEM', fee: 0 }),
+      ];
+
+      const pos = reducePosition('market-1', 'YES', entries);
+      expect(pos.netShares).toBe(0);
+      expect(pos.status).toBe('CLOSED');
+      expect(pos.realizedPnl).toBeCloseTo(-10, 6);
+
+      const portfolio = computePortfolio(1000, entries, new Map());
+      expect(Number.isFinite(portfolio.cash)).toBe(true);
+      expect(portfolio.totalFees).toBeCloseTo(0.1, 6);
     });
   });
 
@@ -382,6 +441,20 @@ describe('paper-ledger — pure accounting math', () => {
 
       expect(portfolio.totalPnl).toBeCloseTo(portfolio.netLiquidationValue - 1000, 6);
     });
+
+    it('starting + realized + unrealized - fees = accountValue', () => {
+      const entries: LedgerEntry[] = [
+        entry({ side: 'BUY', shares: 100, price: 0.5, fee: 0.5 }),
+        entry({ side: 'SELL', shares: 60, price: 0.65, fee: 0.39 }),
+      ];
+      const marks = new Map([['market-1:YES', 0.58]]);
+      const portfolio = computePortfolio(1000, entries, marks);
+
+      const lhs =
+        1000 + portfolio.totalRealizedPnl + portfolio.totalUnrealizedPnl - portfolio.totalFees;
+      expect(lhs).toBeCloseTo(portfolio.netLiquidationValue, 6);
+      expect(portfolio.netPnl).toBeCloseTo(portfolio.totalPnl, 8);
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────
@@ -420,16 +493,16 @@ describe('paper-ledger — pure accounting math', () => {
       expect(result.positionMismatches[0].ledgerShares).toBeCloseTo(7, 6);
     });
 
-    it('detects open position with zero shares', () => {
+    it('ignores status metadata and reconciles based on shares only', () => {
       const entries: LedgerEntry[] = [
         entry({ side: 'BUY', shares: 10, price: 0.5 }),
         entry({ side: 'SELL', shares: 10, price: 0.55 }),
       ];
       const result = reconcile(1000, entries, computeCash(1000, entries), [
-        { marketId: 'market-1', outcome: 'YES', netShares: 0, status: 'OPEN' }, // should be CLOSED
+        { marketId: 'market-1', outcome: 'YES', netShares: 0, status: 'OPEN' },
       ]);
-      expect(result.valid).toBe(false);
-      expect(result.errors.some((e) => e.includes('zero shares but status is OPEN'))).toBe(true);
+      expect(result.valid).toBe(true);
+      expect(result.positionMismatches).toHaveLength(0);
     });
   });
 
@@ -500,6 +573,13 @@ describe('paper-ledger — pure accounting math', () => {
       const pos = reducePosition('market-1', 'YES', entries);
       expect(pos.netShares).toBe(0);
       expect(pos.realizedPnl).toBe(0);
+    });
+
+    it('skipped trade represented by no ledger row mutates nothing', () => {
+      const portfolio = computePortfolio(1000, [], new Map());
+      expect(portfolio.cash).toBe(1000);
+      expect(portfolio.positions).toHaveLength(0);
+      expect(portfolio.totalFees).toBe(0);
     });
   });
 });

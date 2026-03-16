@@ -51,8 +51,8 @@ export class PaperLedgerExecutor implements PaperExecutorPort {
     }
 
     const side = decision.side;
-    const fillPrice = decision.intendedFillPrice ? Number(decision.intendedFillPrice) : 0;
-    const fillShares = decision.simulatedShares ? Number(decision.simulatedShares) : 0;
+    const fillPrice = decision.intendedFillPrice != null ? Number(decision.intendedFillPrice) : 0;
+    const fillShares = decision.simulatedShares != null ? Number(decision.simulatedShares) : 0;
 
     // FIX: Allow fillPrice=0 for SELL (closing worthless positions).
     // REDEEM for losing outcomes has price=0. Old check rejected these.

@@ -68,8 +68,10 @@ export interface PortfolioState {
   closedPositions: ReducedPosition[];
   totalRealizedPnl: number;
   totalUnrealizedPnl: number;
+  totalFees: number;
   grossExposure: number;
   netLiquidationValue: number;
+  netPnl: number;
   totalPnl: number;
 }
 
@@ -125,7 +127,7 @@ export function scaleShares(sourceShares: number, copyRatio: number): number {
  *   - BUY-like actions (side=BUY) increase net shares
  *   - SELL-like actions (side=SELL) decrease net shares
  *   - Average entry price uses weighted average cost
- *   - Realized PnL = (sell_price - avg_entry_price) * shares_sold - fees_on_sell
+ *   - Realized PnL = (sell_price - avg_entry_price) * shares_sold (gross, before fees)
  *   - Net shares cannot go below zero (clamped with warning)
  *   - Position is CLOSED when net shares reach zero
  *
@@ -161,7 +163,7 @@ export function reducePosition(
         avgEntryPrice = (netShares * avgEntryPrice + entry.shares * entry.price) / newTotal;
       }
       netShares = roundShares(newTotal);
-      totalCostBasis += entry.shares * entry.price + entry.fee;
+      totalCostBasis += entry.shares * entry.price;
 
       if (openedAt === null) {
         openedAt = entry.timestamp;
@@ -171,8 +173,8 @@ export function reducePosition(
       const closeShares = Math.min(netShares, entry.shares);
       if (closeShares <= EPSILON) continue;
 
-      // Realized PnL: (sell_price - avg_entry) * shares - fee
-      realizedPnl += closeShares * (entry.price - avgEntryPrice) - entry.fee;
+      // Realized PnL is gross trading edge before fees.
+      realizedPnl += closeShares * (entry.price - avgEntryPrice);
       netShares = roundShares(Math.max(0, netShares - closeShares));
 
       if (netShares <= EPSILON) {
@@ -316,6 +318,7 @@ export function computePortfolio(
 
   // 6. Aggregate realized PnL
   const totalRealizedPnl = positions.reduce((sum, p) => sum + p.realizedPnl, 0);
+  const totalFees = entries.reduce((sum, entry) => sum + entry.fee, 0);
 
   // 7. Net liquidation value
   const openMarketValue = openPositions.reduce((sum, pos) => {
@@ -324,7 +327,8 @@ export function computePortfolio(
     return sum + pos.netShares * mark;
   }, 0);
   const netLiquidationValue = cash + openMarketValue;
-  const totalPnl = netLiquidationValue - startingCash;
+  const netPnl = totalRealizedPnl + totalUnrealizedPnl - totalFees;
+  const totalPnl = netPnl;
 
   return {
     cash,
@@ -333,8 +337,10 @@ export function computePortfolio(
     closedPositions,
     totalRealizedPnl,
     totalUnrealizedPnl,
+    totalFees,
     grossExposure,
     netLiquidationValue,
+    netPnl,
     totalPnl,
   };
 }
@@ -502,7 +508,7 @@ export function computeMarketTradeHistory(
     } else {
       const closeShares = Math.min(netShares, entry.shares);
       if (closeShares > EPSILON) {
-        tradeRealizedPnl = closeShares * (entry.price - avgEntryPrice) - entry.fee;
+        tradeRealizedPnl = closeShares * (entry.price - avgEntryPrice);
         netShares = roundShares(Math.max(0, netShares - closeShares));
         if (netShares <= EPSILON) {
           netShares = 0;
@@ -536,7 +542,8 @@ export interface MarketPerformanceSummary {
   outcome: string;
   totalInvested: number;
   totalReturned: number;
-  netRealizedPnl: number;
+  realizedPnl: number;
+  fees: number;
   currentNetShares: number;
   avgEntryPrice: number;
   status: 'OPEN' | 'CLOSED';
@@ -551,7 +558,8 @@ export interface MarketPerformanceSummary {
  * Each summary shows:
  *   - total $ invested (sum of buy notionals + fees)
  *   - total $ returned (sum of sell notionals - fees)
- *   - net realized PnL
+ *   - realized PnL (gross, before fees)
+ *   - total fees paid
  *   - current position size
  *   - trade counts
  *
@@ -579,6 +587,7 @@ export function computeMarketSummaries(entries: LedgerEntry[]): MarketPerformanc
 
     let totalInvested = 0;
     let totalReturned = 0;
+    let fees = 0;
     let buyCount = 0;
     let sellCount = 0;
     let posTracker = 0; // track shares for clamping
@@ -586,6 +595,7 @@ export function computeMarketSummaries(entries: LedgerEntry[]): MarketPerformanc
     for (const entry of groupEntries) {
       if (entry.side === 'BUY') {
         totalInvested += entry.shares * entry.price + entry.fee;
+        fees += entry.fee;
         posTracker = roundShares(posTracker + entry.shares);
         buyCount++;
       } else {
@@ -594,6 +604,7 @@ export function computeMarketSummaries(entries: LedgerEntry[]): MarketPerformanc
           totalReturned += closeShares * entry.price - entry.fee;
           posTracker = roundShares(Math.max(0, posTracker - closeShares));
         }
+        fees += entry.fee;
         sellCount++;
       }
     }
@@ -603,7 +614,8 @@ export function computeMarketSummaries(entries: LedgerEntry[]): MarketPerformanc
       outcome,
       totalInvested,
       totalReturned,
-      netRealizedPnl: pos.realizedPnl,
+      realizedPnl: pos.realizedPnl,
+      fees,
       currentNetShares: pos.netShares,
       avgEntryPrice: pos.avgEntryPrice,
       status: pos.status,

@@ -41,9 +41,20 @@ type LedgerWarning = {
     | 'OPEN_POSITION_ZERO_SHARES'
     | 'CLOSED_POSITION_POSITIVE_SHARES'
     | 'NON_FINITE_CASH'
-    | 'NON_FINITE_POSITION_VALUE';
+    | 'NON_FINITE_POSITION_VALUE'
+    | 'INVARIANT_ACCOUNTING_IDENTITY_MISMATCH'
+    | 'INVARIANT_ACCOUNT_VALUE_MISMATCH'
+    | 'INVARIANT_NET_PNL_SINCE_START_MISMATCH';
   message: string;
   context?: Record<string, unknown>;
+};
+
+export type AccountingInvariantReport = {
+  healthy: boolean;
+  maxAbsDrift: number;
+  accountingIdentityDrift: number;
+  accountValueCompositionDrift: number;
+  netPnlSinceStartDrift: number;
 };
 
 export type ReducedSessionState = {
@@ -56,6 +67,7 @@ export type ReducedSessionState = {
   grossExposure: number;
   openPositionsCount: number;
   warnings: LedgerWarning[];
+  invariants: AccountingInvariantReport;
   positions: PositionState[];
 };
 
@@ -289,15 +301,89 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
   const startingCapital = Number(session.startingCash);
   const totalPnl = netLiquidationValue - startingCapital;
 
-  if (Math.abs(startingCapital + realizedPnl + unrealizedPnl - fees - netLiquidationValue) > 0.05) {
+  const accountingIdentityDrift =
+    startingCapital + realizedPnl + unrealizedPnl - fees - netLiquidationValue;
+  const accountValueCompositionDrift = netLiquidationValue - (cash + openMarketValue);
+  const netPnlSinceStartDrift = totalPnl - (netLiquidationValue - startingCapital);
+  const maxAbsDrift = Math.max(
+    Math.abs(accountingIdentityDrift),
+    Math.abs(accountValueCompositionDrift),
+    Math.abs(netPnlSinceStartDrift),
+  );
+  const healthy = maxAbsDrift <= 0.05;
+
+  if (Math.abs(accountingIdentityDrift) > 0.05) {
+    warnings.push({
+      code: 'INVARIANT_ACCOUNTING_IDENTITY_MISMATCH',
+      message: 'startingCapital + realizedPnL + unrealizedPnL - fees does not match accountValue.',
+      context: {
+        sessionId,
+        startingCapital,
+        realizedPnl,
+        unrealizedPnl,
+        fees,
+        accountValue: netLiquidationValue,
+        drift: accountingIdentityDrift,
+      },
+    });
+  }
+  if (Math.abs(accountValueCompositionDrift) > 0.05) {
+    warnings.push({
+      code: 'INVARIANT_ACCOUNT_VALUE_MISMATCH',
+      message: 'accountValue does not match cash + openPositionMarketValue.',
+      context: {
+        sessionId,
+        accountValue: netLiquidationValue,
+        cash,
+        openPositionMarketValue: openMarketValue,
+        drift: accountValueCompositionDrift,
+      },
+    });
+  }
+  if (Math.abs(netPnlSinceStartDrift) > 0.05) {
+    warnings.push({
+      code: 'INVARIANT_NET_PNL_SINCE_START_MISMATCH',
+      message: 'netPnLSinceStart does not match accountValue - startingCapital.',
+      context: {
+        sessionId,
+        netPnLSinceStart: totalPnl,
+        accountValue: netLiquidationValue,
+        startingCapital,
+        drift: netPnlSinceStartDrift,
+      },
+    });
+  }
+
+  if (!healthy) {
     logger.warn(
-      { sessionId, startingCapital, realizedPnl, unrealizedPnl, fees, netLiquidationValue },
-      'Ledger reconciliation mismatch: startingCapital + realizedPnL + unrealizedPnL - fees != accountValue',
+      {
+        sessionId,
+        startingCapital,
+        realizedPnl,
+        unrealizedPnl,
+        fees,
+        cash,
+        openMarketValue,
+        netLiquidationValue,
+        accountingIdentityDrift,
+        accountValueCompositionDrift,
+        netPnlSinceStartDrift,
+      },
+      'Ledger invariant mismatch detected',
     );
   }
 
   logger.info(
-    { startingCapital, cash, positionValue: openMarketValue, accountValue: netLiquidationValue, realizedPnl, unrealizedPnl, fees, netPnl: totalPnl },
+    {
+      startingCapital,
+      cash,
+      positionValue: openMarketValue,
+      accountValue: netLiquidationValue,
+      realizedPnl,
+      unrealizedPnl,
+      fees,
+      netPnl: totalPnl,
+    },
     'Ledger reconciliation output explicit mathematical breakdown',
   );
 
@@ -311,6 +397,13 @@ export async function reducePaperSessionLedger(sessionId: string): Promise<Reduc
     grossExposure,
     openPositionsCount,
     warnings,
+    invariants: {
+      healthy,
+      maxAbsDrift,
+      accountingIdentityDrift,
+      accountValueCompositionDrift,
+      netPnlSinceStartDrift,
+    },
     positions,
   };
 }
@@ -366,7 +459,11 @@ export async function materializePaperSessionState(
 
   if (reduced.warnings.length > 0) {
     logger.warn(
-      { sessionId, warnings: reduced.warnings.length },
+      {
+        sessionId,
+        warnings: reduced.warnings.length,
+        invariantHealth: reduced.invariants,
+      },
       'paper ledger invariants warning',
     );
     await prisma.auditLog.create({
@@ -377,6 +474,7 @@ export async function materializePaperSessionState(
         payload: {
           sessionId,
           warnings: reduced.warnings,
+          invariants: reduced.invariants,
           checkedAt: new Date().toISOString(),
         } as Prisma.InputJsonValue,
       },

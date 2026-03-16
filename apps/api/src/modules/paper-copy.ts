@@ -637,11 +637,28 @@ export async function getSessionHealth(sessionId: string) {
   });
   if (!session) return null;
 
-  const latestEvent = await db.walletActivityEvent.findFirst({
-    where: { trackedWalletId: session.trackedWalletId },
-    orderBy: { eventTimestamp: 'desc' },
-    select: { eventTimestamp: true },
-  });
+  const [latestEvent, invariantAlert] = await Promise.all([
+    db.walletActivityEvent.findFirst({
+      where: { trackedWalletId: session.trackedWalletId },
+      orderBy: { eventTimestamp: 'desc' },
+      select: { eventTimestamp: true },
+    }),
+    db.systemAlert.findFirst({
+      where: {
+        sessionId,
+        alertType: 'PAPER_ACCOUNTING_INVARIANT_MISMATCH',
+      },
+      orderBy: { lastSeenAt: 'desc' },
+      select: {
+        severity: true,
+        status: true,
+        title: true,
+        message: true,
+        payloadJson: true,
+        lastSeenAt: true,
+      },
+    }),
+  ]);
 
   const nowMs = Date.now();
   const lastProcessedMs =
@@ -660,6 +677,17 @@ export async function getSessionHealth(sessionId: string) {
     walletLastSyncError: session.trackedWallet?.lastSyncError ?? null,
     walletNextPollAt: session.trackedWallet?.nextPollAt ?? null,
     latestSourceEventAt: latestEvent?.eventTimestamp ?? null,
+    accountingInvariant:
+      invariantAlert == null
+        ? null
+        : {
+            severity: invariantAlert.severity,
+            status: invariantAlert.status,
+            title: invariantAlert.title,
+            message: invariantAlert.message,
+            payload: invariantAlert.payloadJson,
+            lastSeenAt: invariantAlert.lastSeenAt,
+          },
   };
 }
 
@@ -1264,6 +1292,16 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
     Number(session.startingCash) > 0 ? (totalPnl / Number(session.startingCash)) * 100 : 0;
   const timestamp = new Date();
 
+  const accountingIdentityDrift =
+    Number(session.startingCash) + realizedPnl + unrealizedPnl - fees - netLiquidationValue;
+  const accountValueCompositionDrift = netLiquidationValue - (cash + openMarketValue);
+  const netPnlSinceStartDrift = totalPnl - (netLiquidationValue - Number(session.startingCash));
+  const maxAbsDrift = Math.max(
+    Math.abs(accountingIdentityDrift),
+    Math.abs(accountValueCompositionDrift),
+    Math.abs(netPnlSinceStartDrift),
+  );
+
   await db.paperPortfolioSnapshot.create({
     data: {
       sessionId,
@@ -1291,6 +1329,45 @@ async function _writeSnapshot(sessionId: string, opts: { force?: boolean } = {})
       openPositionsCount: openPos.length,
     },
   });
+
+  if (maxAbsDrift > 0.05) {
+    logger.error(
+      {
+        sessionId,
+        accountingIdentityDrift,
+        accountValueCompositionDrift,
+        netPnlSinceStartDrift,
+        maxAbsDrift,
+        startingCash: Number(session.startingCash),
+        cash,
+        openMarketValue,
+        netLiquidationValue,
+        realizedPnl,
+        unrealizedPnl,
+        fees,
+      },
+      'paper accounting invariant drift detected during snapshot write',
+    );
+
+    await raiseSystemAlert({
+      dedupeKey: `PAPER_ACCOUNTING_INVARIANT:${sessionId}`,
+      alertType: 'PAPER_ACCOUNTING_INVARIANT_MISMATCH',
+      severity: 'CRITICAL',
+      title: 'Paper accounting invariant mismatch',
+      message:
+        'Session accounting identities are out of tolerance; review reconciliation drift details.',
+      sessionId,
+      walletId: session.trackedWalletId,
+      payloadJson: {
+        sessionId,
+        accountingIdentityDrift,
+        accountValueCompositionDrift,
+        netPnlSinceStartDrift,
+        maxAbsDrift,
+        at: timestamp.toISOString(),
+      },
+    });
+  }
 
   // ---- Prune old rows to keep table size bounded ----
   // Both tables are pruned to MAX_METRIC_ROWS. We do this asynchronously after

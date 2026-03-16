@@ -27,7 +27,7 @@ export async function applyPaperFill(
   let realizedDelta = 0;
   if (!existing) {
     if (input.side === 'SELL') {
-      return { feePaid, realizedDelta: -feePaid };
+      return { feePaid, realizedDelta: 0 };
     }
     await prisma.position.create({
       data: {
@@ -36,11 +36,11 @@ export async function applyPaperFill(
         outcome: input.outcome,
         size: input.size,
         avgPrice: input.fillPrice,
-        realizedPnl: -feePaid,
+        realizedPnl: 0,
         unrealizedPnl: 0,
       },
     });
-    return { feePaid, realizedDelta: -feePaid };
+    return { feePaid, realizedDelta: 0 };
   }
 
   const currentSize = Number(existing.size);
@@ -58,13 +58,13 @@ export async function applyPaperFill(
       data: {
         size: newSize,
         avgPrice: newAvg,
-        realizedPnl: currentRealized - feePaid,
+        realizedPnl: currentRealized,
       },
     });
-    realizedDelta = -feePaid;
+    realizedDelta = 0;
   } else {
     const closeSize = Math.min(currentSize, input.size);
-    const pnl = closeSize * (input.fillPrice - currentAvg) - feePaid;
+    const pnl = closeSize * (input.fillPrice - currentAvg);
     const newSize = Math.max(0, currentSize - closeSize);
     await prisma.position.update({
       where: { id: existing.id },

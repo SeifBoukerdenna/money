@@ -40,6 +40,7 @@ import {
 } from './modules/profile-parity-routes.js';
 import { buildProfileSummary } from './modules/profile-parity.js';
 import { registerPaperSessionMarketRoutes } from './paper-session-market-routes.js';
+import { buildTradeAttribution, toNullableNumber } from './modules/paper-api-mappers.js';
 
 const walletCreateSchema = z.object({
   input: z.string().min(3),
@@ -1561,8 +1562,8 @@ export async function registerRoutes(app: any): Promise<void> {
         eventType: e.eventType,
         side: e.side,
         outcome: e.outcome,
-        price: e.price ? Number(e.price) : null,
-        shares: e.shares ? Number(e.shares) : null,
+        price: e.price != null ? Number(e.price) : null,
+        shares: e.shares != null ? Number(e.shares) : null,
         market: e.marketQuestion ?? e.marketId,
         ts: e.eventTimestamp,
         processed: processedIds.has(e.id),
@@ -1927,7 +1928,7 @@ export async function registerRoutes(app: any): Promise<void> {
 
     const sourceEventIds = sourceEvents.map((e) => String(e.id));
 
-    const [decisions, openPositions, closedPositions] = await Promise.all([
+    const [decisions, openPositions, allSessionTrades] = await Promise.all([
       sourceEventIds.length > 0
         ? db.paperCopyDecision.findMany({
             where: {
@@ -1937,7 +1938,7 @@ export async function registerRoutes(app: any): Promise<void> {
             include: {
               trades: {
                 orderBy: { eventTimestamp: 'desc' },
-                take: 1,
+                take: 5,
               },
             },
           })
@@ -1946,9 +1947,18 @@ export async function registerRoutes(app: any): Promise<void> {
         where: { sessionId: params.id, status: 'OPEN' },
         select: { marketId: true, outcome: true, netShares: true },
       }),
-      db.paperCopyPosition.findMany({
-        where: { sessionId: params.id, status: 'CLOSED' },
-        select: { marketId: true, outcome: true, realizedPnl: true },
+      db.paperCopyTrade.findMany({
+        where: { sessionId: params.id },
+        orderBy: [{ eventTimestamp: 'asc' }, { createdAt: 'asc' }],
+        select: {
+          id: true,
+          marketId: true,
+          outcome: true,
+          side: true,
+          simulatedPrice: true,
+          simulatedShares: true,
+          feeApplied: true,
+        },
       }),
     ]);
 
@@ -1966,12 +1976,17 @@ export async function registerRoutes(app: any): Promise<void> {
       });
     }
 
-    const closedByKey = new Map<string, { realizedPnl: number }>();
-    for (const p of closedPositions as Array<Record<string, unknown>>) {
-      closedByKey.set(`${String(p.marketId)}:${String(p.outcome).toUpperCase()}`, {
-        realizedPnl: Number(p.realizedPnl ?? 0),
-      });
-    }
+    const attribution = buildTradeAttribution(
+      (allSessionTrades as Array<Record<string, unknown>>).map((trade) => ({
+        id: String(trade.id),
+        marketId: String(trade.marketId ?? ''),
+        outcome: String(trade.outcome ?? ''),
+        side: String(trade.side ?? '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+        simulatedPrice: Number(trade.simulatedPrice ?? 0),
+        simulatedShares: Number(trade.simulatedShares ?? 0),
+        feeApplied: Number(trade.feeApplied ?? 0),
+      })),
+    );
 
     const items = sourceEvents
       .map((event) => {
@@ -2031,7 +2046,17 @@ export async function registerRoutes(app: any): Promise<void> {
           eventTimestamp: eventTs.toISOString(),
           ourAction,
           ourPnl:
-            ourAction === 'AUTO_CLOSED' && key ? (closedByKey.get(key)?.realizedPnl ?? null) : null,
+            ourAction === 'AUTO_CLOSED' && latestTrade?.id != null
+              ? (attribution.eventRealizedPnlGrossByTradeId.get(String(latestTrade.id)) ?? 0)
+              : null,
+          ourPnlCumulative:
+            ourAction === 'AUTO_CLOSED' && key
+              ? (attribution.cumulativeRealizedPnlGrossByPositionKey.get(key) ?? null)
+              : null,
+          ourFeeUsd:
+            latestTrade?.id != null
+              ? (attribution.feeByTradeId.get(String(latestTrade.id)) ?? null)
+              : null,
           ourAmountUsd:
             latestTrade?.notional != null && Number.isFinite(Number(latestTrade.notional))
               ? Number(latestTrade.notional)
@@ -2390,10 +2415,9 @@ export async function registerRoutes(app: any): Promise<void> {
       autoPauseOnHealthDegradation: Boolean(row.autoPauseOnHealthDegradation),
       consecutiveDecisionFailures: Number(row.consecutiveDecisionFailures ?? 0),
       lastAutoPausedAt: row.lastAutoPausedAt,
-      estimatedSourceExposure: row.estimatedSourceExposure
-        ? Number(row.estimatedSourceExposure)
-        : null,
-      copyRatio: row.copyRatio ? Number(row.copyRatio) : null,
+      estimatedSourceExposure:
+        row.estimatedSourceExposure != null ? Number(row.estimatedSourceExposure) : null,
+      copyRatio: row.copyRatio != null ? Number(row.copyRatio) : null,
       slippageBps: Number(row.slippageBps ?? 0),
       slippageConfig: row.slippageConfig ?? null,
       netLiquidationValue: nlv,
@@ -2576,9 +2600,9 @@ export async function registerRoutes(app: any): Promise<void> {
       side: row.side,
       action: row.action,
       sourceActivityEventId: row.sourceActivityEventId,
-      sourcePrice: row.sourcePrice ? Number(row.sourcePrice) : null,
+      sourcePrice: toNullableNumber(row.sourcePrice),
       simulatedPrice: Number(row.simulatedPrice),
-      sourceShares: row.sourceShares ? Number(row.sourceShares) : null,
+      sourceShares: toNullableNumber(row.sourceShares),
       simulatedShares: Number(row.simulatedShares),
       notional: Number(row.notional),
       feeApplied: Number(row.feeApplied),
@@ -2661,11 +2685,11 @@ export async function registerRoutes(app: any): Promise<void> {
         marketQuestion: row.marketQuestion,
         outcome: row.outcome,
         side: row.side,
-        sourceShares: row.sourceShares ? Number(row.sourceShares) : null,
-        simulatedShares: row.simulatedShares ? Number(row.simulatedShares) : null,
-        sourcePrice: row.sourcePrice ? Number(row.sourcePrice) : null,
-        intendedFillPrice: row.intendedFillPrice ? Number(row.intendedFillPrice) : null,
-        copyRatio: row.copyRatio ? Number(row.copyRatio) : null,
+        sourceShares: toNullableNumber(row.sourceShares),
+        simulatedShares: toNullableNumber(row.simulatedShares),
+        sourcePrice: toNullableNumber(row.sourcePrice),
+        intendedFillPrice: toNullableNumber(row.intendedFillPrice),
+        copyRatio: toNullableNumber(row.copyRatio),
         reasonCode: row.reasonCode,
         humanReason: row.humanReason,
         sizingInputs: row.sizingInputsJson,

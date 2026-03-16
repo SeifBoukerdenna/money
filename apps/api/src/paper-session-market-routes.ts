@@ -203,7 +203,7 @@ export function registerPaperSessionMarketRoutes(app: any) {
     // Sort
     switch (query.sortBy) {
       case 'pnl':
-        summaries.sort((a, b) => Math.abs(b.netRealizedPnl) - Math.abs(a.netRealizedPnl));
+        summaries.sort((a, b) => Math.abs(b.realizedPnl) - Math.abs(a.realizedPnl));
         break;
       case 'invested':
         summaries.sort((a, b) => b.totalInvested - a.totalInvested);
@@ -224,14 +224,20 @@ export function registerPaperSessionMarketRoutes(app: any) {
       marketCount: summaries.length,
       markets: summaries.map((s) => {
         const key = `${s.marketId}:${s.outcome}`;
+        const unrealizedPnl = unrealizedMap.get(key) ?? 0;
+        const netPnl = s.realizedPnl + unrealizedPnl - s.fees;
         return {
           marketId: s.marketId,
           outcome: s.outcome,
           marketQuestion: questionMap.get(key) ?? null,
           totalInvested: Math.round(s.totalInvested * 100) / 100,
           totalReturned: Math.round(s.totalReturned * 100) / 100,
-          netRealizedPnl: Math.round(s.netRealizedPnl * 100) / 100,
-          unrealizedPnl: Math.round((unrealizedMap.get(key) ?? 0) * 100) / 100,
+          realizedPnl: Math.round(s.realizedPnl * 100) / 100,
+          fees: Math.round(s.fees * 100) / 100,
+          netPnl: Math.round(netPnl * 100) / 100,
+          // Legacy alias kept for backwards compatibility with existing consumers.
+          netRealizedPnl: Math.round(s.realizedPnl * 100) / 100,
+          unrealizedPnl: Math.round(unrealizedPnl * 100) / 100,
           currentNetShares: s.currentNetShares,
           avgEntryPrice: s.avgEntryPrice,
           status: s.status,

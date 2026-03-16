@@ -97,6 +97,8 @@ type LiveFeedItem = {
     relativeTime: string;
     ourAction: 'COPIED' | 'SKIPPED' | 'AUTO_CLOSED' | 'OPEN' | null;
     ourPnl: number | null;
+    ourPnlCumulative?: number | null;
+    ourFeeUsd?: number | null;
     ourAmountUsd?: number | null;
     ourLatencyMs?: number | null;
     ourSlippageBps?: number | null;
@@ -117,18 +119,6 @@ type Position = {
     unrealizedPnl: number;
     openedAt: string;
     closedAt: string | null;
-};
-
-type PaperTrade = {
-    id: string;
-    marketId: string;
-    marketQuestion: string | null;
-    outcome: string;
-    side: 'BUY' | 'SELL';
-    action: string;
-    simulatedPrice: number;
-    simulatedShares: number;
-    eventTimestamp: string;
 };
 
 type TabKey = 'live' | 'positions' | 'history' | 'market-history';
@@ -245,7 +235,6 @@ export default function SimulationPage() {
     const [liveFeed, setLiveFeed] = useState<LiveFeedItem[]>([]);
     const [openPositions, setOpenPositions] = useState<Position[]>([]);
     const [closedPositions, setClosedPositions] = useState<Position[]>([]);
-    const [trades, setTrades] = useState<PaperTrade[]>([]);
 
     const [creating, setCreating] = useState(false);
     const [err, setErr] = useState('');
@@ -335,14 +324,6 @@ export default function SimulationPage() {
         setLastUpdatedAt(Date.now());
     }, []);
 
-    const loadTrades = useCallback(async (sid: string) => {
-        if (!sid) return;
-        const r = await fetch(`${API}/paper-copy-sessions/${sid}/trades?limit=500`).catch(() => null);
-        if (!r?.ok) return;
-        setTrades((await r.json()) as PaperTrade[]);
-        setLastUpdatedAt(Date.now());
-    }, []);
-
     useEffect(() => {
         loadWallets();
         loadSessions();
@@ -372,7 +353,6 @@ export default function SimulationPage() {
         if (activeTab === 'live') loadLiveFeed(activeSessionId, feedLimit);
         if (activeTab === 'positions') {
             loadOpenPositions(activeSessionId);
-            loadTrades(activeSessionId);
         }
     }, [
         activeSessionId,
@@ -382,7 +362,6 @@ export default function SimulationPage() {
         loadAnalytics,
         loadLiveFeed,
         loadOpenPositions,
-        loadTrades,
         loadClosedPositions,
     ]);
 
@@ -410,7 +389,6 @@ export default function SimulationPage() {
         const timer = setInterval(() => {
             if (activeTab === 'positions') {
                 loadOpenPositions(activeSessionId);
-                loadTrades(activeSessionId);
             }
             if (activeTab === 'history') loadClosedPositions(activeSessionId);
         }, 30_000);
@@ -421,7 +399,6 @@ export default function SimulationPage() {
         feedLimit,
         loadLiveFeed,
         loadOpenPositions,
-        loadTrades,
         loadClosedPositions,
     ]);
 
@@ -511,13 +488,9 @@ export default function SimulationPage() {
         await loadSessions();
     };
 
-    const forceClose = async (positionId: string | null, lotTradeId?: string) => {
+    const forceClose = async (positionId: string | null) => {
         if (!activeSessionId) return;
-        if (lotTradeId) {
-            await fetch(`${API}/paper-copy-sessions/${activeSessionId}/lots/${lotTradeId}/force-close`, {
-                method: 'POST',
-            });
-        } else if (positionId) {
+        if (positionId) {
             await fetch(`${API}/paper-copy-sessions/${activeSessionId}/positions/${positionId}/force-close`, {
                 method: 'POST',
             });
@@ -527,7 +500,6 @@ export default function SimulationPage() {
         await Promise.all([
             loadOpenPositions(activeSessionId),
             loadClosedPositions(activeSessionId),
-            loadTrades(activeSessionId),
             loadDetail(activeSessionId),
             loadAnalytics(activeSessionId),
         ]);
@@ -549,105 +521,17 @@ export default function SimulationPage() {
         };
     }, [closedPositions]);
 
-    const openLots = useMemo(() => {
-        const markByKey = new Map<string, { currentMarkPrice: number; positionId: string }>();
-        for (const p of openPositions) {
-            markByKey.set(`${p.marketId}:${p.outcome.toUpperCase()}`, {
-                currentMarkPrice: p.currentMarkPrice,
-                positionId: p.id,
-            });
-        }
-
-        type Lot = {
-            lotId: string;
-            positionId: string | null;
-            marketId: string;
-            marketQuestion: string | null;
-            outcome: string;
-            entryPrice: number;
-            remainingShares: number;
-            currentMarkPrice: number;
-            openedAt: string;
-            unrealizedPnl: number;
-        };
-
-        const queueByKey = new Map<string, Lot[]>();
-
-        const ascTrades = [...trades].sort(
-            (a, b) => new Date(a.eventTimestamp).getTime() - new Date(b.eventTimestamp).getTime(),
-        );
-
-        for (const t of ascTrades) {
-            const key = `${t.marketId}:${t.outcome.toUpperCase()}`;
-            const isSell =
-                t.side === 'SELL' ||
-                t.action.toUpperCase().includes('SELL') ||
-                t.action.toUpperCase().includes('CLOSE') ||
-                t.action.toUpperCase().includes('REDUCE') ||
-                t.action.toUpperCase().includes('REDEEM');
-
-            const shares = Math.max(0, Number(t.simulatedShares));
-            if (shares <= 0) continue;
-
-            if (!isSell) {
-                const currentMark = markByKey.get(key)?.currentMarkPrice ?? Number(t.simulatedPrice);
-                const lot: Lot = {
-                    lotId: t.id,
-                    positionId: markByKey.get(key)?.positionId ?? null,
-                    marketId: t.marketId,
-                    marketQuestion: t.marketQuestion,
-                    outcome: t.outcome,
-                    entryPrice: Number(t.simulatedPrice),
-                    remainingShares: shares,
-                    currentMarkPrice: currentMark,
-                    openedAt: t.eventTimestamp,
-                    unrealizedPnl: 0,
-                };
-                const q = queueByKey.get(key) ?? [];
-                q.push(lot);
-                queueByKey.set(key, q);
-                continue;
-            }
-
-            let remainingToClose = shares;
-            const q = queueByKey.get(key) ?? [];
-            for (const lot of q) {
-                if (remainingToClose <= 0) break;
-                if (lot.remainingShares <= 0) continue;
-                const consume = Math.min(lot.remainingShares, remainingToClose);
-                lot.remainingShares -= consume;
-                remainingToClose -= consume;
-            }
-            queueByKey.set(
-                key,
-                q.filter((lot) => lot.remainingShares > 1e-8),
-            );
-        }
-
-        const lots = Array.from(queueByKey.values())
-            .flat()
-            .map((lot) => {
-                const currentMark =
-                    markByKey.get(`${lot.marketId}:${lot.outcome.toUpperCase()}`)?.currentMarkPrice ??
-                    lot.currentMarkPrice;
-                const unrealizedPnl = (currentMark - lot.entryPrice) * lot.remainingShares;
-                return {
-                    ...lot,
-                    currentMarkPrice: currentMark,
-                    unrealizedPnl,
-                };
-            })
-            .sort((a, b) => new Date(a.openedAt).getTime() - new Date(b.openedAt).getTime());
-
-        return lots;
-    }, [trades, openPositions]);
+    const openPositionRows = useMemo(
+        () => [...openPositions].sort((a, b) => new Date(a.openedAt).getTime() - new Date(b.openedAt).getTime()),
+        [openPositions],
+    );
 
     const openLotsSummary = useMemo(() => {
-        const totalValue = openLots.reduce((sum, lot) => sum + lot.remainingShares * lot.currentMarkPrice, 0);
-        const totalUnrealizedPnl = openLots.reduce((sum, lot) => sum + lot.unrealizedPnl, 0);
-        const totalShares = openLots.reduce((sum, lot) => sum + lot.remainingShares, 0);
+        const totalValue = openPositionRows.reduce((sum, pos) => sum + pos.netShares * pos.currentMarkPrice, 0);
+        const totalUnrealizedPnl = openPositionRows.reduce((sum, pos) => sum + pos.unrealizedPnl, 0);
+        const totalShares = openPositionRows.reduce((sum, pos) => sum + pos.netShares, 0);
         return { totalValue, totalUnrealizedPnl, totalShares };
-    }, [openLots]);
+    }, [openPositionRows]);
 
     const realizedPnlSummary = useMemo(
         () => {
@@ -668,18 +552,18 @@ export default function SimulationPage() {
     }, [closedPositions]);
 
     const sortedOpenLots = useMemo(() => {
-        const rows = [...openLots];
+        const rows = [...openPositionRows];
         rows.sort((a, b) => {
-            const aValue = a.remainingShares * a.currentMarkPrice;
-            const bValue = b.remainingShares * b.currentMarkPrice;
+            const aValue = a.netShares * a.currentMarkPrice;
+            const bValue = b.netShares * b.currentMarkPrice;
             const aSince = new Date(a.openedAt).getTime();
             const bSince = new Date(b.openedAt).getTime();
 
             let cmp = 0;
             if (positionSortBy === 'market') cmp = (a.marketQuestion ?? a.marketId).localeCompare(b.marketQuestion ?? b.marketId);
             if (positionSortBy === 'outcome') cmp = a.outcome.localeCompare(b.outcome);
-            if (positionSortBy === 'shares') cmp = a.remainingShares - b.remainingShares;
-            if (positionSortBy === 'entry') cmp = a.entryPrice - b.entryPrice;
+            if (positionSortBy === 'shares') cmp = a.netShares - b.netShares;
+            if (positionSortBy === 'entry') cmp = a.avgEntryPrice - b.avgEntryPrice;
             if (positionSortBy === 'mark') cmp = a.currentMarkPrice - b.currentMarkPrice;
             if (positionSortBy === 'value') cmp = aValue - bValue;
             if (positionSortBy === 'pnl') cmp = a.unrealizedPnl - b.unrealizedPnl;
@@ -688,7 +572,7 @@ export default function SimulationPage() {
             return positionSortDir === 'asc' ? cmp : -cmp;
         });
         return rows;
-    }, [openLots, positionSortBy, positionSortDir]);
+    }, [openPositionRows, positionSortBy, positionSortDir]);
 
     const togglePositionSort = (key: PositionSortKey) => {
         if (positionSortBy === key) {
@@ -727,7 +611,7 @@ export default function SimulationPage() {
     const realizedValue = detail?.realizedPnl ?? realizedPnlSummary;
     const unrealizedValue = detail?.unrealizedPnl ?? openLotsSummary.totalUnrealizedPnl;
     const feesPaid = Math.abs(detail?.fees ?? 0);
-    const openCount = detail?.stats?.openPositionsCount ?? openLots.length;
+    const openCount = detail?.stats?.openPositionsCount ?? openPositionRows.length;
     const openValueCanonical = detail
         ? Math.max(0, detail.netLiquidationValue - detail.currentCash)
         : openLotsSummary.totalValue;
@@ -977,8 +861,14 @@ export default function SimulationPage() {
                                                         <td className="py-2 text-right text-slate-500">{item.relativeTime}</td>
                                                         <td className="py-2 text-right">
                                                             <span className={`rounded px-2 py-0.5 text-[10px] font-semibold ${item.ourAction === 'COPIED' ? 'bg-emerald-500/15 text-emerald-300' : item.ourAction === 'AUTO_CLOSED' ? ((item.ourPnl ?? 0) >= 0 ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300') : item.ourAction === 'OPEN' ? 'bg-amber-500/15 text-amber-300' : 'bg-slate-700/50 text-slate-300'}`}>
-                                                                {item.ourAction ?? '-'}{item.ourAction === 'AUTO_CLOSED' ? ` (${fmtPnl(item.ourPnl ?? 0)})` : ''}
+                                                                {item.ourAction ?? '-'}{item.ourAction === 'AUTO_CLOSED' ? ` (${fmtPnl(item.ourPnl ?? 0)} event)` : ''}
                                                             </span>
+                                                            {item.ourAction === 'AUTO_CLOSED' && item.ourPnlCumulative != null && (
+                                                                <p className="mt-1 text-[10px] text-slate-500">
+                                                                    cumulative position realized: {fmtPnl(item.ourPnlCumulative)}
+                                                                    {item.ourFeeUsd != null ? ` | fee: ${fmtUsd(item.ourFeeUsd)}` : ''}
+                                                                </p>
+                                                            )}
                                                             {item.ourAction === 'COPIED' && item.ourAmountUsd != null && (
                                                                 <p className="mt-1 text-[10px] text-slate-500">
                                                                     our fill: {fmtUsd(item.ourAmountUsd)}
@@ -1005,7 +895,7 @@ export default function SimulationPage() {
 
                                 {activeTab === 'positions' && (
                                     <div className="overflow-x-auto">
-                                        {openLots.length === 0 ? (
+                                        {openPositionRows.length === 0 ? (
                                             <p className="py-8 text-center text-sm text-slate-500">No open positions.</p>
                                         ) : (
                                             <>
@@ -1026,20 +916,20 @@ export default function SimulationPage() {
                                                     </thead>
                                                     <tbody className="divide-y divide-slate-800/25">
                                                         {sortedOpenLots.map((p) => {
-                                                            const value = p.remainingShares * p.currentMarkPrice;
+                                                            const value = p.netShares * p.currentMarkPrice;
                                                             return (
-                                                                <tr key={p.lotId}>
+                                                                <tr key={p.id}>
                                                                     <td className="max-w-[280px] truncate py-2 text-slate-200">{p.marketQuestion ?? p.marketId}</td>
                                                                     <td className="py-2 text-right text-slate-300">{p.outcome}</td>
-                                                                    <td className="py-2 text-right text-slate-300">{p.remainingShares.toFixed(2)}</td>
-                                                                    <td className="py-2 text-right text-slate-400">{p.entryPrice.toFixed(3)}</td>
+                                                                    <td className="py-2 text-right text-slate-300">{p.netShares.toFixed(2)}</td>
+                                                                    <td className="py-2 text-right text-slate-400">{p.avgEntryPrice.toFixed(3)}</td>
                                                                     <td className="py-2 text-right text-slate-300">{p.currentMarkPrice.toFixed(3)}</td>
                                                                     <td className="py-2 text-right text-slate-300">{fmtUsd(value)}</td>
                                                                     <td className={`py-2 text-right font-semibold ${pnlClass(p.unrealizedPnl)}`}>{fmtPnl(p.unrealizedPnl)}</td>
                                                                     <td className="py-2 text-right text-slate-500">{shortDateTime(p.openedAt)}</td>
                                                                     <td className="py-2 text-right">
-                                                                        {p.positionId ? (
-                                                                            <button className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[10px] text-rose-300" onClick={() => forceClose(p.positionId as string, p.lotId)}>x</button>
+                                                                        {p.id ? (
+                                                                            <button className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[10px] text-rose-300" onClick={() => forceClose(p.id)}>x</button>
                                                                         ) : (
                                                                             <span className="text-slate-600">-</span>
                                                                         )}
