@@ -87,6 +87,7 @@ async function evaluateSourceStartReadiness(trackedWalletId: string): Promise<{
       shares: true,
       notional: true,
       fee: true,
+      rawPayloadJson: true,
       eventTimestamp: true,
       createdAt: true,
     },
@@ -113,6 +114,10 @@ async function evaluateSourceStartReadiness(trackedWalletId: string): Promise<{
     shares: row.shares !== null ? Number(row.shares) : null,
     notional: row.notional !== null ? Number(row.notional) : null,
     fee: row.fee !== null ? Number(row.fee) : null,
+    feeIsInferred:
+      row.rawPayloadJson &&
+      typeof row.rawPayloadJson === 'object' &&
+      (row.rawPayloadJson as Record<string, unknown>).feeIsInferred === true,
     eventTimestamp: new Date(row.eventTimestamp),
     createdAt: new Date(row.createdAt ?? row.eventTimestamp),
   }));
@@ -1318,6 +1323,19 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         continue;
       }
 
+      const sourceAtMs =
+        event.eventTimestamp instanceof Date ? event.eventTimestamp.getTime() : NaN;
+      const detectedAtMs = event.detectedAt instanceof Date ? event.detectedAt.getTime() : NaN;
+      const persistedAtMs = Date.now();
+      const pollingLatencyMs =
+        Number.isFinite(sourceAtMs) && Number.isFinite(detectedAtMs)
+          ? Math.max(0, detectedAtMs - sourceAtMs)
+          : 0;
+      const totalObservedLatencyMs = Number.isFinite(sourceAtMs)
+        ? Math.max(0, persistedAtMs - sourceAtMs)
+        : 0;
+      const queueAndProcessingLatencyMs = Math.max(0, totalObservedLatencyMs - pollingLatencyMs);
+
       let liveMarketPrice: { bestAsk: number; bestBid: number; spreadBps?: number } | undefined;
       if (typeof event.marketId === 'string' && event.marketId.trim().length > 0) {
         try {
@@ -1349,6 +1367,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         projectedCash,
         projectedGrossExposure,
         positionStateByKey,
+        latencyMs: totalObservedLatencyMs,
         liveMarketPrice,
       });
 
@@ -1471,19 +1490,6 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
           executionError: execution.errorMessage,
         },
       });
-
-      const sourceAtMs =
-        event.eventTimestamp instanceof Date ? event.eventTimestamp.getTime() : NaN;
-      const detectedAtMs = event.detectedAt instanceof Date ? event.detectedAt.getTime() : NaN;
-      const persistedAtMs = Date.now();
-      const pollingLatencyMs =
-        Number.isFinite(sourceAtMs) && Number.isFinite(detectedAtMs)
-          ? Math.max(0, detectedAtMs - sourceAtMs)
-          : 0;
-      const totalObservedLatencyMs = Number.isFinite(sourceAtMs)
-        ? Math.max(0, persistedAtMs - sourceAtMs)
-        : 0;
-      const queueAndProcessingLatencyMs = Math.max(0, totalObservedLatencyMs - pollingLatencyMs);
 
       const existingSizingInputs =
         draft.sizingInputsJson && typeof draft.sizingInputsJson === 'object'

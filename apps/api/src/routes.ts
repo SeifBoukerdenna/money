@@ -74,6 +74,7 @@ type TrackedWalletEventRow = {
   shares: unknown;
   notional: unknown;
   fee: unknown;
+  rawPayloadJson: unknown;
   eventTimestamp: Date;
   createdAt: Date;
 };
@@ -91,6 +92,7 @@ type CachedTrackedWalletEvent = {
   shares: number | null;
   notional: number | null;
   fee: number | null;
+  feeIsInferred: boolean;
   eventTimestamp: Date;
   createdAt: Date;
 };
@@ -102,6 +104,11 @@ type TrackedWalletCacheCursor = {
 };
 
 function normalizeTrackedEventRow(row: TrackedWalletEventRow): CachedTrackedWalletEvent {
+  const feeIsInferred =
+    row.rawPayloadJson &&
+    typeof row.rawPayloadJson === 'object' &&
+    (row.rawPayloadJson as Record<string, unknown>).feeIsInferred === true;
+
   return {
     id: row.id,
     marketId: row.marketId,
@@ -115,6 +122,7 @@ function normalizeTrackedEventRow(row: TrackedWalletEventRow): CachedTrackedWall
     shares: row.shares !== null ? Number(row.shares) : null,
     notional: row.notional !== null ? Number(row.notional) : null,
     fee: row.fee !== null ? Number(row.fee) : null,
+    feeIsInferred,
     eventTimestamp: row.eventTimestamp,
     createdAt: row.createdAt,
   };
@@ -462,6 +470,7 @@ async function computeTrackedWalletPerformance(input: {
     shares: true,
     notional: true,
     fee: true,
+    rawPayloadJson: true,
     eventTimestamp: true,
     createdAt: true,
   } as const;
@@ -549,6 +558,7 @@ async function computeTrackedWalletPerformance(input: {
       shares: row.shares !== null ? Number(row.shares) : null,
       notional: row.notional !== null ? Number(row.notional) : null,
       fee: row.fee !== null ? Number(row.fee) : null,
+      feeIsInferred: row.feeIsInferred,
       eventTimestamp: row.eventTimestamp,
       createdAt: row.createdAt,
     })),
@@ -3490,6 +3500,7 @@ export async function registerRoutes(app: any): Promise<void> {
     const sourceComparison = buildSessionSourceComparison({
       sourceWinRate: Number(sourceWindow.winRate),
       sourceNetPnl: sourceWindow.netPnl,
+      paperNetPnl: Number((result as any).summary?.totalPnl ?? 0),
       closedPositions: closedPositions as Array<{ realizedPnl: unknown }>,
       startedAt,
       createdAtIso: new Date(session.createdAt as Date).toISOString(),

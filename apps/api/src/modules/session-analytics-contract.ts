@@ -5,6 +5,7 @@ export type ClosedPositionLike = {
 export type SessionSourceComparisonInput = {
   sourceWinRate: number;
   sourceNetPnl: number;
+  paperNetPnl?: number;
   closedPositions: ClosedPositionLike[];
   startedAt: string | null;
   createdAtIso: string;
@@ -18,6 +19,7 @@ export function buildSessionSourceComparison(input: SessionSourceComparisonInput
   sourceNetPnl: number;
   paperRealizedPnl: number;
   trackingEfficiencyPct: number;
+  trackingEfficiencyBasis: 'NET_VS_NET' | 'REALIZED_VS_NET';
   sessionStartDate: string;
   periodLabel: string;
 } {
@@ -29,8 +31,12 @@ export function buildSessionSourceComparison(input: SessionSourceComparisonInput
     (sum, p) => sum + Number(p.realizedPnl ?? 0),
     0,
   );
+  const hasPaperNetPnl =
+    typeof input.paperNetPnl === 'number' && Number.isFinite(input.paperNetPnl);
+  const trackingEfficiencyBasis = hasPaperNetPnl ? 'NET_VS_NET' : 'REALIZED_VS_NET';
+  const paperPnlForEfficiency = hasPaperNetPnl ? Number(input.paperNetPnl) : paperRealizedPnl;
   const trackingEfficiencyPct =
-    input.sourceNetPnl !== 0 ? (paperRealizedPnl / input.sourceNetPnl) * 100 : 0;
+    input.sourceNetPnl !== 0 ? (paperPnlForEfficiency / input.sourceNetPnl) * 100 : 0;
 
   const sessionStartDate = input.startedAt ?? input.createdAtIso;
   const sessionStartDateObj = new Date(sessionStartDate);
@@ -43,6 +49,7 @@ export function buildSessionSourceComparison(input: SessionSourceComparisonInput
     sourceNetPnl: input.sourceNetPnl,
     paperRealizedPnl,
     trackingEfficiencyPct,
+    trackingEfficiencyBasis,
     sessionStartDate,
     periodLabel: `Since ${sessionStartDateObj.toLocaleDateString('en-US', {
       month: 'short',

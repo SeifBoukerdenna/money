@@ -120,4 +120,31 @@ describe('win-rate response contracts', () => {
     expect(comparison.sourceNetPnl).toBe(200);
     expect(comparison).not.toHaveProperty('sourceRealizedPnl');
   });
+
+  it('trackingEfficiency uses NET_VS_NET when paperNetPnl is provided', () => {
+    const comparison = buildSessionSourceComparison({
+      sourceWinRate: 0.6,
+      sourceNetPnl: 200,
+      paperNetPnl: 180,
+      closedPositions: [{ realizedPnl: 150 }],
+      startedAt: '2026-03-16T00:00:00.000Z',
+      createdAtIso: '2026-03-15T00:00:00.000Z',
+    });
+
+    expect(comparison.trackingEfficiencyPct).toBeCloseTo(90, 10);
+    expect(comparison.trackingEfficiencyBasis).toBe('NET_VS_NET');
+  });
+
+  it('falls back to REALIZED_VS_NET when paperNetPnl is omitted', () => {
+    const comparison = buildSessionSourceComparison({
+      sourceWinRate: 0.6,
+      sourceNetPnl: 200,
+      closedPositions: [{ realizedPnl: 150 }],
+      startedAt: '2026-03-16T00:00:00.000Z',
+      createdAtIso: '2026-03-15T00:00:00.000Z',
+    });
+
+    expect(comparison.trackingEfficiencyPct).toBeCloseTo(75, 10);
+    expect(comparison.trackingEfficiencyBasis).toBe('REALIZED_VS_NET');
+  });
 });

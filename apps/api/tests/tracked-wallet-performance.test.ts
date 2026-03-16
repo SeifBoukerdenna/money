@@ -17,6 +17,7 @@ function event(input: {
   price?: number | null;
   notional?: number | null;
   fee?: number | null;
+  feeIsInferred?: boolean;
   marketId?: string;
   conditionId?: string | null;
   outcome?: string | null;
@@ -34,6 +35,7 @@ function event(input: {
     shares: input.shares ?? null,
     notional: input.notional ?? null,
     fee: input.fee ?? null,
+    feeIsInferred: input.feeIsInferred,
     eventTimestamp: new Date(input.ts),
     createdAt: new Date(input.ts),
   };
@@ -501,6 +503,38 @@ describe('tracked-wallet-performance reducer', () => {
     expect(reduced.summary.missingFeeEvents).toBe(2);
     expect(reduced.confidenceModel.hasMissingFees).toBe(true);
     expect(reduced.canonical.canonicalKnownNetPnl).toBeNull();
+  });
+
+  it('infers 2% fee from notional when fee field is absent and produces non-null canonicalKnownNetPnl with PARTIAL confidence', () => {
+    const reduced = reduceTrackedWalletEvents({
+      events: [
+        event({
+          id: 'if-1',
+          ts: '2026-03-01T00:00:00.000Z',
+          eventType: 'BUY',
+          side: 'BUY',
+          shares: 100,
+          price: 0.4,
+          fee: 0.8,
+          feeIsInferred: true,
+        }),
+        event({
+          id: 'if-2',
+          ts: '2026-03-01T00:05:00.000Z',
+          eventType: 'SELL',
+          side: 'SELL',
+          shares: 100,
+          price: 0.6,
+          fee: 1.2,
+          feeIsInferred: true,
+        }),
+      ],
+    });
+
+    expect(reduced.canonical.canonicalKnownNetPnl).not.toBeNull();
+    expect(reduced.canonical.canonicalFees).toBeCloseTo(2, 8);
+    expect(reduced.confidenceModel.hasInferredFees).toBe(true);
+    expect(reduced.confidenceModel.confidence).toBe('PARTIAL');
   });
 
   it('keeps canonical formula consistent and reconciliation debug aligned', () => {

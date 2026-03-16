@@ -298,6 +298,7 @@ export function evaluatePaperEventDecision(input: {
   projectedCash: number;
   projectedGrossExposure: number;
   positionStateByKey: Map<string, ProjectedPositionState>;
+  latencyMs?: number;
   liveMarketPrice?: { bestAsk: number; bestBid: number; spreadBps?: number };
 }): PaperDecisionDraft {
   const { session, event, projectedCash, projectedGrossExposure, positionStateByKey } = input;
@@ -500,17 +501,14 @@ export function evaluatePaperEventDecision(input: {
       : null;
 
   let simulatedShares = sourceShares * copyRatio;
-  let latencyMs: number | undefined = undefined;
-  if (event.detectedAt instanceof Date && event.eventTimestamp instanceof Date) {
-    latencyMs = Math.max(0, event.detectedAt.getTime() - event.eventTimestamp.getTime());
-  }
+  const latencyMs = Math.max(0, input.latencyMs ?? 0);
 
   const slippageInput: any = {
     side: effectiveSide,
     sourcePrice,
     simulatedShares,
+    latencyMs: input.latencyMs ?? 0,
   };
-  if (latencyMs !== undefined) slippageInput.latencyMs = latencyMs;
   if (input.liveMarketPrice) {
     slippageInput.liveAsk = input.liveMarketPrice.bestAsk;
     slippageInput.liveBid = input.liveMarketPrice.bestBid;

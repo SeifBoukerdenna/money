@@ -175,4 +175,67 @@ describe('paper-decisioning accounting guards', () => {
     expect(Number(sizing.liveBookGapBps)).toBeGreaterThanOrEqual(0);
     expect(Number(sizing.slippageResult?.spreadBpsApplied ?? 0)).toBe(200);
   });
+
+  it('drift latency uses total pipeline latency not just polling latency', () => {
+    const session = {
+      maxAllocationPerMarket: 10000,
+      maxTotalExposure: 10000,
+      minNotionalThreshold: 1,
+      feeBps: 0,
+      slippageBps: 0,
+      copyRatio: 1,
+      startedAt: new Date('2026-03-16T00:00:00.000Z'),
+      slippageConfig: {
+        enabled: true,
+        mode: 'NONE',
+        latencyDrift: {
+          enabled: true,
+          bpsPerSecond: 10,
+          maxBps: 200,
+        },
+      },
+    } as any;
+
+    const withTotalLatency = evaluatePaperEventDecision({
+      session,
+      event: {
+        id: 'buy-total-latency',
+        eventType: 'BUY',
+        marketId: 'm-5',
+        outcome: 'YES',
+        side: 'BUY',
+        price: 0.5,
+        shares: 10,
+        eventTimestamp: new Date('2026-03-16T00:01:00.000Z'),
+      },
+      projectedCash: 10000,
+      projectedGrossExposure: 0,
+      positionStateByKey: new Map(),
+      latencyMs: 5000,
+    });
+
+    const withPollingLatency = evaluatePaperEventDecision({
+      session,
+      event: {
+        id: 'buy-polling-latency',
+        eventType: 'BUY',
+        marketId: 'm-5',
+        outcome: 'YES',
+        side: 'BUY',
+        price: 0.5,
+        shares: 10,
+        eventTimestamp: new Date('2026-03-16T00:01:10.000Z'),
+      },
+      projectedCash: 10000,
+      projectedGrossExposure: 0,
+      positionStateByKey: new Map(),
+      latencyMs: 1000,
+    });
+
+    const highLatencySizing = withTotalLatency.sizingInputsJson as Record<string, any>;
+    const lowLatencySizing = withPollingLatency.sizingInputsJson as Record<string, any>;
+
+    expect(Number(highLatencySizing.slippageResult?.driftBps ?? 0)).toBeCloseTo(50, 8);
+    expect(Number(lowLatencySizing.slippageResult?.driftBps ?? 0)).toBeCloseTo(10, 8);
+  });
 });

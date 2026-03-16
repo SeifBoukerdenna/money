@@ -1,6 +1,10 @@
 import { describe, expect, it, beforeAll, afterAll } from 'vitest';
 import { prisma } from '../src/lib/prisma.js';
-import { evaluatePaperEventDecision, PAPER_REASON_CODES, type ProjectedPositionState } from '../src/modules/paper-decisioning.js';
+import {
+  evaluatePaperEventDecision,
+  PAPER_REASON_CODES,
+  type ProjectedPositionState,
+} from '../src/modules/paper-decisioning.js';
 import { resolvePaperExecutor } from '../src/modules/paper-executor.js';
 
 describe('Slippage & Execution Integration tests', () => {
@@ -8,7 +12,9 @@ describe('Slippage & Execution Integration tests', () => {
   let sessionId: string;
 
   beforeAll(async () => {
-    await prisma.watchedWallet.deleteMany({ where: { address: '0xTestWalletIntegrationSlippage' } });
+    await prisma.watchedWallet.deleteMany({
+      where: { address: '0xTestWalletIntegrationSlippage' },
+    });
     const wallet = await prisma.watchedWallet.create({
       data: {
         address: '0xTestWalletIntegrationSlippage',
@@ -65,6 +71,7 @@ describe('Slippage & Execution Integration tests', () => {
       projectedCash: 10000,
       projectedGrossExposure: 0,
       positionStateByKey,
+      latencyMs: 0,
     });
 
     expect(decisionDraft.decisionType).toBe('COPY');
@@ -87,7 +94,7 @@ describe('Slippage & Execution Integration tests', () => {
         intendedFillPrice: decisionDraft.intendedFillPrice,
         reasonCode: decisionDraft.reasonCode,
         humanReason: decisionDraft.humanReason,
-        sizingInputsJson: decisionDraft.sizingInputsJson as any ?? {},
+        sizingInputsJson: (decisionDraft.sizingInputsJson as any) ?? {},
       },
     });
 
@@ -99,10 +106,12 @@ describe('Slippage & Execution Integration tests', () => {
     expect(execRes.fillPrice).toBe(0.525);
 
     // Verify it is in the ledger preserving source vs fill price
-    const trade = await prisma.paperCopyTrade.findUniqueOrThrow({ where: { id: execRes.tradeId! } });
+    const trade = await prisma.paperCopyTrade.findUniqueOrThrow({
+      where: { id: execRes.tradeId! },
+    });
     expect(Number(trade.sourcePrice)).toBeCloseTo(0.5);
     expect(Number(trade.simulatedPrice)).toBeCloseTo(0.525);
-    
+
     // Size check
     expect(Number(trade.simulatedShares)).toBe(100);
     expect(Number(trade.notional)).toBeCloseTo(52.5);
@@ -110,7 +119,7 @@ describe('Slippage & Execution Integration tests', () => {
 
   it('skips trade due to MAX_ADVERSE_MOVE', async () => {
     const session = await prisma.paperCopySession.findUniqueOrThrow({ where: { id: sessionId } });
-    
+
     // Inject extreme latency to simulate skipping
     const nowTs = Date.now();
     const eventTimestamp = new Date(nowTs - 10000); // 10s old
@@ -126,7 +135,7 @@ describe('Slippage & Execution Integration tests', () => {
           { maxMs: 5000, slippagePercent: 0.05 },
           { maxMs: null, slippagePercent: 0.1, skipTrade: true }, // Should hit this
         ],
-      }
+      },
     };
 
     const event = {
@@ -151,11 +160,11 @@ describe('Slippage & Execution Integration tests', () => {
       projectedCash: 10000,
       projectedGrossExposure: 0,
       positionStateByKey,
+      latencyMs: Math.max(0, detectedAt.getTime() - eventTimestamp.getTime()),
     });
 
     expect(decisionDraft.decisionType).toBe('SKIP');
     expect(decisionDraft.reasonCode).toBe(PAPER_REASON_CODES.SKIP_MAX_ADVERSE_MOVE);
     expect(decisionDraft.status).toBe('SKIPPED');
   });
-
 });

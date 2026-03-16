@@ -78,6 +78,7 @@ export type WalletActivityFeedEvent = {
   shares: number | null;
   notional: number | null;
   fee: number | null;
+  feeIsInferred?: boolean;
   blockNumber: number | null;
   logIndex: number | null;
   txHash: string | null;
@@ -290,6 +291,25 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
         }
       }
 
+      const explicitFeeCandidate =
+        row.feeAmount ?? row.fee ?? row.takerFee ?? row.makerFee ?? row.orderFee;
+      let parsedFee: number | null = null;
+      if (explicitFeeCandidate !== null && explicitFeeCandidate !== undefined) {
+        const candidate = Number(explicitFeeCandidate);
+        if (Number.isFinite(candidate) && candidate >= 0) {
+          parsedFee = candidate;
+        }
+      }
+
+      const computedNotional =
+        eventShares !== null && eventPrice !== null ? eventShares * eventPrice : null;
+      let feeValue: number | null = parsedFee;
+      let feeIsInferred = false;
+      if (feeValue === null && computedNotional !== null && computedNotional > 0) {
+        feeValue = computedNotional * 0.02;
+        feeIsInferred = true;
+      }
+
       events.push({
         id: crypto.randomUUID(),
         ...(externalEventId ? { externalEventId } : {}),
@@ -303,8 +323,9 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
         effectiveSide,
         price: eventPrice,
         shares: eventShares,
-        notional: eventShares !== null && eventPrice !== null ? eventShares * eventPrice : null,
-        fee: null,
+        notional: computedNotional,
+        fee: feeValue,
+        ...(feeIsInferred ? { feeIsInferred: true } : {}),
         blockNumber: numberOrNull(row.blockNumber ?? row.block_num ?? row.block),
         logIndex: numberOrNull(row.logIndex ?? row.log_index ?? row.index),
         txHash: row.transactionHash
@@ -316,7 +337,7 @@ export class LivePolymarketAdapter implements PolymarketDataPort, PolymarketTrad
         eventTimestamp: new Date(tradedAtMs).toISOString(),
         detectedAt: new Date().toISOString(),
         walletAddress: sourceWalletAddress,
-        rawPayload: row,
+        rawPayload: feeIsInferred ? { ...row, feeIsInferred: true } : row,
       });
     }
 

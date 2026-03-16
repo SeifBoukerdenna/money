@@ -31,6 +31,7 @@ export type TrackedWalletEvent = {
   shares: number | null;
   notional: number | null;
   fee: number | null;
+  feeIsInferred?: boolean;
   eventTimestamp: Date;
   createdAt: Date;
 };
@@ -125,6 +126,7 @@ export type TrackedWalletConfidenceModel = {
   hasUnknownCostBasis: boolean;
   hasEstimatedMarks: boolean;
   hasMissingFees: boolean;
+  hasInferredFees: boolean;
   warnings: string[];
 };
 
@@ -134,6 +136,7 @@ type TrackedWalletConfidenceModelInput = {
   hasUnknownCostBasis: boolean;
   hasEstimatedMarks: boolean;
   hasMissingFees: boolean;
+  hasInferredFees: boolean;
   feeCoveragePct: number;
   unsupportedEventCount: number;
   totalEventCount: number;
@@ -186,6 +189,7 @@ export type TrackedWalletReductionSummary = {
   sellEventCount: number;
   inferredShareEvents: number;
   inferredPriceEvents: number;
+  inferredFeeEvents: number;
   missingFeeEvents: number;
   feeCoveragePct: number;
   duplicateSkipped: number;
@@ -394,7 +398,11 @@ function buildConfidenceModel(
 
   const severe = input.hasUnknownCostBasis || feeCoverageSevere || truncatedWithOpenPositions;
   const moderate =
-    input.hasEstimatedMarks || feeCoveragePartial || unsupportedPartial || truncatedHistoryPartial;
+    input.hasEstimatedMarks ||
+    feeCoveragePartial ||
+    unsupportedPartial ||
+    truncatedHistoryPartial ||
+    input.hasInferredFees;
 
   const confidence: TrackedWalletConfidence = severe ? 'LOW' : moderate ? 'PARTIAL' : 'HIGH';
   return {
@@ -404,6 +412,7 @@ function buildConfidenceModel(
     hasUnknownCostBasis: input.hasUnknownCostBasis,
     hasEstimatedMarks: input.hasEstimatedMarks,
     hasMissingFees: input.hasMissingFees,
+    hasInferredFees: input.hasInferredFees,
     warnings: input.warnings,
   };
 }
@@ -982,6 +991,7 @@ export function reduceTrackedWalletEvents(input: {
       sellEventCount: 0,
       inferredShareEvents: 0,
       inferredPriceEvents: 0,
+      inferredFeeEvents: 0,
       missingFeeEvents: 0,
       feeCoveragePct: 100,
       duplicateSkipped: 0,
@@ -1065,7 +1075,10 @@ export function reduceTrackedWalletEvents(input: {
     }
 
     state.summary.tradeLikeEventCount += 1;
-    const feeMissing = event.fee === null || event.fee === undefined;
+    const eventForAccounting: TrackedWalletEvent = event;
+    const feeMissing =
+      (eventForAccounting.fee === null || eventForAccounting.fee === undefined) &&
+      !eventForAccounting.feeIsInferred;
     if (feeMissing) {
       state.summary.missingFeeEvents += 1;
       state.warnings.push({
@@ -1073,6 +1086,9 @@ export function reduceTrackedWalletEvents(input: {
         eventId: event.id,
         message: 'Event had no explicit fee; canonical known net is not fully authoritative.',
       });
+    }
+    if (eventForAccounting.feeIsInferred) {
+      state.summary.inferredFeeEvents += 1;
     }
 
     const marketKey = normalizeMarketKey({
@@ -1084,10 +1100,10 @@ export function reduceTrackedWalletEvents(input: {
     let processed = false;
     if (side === 'BUY') {
       state.summary.buyEventCount += 1;
-      processed = applyBuy(state, event, marketKey, outcome);
+      processed = applyBuy(state, eventForAccounting, marketKey, outcome);
     } else {
       state.summary.sellEventCount += 1;
-      processed = applySell(state, event, marketKey, outcome);
+      processed = applySell(state, eventForAccounting, marketKey, outcome);
     }
 
     if (!processed) continue;
@@ -1195,6 +1211,7 @@ export function reduceTrackedWalletEvents(input: {
   const canonicalUnrealizedPnl = normalizeMoney(knownUnrealizedPnl);
   const canonicalFees = normalizeMoney(state.canonicalFees);
   const hasMissingFees = state.summary.missingFeeEvents > 0;
+  const hasInferredFees = state.summary.inferredFeeEvents > 0;
   const hasUnknownCostBasis = unknownCostBasisPositions.length > 0;
   const hasUnsupportedEvents = state.summary.unsupportedEventCount > 0;
   const hasEstimatedMarks = state.estimatedMarkCount > 0 || state.missingMarkCount > 0;
@@ -1238,6 +1255,7 @@ export function reduceTrackedWalletEvents(input: {
   if (hasUnknownCostBasis) confidenceWarnings.push('unknown-cost-basis');
   if (hasEstimatedMarks) confidenceWarnings.push('estimated-or-missing-marks');
   if (hasMissingFees) confidenceWarnings.push('missing-fees');
+  if (hasInferredFees) confidenceWarnings.push('inferred-fees');
 
   const confidenceModel = buildConfidenceModel({
     hasTruncatedHistory: state.hasTruncatedHistory,
@@ -1245,6 +1263,7 @@ export function reduceTrackedWalletEvents(input: {
     hasUnknownCostBasis,
     hasEstimatedMarks,
     hasMissingFees,
+    hasInferredFees,
     feeCoveragePct,
     unsupportedEventCount: state.summary.unsupportedEventCount,
     totalEventCount: state.summary.eventCount,
