@@ -44,6 +44,7 @@ import {
 } from './modules/profile-parity-routes.js';
 import { buildProfileSummary } from './modules/profile-parity.js';
 import { registerPaperSessionMarketRoutes } from './paper-session-market-routes.js';
+import { registerWalletPnlTrackerRoutes } from './modules/wallet-pnl-tracker-routes.js';
 import {
   buildTradeAttribution,
   resolveAttributionPositionKey,
@@ -106,10 +107,8 @@ type TrackedWalletCacheCursor = {
 };
 
 function normalizeTrackedEventRow(row: TrackedWalletEventRow): CachedTrackedWalletEvent {
-  const feeIsInferred =
-    row.rawPayloadJson &&
-    typeof row.rawPayloadJson === 'object' &&
-    (row.rawPayloadJson as Record<string, unknown>).feeIsInferred === true;
+  const raw = row.rawPayloadJson as Record<string, unknown> | null;
+  const feeIsInferred: boolean = raw !== null && typeof raw === 'object' && raw.feeIsInferred === true;
 
   return {
     id: row.id,
@@ -3803,4 +3802,5 @@ export async function registerRoutes(app: any): Promise<void> {
   registerForceCloseRoutes(app);
   registerProfileParityRoutes(app, { prisma, dataAdapter });
   registerPaperSessionMarketRoutes(app);
+  registerWalletPnlTrackerRoutes(app);
 }

@@ -17,6 +17,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { WindowedPnlClient } from './windowed-pnl-client';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -340,7 +342,7 @@ export function PolymarketProfileClient({ walletId }: { walletId: string }) {
     const [chart, setChart] = useState<PnlChart | null>(null);
     const [chartLoading, setChartLoading] = useState(false);
 
-    const [mainTab, setMainTab] = useState<'positions' | 'activity'>('positions');
+    const [mainTab, setMainTab] = useState<'positions' | 'activity' | 'pnl-tracker'>('positions');
 
     const [posTab, setPosTab] = useState<'OPEN' | 'CLOSED'>('OPEN');
     const [posSearch, setPosSearch] = useState('');
@@ -659,6 +661,7 @@ export function PolymarketProfileClient({ walletId }: { walletId: string }) {
                 <div className="pm-tab-bar">
                     <button type="button" className={`pm-tab${mainTab === 'positions' ? ' pm-tab-on' : ''}`} onClick={() => setMainTab('positions')}>Positions</button>
                     <button type="button" className={`pm-tab${mainTab === 'activity' ? ' pm-tab-on' : ''}`} onClick={() => setMainTab('activity')}>Activity</button>
+                    <button type="button" className={`pm-tab${mainTab === 'pnl-tracker' ? ' pm-tab-on' : ''}`} onClick={() => setMainTab('pnl-tracker')}>PnL Tracker</button>
                 </div>
 
                 {/* ── C) POSITIONS ─────────────────────────────────────────── */}
@@ -853,6 +856,11 @@ export function PolymarketProfileClient({ walletId }: { walletId: string }) {
                         </div>
                         <Pager page={actPage} pageSize={ACT_PAGE_SIZE} total={actTotal} onPrev={() => setActPage(v => Math.max(1, v - 1))} onNext={() => setActPage(v => v + 1)} />
                     </div>
+                )}
+
+                {/* ── E) PNL TRACKER ───────────────────────────────────────── */}
+                {mainTab === 'pnl-tracker' && (
+                    <WindowedPnlClient walletId={walletId} />
                 )}
 
             </div>

@@ -1348,9 +1348,9 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
             liveMarketPrice = {
               bestAsk: Number(liveMarket.bestAsk),
               bestBid: Number(liveMarket.bestBid),
-              spreadBps: Number.isFinite(liveMarket.spreadBps)
-                ? Number(liveMarket.spreadBps)
-                : undefined,
+              ...(Number.isFinite(liveMarket.spreadBps)
+                ? { spreadBps: Number(liveMarket.spreadBps) }
+                : {}),
             };
           }
         } catch (error) {
@@ -1368,7 +1368,7 @@ async function _runTickUnsafe(sessionId: string): Promise<void> {
         projectedGrossExposure,
         positionStateByKey,
         latencyMs: totalObservedLatencyMs,
-        liveMarketPrice,
+        ...(liveMarketPrice !== undefined ? { liveMarketPrice } : {}),
       });
 
       const draftSlippage =
